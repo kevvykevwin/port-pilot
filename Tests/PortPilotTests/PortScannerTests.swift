@@ -198,10 +198,10 @@ final class PortStoreTests: XCTestCase {
         store.groupMode = .type
 
         let groupNames = store.grouped.map(\.name)
-        XCTAssertTrue(groupNames.contains("System (1-1023)"))
-        XCTAssertTrue(groupNames.contains("Databases"))
-        XCTAssertTrue(groupNames.contains("Dev Servers (3000-9999)"))
-        XCTAssertTrue(groupNames.contains("High Ports (10000+)"))
+        XCTAssertTrue(groupNames.contains("System"), "got: \(groupNames)")
+        XCTAssertTrue(groupNames.contains("Databases"), "got: \(groupNames)")
+        XCTAssertTrue(groupNames.contains("Dev Servers"), "got: \(groupNames)")
+        XCTAssertTrue(groupNames.contains("High Ports"), "got: \(groupNames)")
     }
 
     func testIPv6Dedup() async {

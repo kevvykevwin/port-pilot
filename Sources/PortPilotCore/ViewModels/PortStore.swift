@@ -25,9 +25,10 @@ public struct PortGroup: Identifiable, Sendable {
 // MARK: - PortCategory
 
 public enum PortCategory: String, Sendable {
-    case system      // 1-1023
+    case devServers  // actual dev tools (node, python, etc.)
     case databases   // well-known DB ports
-    case devServers  // 3000-9999 minus DBs
+    case apps        // macOS apps using any port
+    case system      // system services
     case highPorts   // 10000+
 
     public static let knownDatabases: Set<UInt16> = [
@@ -36,6 +37,28 @@ public enum PortCategory: String, Sendable {
 
     public static let infrastructurePorts: Set<UInt16> = [1355, 2375, 2376]
 
+    /// Known dev runtime process names
+    public static let devRuntimes: Set<String> = [
+        "node", "python3", "python", "ruby", "java", "go",
+        "bun", "deno", "cargo", "mix", "beam.smp",
+        "next-server", "vite", "webpack", "esbuild", "tsx",
+        "uvicorn", "gunicorn", "flask", "rails", "puma",
+        "php", "nginx", "caddy",
+    ]
+
+    /// Categorize using both port AND process context
+    public static func categorize(_ entry: PortEntry) -> PortCategory {
+        if knownDatabases.contains(entry.port) { return .databases }
+        if isMacApp(entry) { return .apps }
+        if infrastructurePorts.contains(entry.port) { return .system }
+        if entry.port <= 1023 { return .system }
+        if isDevProcess(entry) { return .devServers }
+        if entry.projectPath != nil { return .devServers }
+        if entry.port >= 10000 { return .highPorts }
+        return .devServers
+    }
+
+    /// Port-only categorize (backward compat for tests)
     public static func categorize(_ port: UInt16) -> PortCategory {
         if knownDatabases.contains(port) { return .databases }
         if infrastructurePorts.contains(port) { return .system }
@@ -44,12 +67,36 @@ public enum PortCategory: String, Sendable {
         return .devServers
     }
 
+    private static func isDevProcess(_ entry: PortEntry) -> Bool {
+        if devRuntimes.contains(entry.processName) { return true }
+        let path = entry.executablePath
+        // Common dev tool paths
+        if path.contains("/node_modules/") { return true }
+        if path.contains("/.cargo/") { return true }
+        if path.contains("/go/bin/") { return true }
+        if path.contains("/.local/bin/") { return true }
+        return false
+    }
+
+    private static func isMacApp(_ entry: PortEntry) -> Bool {
+        let path = entry.executablePath
+        if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
+        if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
+        if path.contains(".app/") { return true }
+        let knownApps: Set<String> = [
+            "Spotify", "LINE", "ControlCenter", "rapportd", "figma_agent",
+            "Slack", "Discord", "zoom.us", "Notion", "Safari",
+        ]
+        return knownApps.contains(entry.processName)
+    }
+
     public var displayName: String {
         switch self {
-        case .system: return "System (1-1023)"
+        case .devServers: return "Dev Servers"
         case .databases: return "Databases"
-        case .devServers: return "Dev Servers (3000-9999)"
-        case .highPorts: return "High Ports (10000+)"
+        case .apps: return "macOS Apps"
+        case .system: return "System"
+        case .highPorts: return "High Ports"
         }
     }
 }
@@ -239,18 +286,17 @@ public final class PortStore {
     private func groupByPortRange(_ entries: [PortEntry]) -> [PortGroup] {
         var groups: [PortCategory: [PortEntry]] = [:]
         for entry in entries {
-            let cat = PortCategory.categorize(entry.port)
+            let cat = PortCategory.categorize(entry)
             groups[cat, default: []].append(entry)
         }
-        // Dev servers first — those are the ports you care about while coding
-        let order: [PortCategory] = [.devServers, .databases, .system, .highPorts]
+        let order: [PortCategory] = [.devServers, .databases, .system, .apps, .highPorts]
         return order.compactMap { cat in
             guard let entries = groups[cat], !entries.isEmpty else { return nil }
             return PortGroup(
                 id: "range-\(cat.rawValue)",
                 name: cat.displayName,
                 entries: entries.sorted { $0.port < $1.port },
-                collapsedByDefault: cat == .highPorts
+                collapsedByDefault: cat == .highPorts || cat == .apps
             )
         }
     }
