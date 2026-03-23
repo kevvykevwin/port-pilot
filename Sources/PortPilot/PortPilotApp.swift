@@ -16,6 +16,12 @@ struct PortPilotApp: App {
         }
         .menuBarExtraStyle(.window)
     }
+
+    init() {
+        // Start polling immediately so the lighthouse icon reflects
+        // multi-port state without needing to open the popover.
+        store.startPolling()
+    }
 }
 
 /// Generates an NSImage template for the menu bar lighthouse icon

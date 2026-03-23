@@ -77,7 +77,5 @@ struct MenuBarView: View {
             .padding(.vertical, 8)
         }
         .frame(width: 320, height: 500)
-        .onAppear { store.startPolling() }
-        .onDisappear { store.stopPolling() }
     }
 }
