@@ -109,10 +109,14 @@ enum LighthouseIcon {
             NSColor.black.setFill()
             path.fill()
 
-            // Amber glow dot on the beacon
-            let dotRect = NSRect(x: 14.5 * sx, y: 3.5 * sy, width: 5 * sx, height: 5 * sy)
+            // Amber glow beam — same triangle shape as the light beam
+            let glowBeam = NSBezierPath()
+            glowBeam.move(to: NSPoint(x: 14.0 * sx, y: 5.4 * sy))
+            glowBeam.line(to: NSPoint(x: 20.5 * sx, y: 4.4 * sy))
+            glowBeam.line(to: NSPoint(x: 20.5 * sx, y: 6.8 * sy))
+            glowBeam.close()
             NSColor.orange.setFill()
-            NSBezierPath(ovalIn: dotRect).fill()
+            glowBeam.fill()
 
             return true
         }
