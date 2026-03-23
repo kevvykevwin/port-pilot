@@ -20,8 +20,7 @@ struct MenuBarView: View {
 
                 Picker("Group", selection: $store.groupMode) {
                     Text("Project").tag(GroupMode.project)
-                    Text("Range").tag(GroupMode.portRange)
-                    Text("Flat").tag(GroupMode.flat)
+                    Text("Type").tag(GroupMode.type)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()

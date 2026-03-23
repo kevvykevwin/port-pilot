@@ -195,7 +195,7 @@ final class PortStoreTests: XCTestCase {
             makeEntry(pid: 3, port: 3000, name: "node"),
             makeEntry(pid: 4, port: 12000, name: "custom"),
         ]
-        store.groupMode = .portRange
+        store.groupMode = .type
 
         let groupNames = store.grouped.map(\.name)
         XCTAssertTrue(groupNames.contains("System (1-1023)"))

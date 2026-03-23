@@ -3,7 +3,7 @@ import Foundation
 // MARK: - GroupMode
 
 public enum GroupMode: String, CaseIterable, Sendable {
-    case project, portRange, flat
+    case project, type
 }
 
 // MARK: - PortGroup
@@ -90,10 +90,8 @@ public final class PortStore {
         switch groupMode {
         case .project:
             return groupByProject(source)
-        case .portRange:
+        case .type:
             return groupByPortRange(source)
-        case .flat:
-            return [PortGroup(id: "all", name: "All Ports", entries: source.sorted { $0.port < $1.port })]
         }
     }
 
