@@ -78,7 +78,7 @@ public enum PortCategory: String, Sendable {
         return false
     }
 
-    private static func isMacApp(_ entry: PortEntry) -> Bool {
+    static func isMacApp(_ entry: PortEntry) -> Bool {
         let path = entry.executablePath
         if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
         if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
@@ -148,11 +148,9 @@ public final class PortStore {
 
     /// Projects with 2+ listening ports — potential dupes worth flagging
     public var multiPortProjects: Set<String> {
-        var portCounts: [String: Int] = [:]
-        for entry in entries where entry.projectPath != nil {
-            portCounts[entry.projectPath!, default: 0] += 1
-        }
-        return Set(portCounts.filter { $0.value >= 2 }.keys)
+        let counts = Dictionary(grouping: entries.compactMap(\.projectPath), by: { $0 })
+            .filter { $0.value.count >= 2 }
+        return Set(counts.keys)
     }
 
     /// True when any dev project has multiple ports (triggers lighthouse glow)
@@ -162,16 +160,23 @@ public final class PortStore {
 
     // MARK: - Polling
 
+    private static let pollIntervalNormal: UInt64    = 2_000_000_000  // 2s
+    private static let pollIntervalLowPower: UInt64  = 5_000_000_000  // 5s
+
     public func startPolling() {
         stopPolling()
         scanTask = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
+                guard let self else { return }
                 await self.refresh()
-                let interval: UInt64 = ProcessInfo.processInfo.isLowPowerModeEnabled
-                    ? 5_000_000_000  // 5s
-                    : 2_000_000_000  // 2s
-                try? await Task.sleep(nanoseconds: interval)
+                let interval = ProcessInfo.processInfo.isLowPowerModeEnabled
+                    ? Self.pollIntervalLowPower
+                    : Self.pollIntervalNormal
+                do {
+                    try await Task.sleep(nanoseconds: interval)
+                } catch {
+                    break
+                }
             }
         }
     }
@@ -238,7 +243,7 @@ public final class PortStore {
         for entry in entries {
             if let project = entry.projectPath {
                 projectGroups[project, default: []].append(entry)
-            } else if Self.isMacApp(entry) {
+            } else if PortCategory.isMacApp(entry) {
                 macApps.append(entry)
             } else {
                 projectGroups["Other", default: []].append(entry)
@@ -264,23 +269,6 @@ public final class PortStore {
         }
 
         return result
-    }
-
-    /// Detect if a port entry belongs to a macOS app (not a dev server)
-    private static func isMacApp(_ entry: PortEntry) -> Bool {
-        let path = entry.executablePath
-        // Apps in /Applications, /System, or Apple frameworks
-        if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
-        // Apple system services (ControlCenter, rapportd, etc.)
-        if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
-        // macOS apps with .app bundle paths
-        if path.contains(".app/") { return true }
-        // Known macOS app process names
-        let knownApps: Set<String> = [
-            "Spotify", "LINE", "ControlCenter", "rapportd", "figma_agent",
-            "Slack", "Discord", "zoom.us", "Notion", "Safari",
-        ]
-        return knownApps.contains(entry.processName)
     }
 
     private func groupByPortRange(_ entries: [PortEntry]) -> [PortGroup] {

@@ -53,32 +53,33 @@ public final class ProjectResolver: Sendable {
         let key = CacheKey(pid: pid, startTime: startTime)
 
         // Check cache
-        lock.lock()
-        if let cached = _cache.entries[key] {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
+        let cached: String?? = withLock { _cache.entries[key] }
+        if let cached { return cached }
 
         // Cache miss — resolve
         let result = resolveProjectName(pid: pid)
 
         // Store in cache
-        lock.lock()
-        _cache.entries[key] = result
-        _cache.order.append(key)
+        withLock {
+            _cache.entries[key] = result
+            _cache.order.append(key)
 
-        // Evict if over capacity
-        if _cache.order.count > Self.maxCacheSize {
-            let toRemove = Array(_cache.order.prefix(Self.evictCount))
-            _cache.order.removeFirst(Self.evictCount)
-            for old in toRemove {
-                _cache.entries.removeValue(forKey: old)
+            if _cache.order.count > Self.maxCacheSize {
+                let toRemove = Array(_cache.order.prefix(Self.evictCount))
+                _cache.order.removeFirst(Self.evictCount)
+                for old in toRemove {
+                    _cache.entries.removeValue(forKey: old)
+                }
             }
         }
-        lock.unlock()
 
         return result
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 
     // MARK: - Private

@@ -65,11 +65,11 @@ public final class PortScanner: PortScanning, Sendable {
 
                         if family == AF_INET {
                             let insi = tcpInfo.tcpsi_ini.insi_laddr.ina_46.i46a_addr4
-                            port = UInt16(bigEndian: tcpInfo.tcpsi_ini.insi_lport.unsafeBitCast())
+                            port = UInt16(bigEndian: tcpInfo.tcpsi_ini.insi_lport.truncatedPort())
                             address = formatIPv4(insi)
                         } else {
                             let in6si = tcpInfo.tcpsi_ini.insi_laddr.ina_6
-                            port = UInt16(bigEndian: tcpInfo.tcpsi_ini.insi_lport.unsafeBitCast())
+                            port = UInt16(bigEndian: tcpInfo.tcpsi_ini.insi_lport.truncatedPort())
                             address = formatIPv6(in6si)
                         }
                     } else if proto == IPPROTO_UDP {
@@ -78,11 +78,11 @@ public final class PortScanner: PortScanning, Sendable {
                         let udpInfo = soi.pri_in
                         if family == AF_INET {
                             let insi = udpInfo.insi_laddr.ina_46.i46a_addr4
-                            port = UInt16(bigEndian: udpInfo.insi_lport.unsafeBitCast())
+                            port = UInt16(bigEndian: udpInfo.insi_lport.truncatedPort())
                             address = formatIPv4(insi)
                         } else {
                             let in6si = udpInfo.insi_laddr.ina_6
-                            port = UInt16(bigEndian: udpInfo.insi_lport.unsafeBitCast())
+                            port = UInt16(bigEndian: udpInfo.insi_lport.truncatedPort())
                             address = formatIPv6(in6si)
                         }
                     } else {
@@ -151,11 +151,11 @@ public final class PortScanner: PortScanning, Sendable {
     }
 }
 
-// MARK: - Bit-cast helper for port extraction
+// MARK: - Port extraction helper
 
 private extension Int32 {
-    /// Reinterpret the bytes of this Int32 as a UInt16 (for port extraction from insi_lport).
-    func unsafeBitCast() -> UInt16 {
+    /// Extract port number (lower 16 bits) from insi_lport.
+    func truncatedPort() -> UInt16 {
         UInt16(truncatingIfNeeded: self)
     }
 }

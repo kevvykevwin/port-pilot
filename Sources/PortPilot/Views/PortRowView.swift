@@ -7,6 +7,13 @@ struct PortRowView: View {
 
     @State private var confirmingKill = false
 
+    private static let killConfirmResetNs: UInt64 = 2_000_000_000  // 2s before button resets
+
+    private func copy(_ string: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+    }
+
     private var isInfrastructure: Bool {
         PortCategory.infrastructurePorts.contains(entry.port)
     }
@@ -64,9 +71,8 @@ struct PortRowView: View {
                     confirmingKill = false
                 } else {
                     confirmingKill = true
-                    // Auto-reset after 2 seconds
                     Task {
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        try? await Task.sleep(nanoseconds: Self.killConfirmResetNs)
                         confirmingKill = false
                     }
                 }
@@ -105,18 +111,9 @@ struct PortRowView: View {
         }
         .contentShape(Rectangle())
         .contextMenu {
-            Button("Copy Port") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(String(entry.port), forType: .string)
-            }
-            Button("Copy PID") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(String(entry.pid), forType: .string)
-            }
-            Button("Copy Kill Command") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString("kill -9 \(entry.pid)", forType: .string)
-            }
+            Button("Copy Port")         { copy(String(entry.port)) }
+            Button("Copy PID")          { copy(String(entry.pid)) }
+            Button("Copy Kill Command") { copy("kill -9 \(entry.pid)") }
         }
     }
 }

@@ -17,19 +17,29 @@ public final class LsofScanner: PortScanning, Sendable {
     }
 
     private func runLsof() async throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"]
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            process.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"]
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
 
-        try process.run()
-        process.waitUntilExit()
+            // NOTE: readDataToEndOfFile inside terminationHandler is safe because
+            // -sTCP:LISTEN output is well under the pipe buffer size (~64KB).
+            process.terminationHandler = { _ in
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                continuation.resume(returning: output)
+            }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     /// Parse lsof -F pcn output format:
@@ -43,8 +53,6 @@ public final class LsofScanner: PortScanning, Sendable {
 
         for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
             let str = String(line)
-            guard !str.isEmpty else { continue }
-
             let prefix = str.first!
             let value = String(str.dropFirst())
 

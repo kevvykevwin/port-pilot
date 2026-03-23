@@ -67,24 +67,20 @@ public enum LibProc {
 
     /// Returns the process name for a PID, or nil on failure.
     public static func processName(pid: pid_t) -> String? {
-        let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXCOMLEN) + 1)
-        defer { nameBuffer.deallocate() }
-
-        let length = proc_name(pid, nameBuffer, UInt32(MAXCOMLEN) + 1)
+        var buffer = [CChar](repeating: 0, count: Int(MAXCOMLEN) + 1)
+        let length = proc_name(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else { return nil }
-        return String(cString: nameBuffer)
+        return String(cString: buffer)
     }
 
     // MARK: - Process Path
 
     /// Returns the full executable path for a PID, or nil on failure.
     public static func processPath(pid: pid_t) -> String? {
-        let pathBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(MAXPATHLEN))
-        defer { pathBuffer.deallocate() }
-
-        let length = proc_pidpath(pid, pathBuffer, UInt32(MAXPATHLEN))
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else { return nil }
-        return String(cString: pathBuffer)
+        return String(cString: buffer)
     }
 
     // MARK: - BSD Info (start time)
