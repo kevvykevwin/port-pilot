@@ -3,11 +3,12 @@ import PortPilotCore
 
 struct PortListView: View {
     let groups: [PortGroup]
+    let multiPortProjects: Set<String>
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 12) {
             ForEach(groups) { group in
-                CollapsibleSection(group: group)
+                CollapsibleSection(group: group, multiPortProjects: multiPortProjects)
             }
         }
     }
@@ -15,10 +16,12 @@ struct PortListView: View {
 
 private struct CollapsibleSection: View {
     let group: PortGroup
+    let multiPortProjects: Set<String>
     @State private var isCollapsed: Bool
 
-    init(group: PortGroup) {
+    init(group: PortGroup, multiPortProjects: Set<String>) {
         self.group = group
+        self.multiPortProjects = multiPortProjects
         self._isCollapsed = State(initialValue: group.collapsedByDefault)
     }
 
@@ -26,7 +29,10 @@ private struct CollapsibleSection: View {
         Section {
             if !isCollapsed {
                 ForEach(group.entries, id: \.id) { entry in
-                    PortRowView(entry: entry)
+                    PortRowView(
+                        entry: entry,
+                        isMultiPort: entry.projectPath.map { multiPortProjects.contains($0) } ?? false
+                    )
                 }
             }
         } header: {

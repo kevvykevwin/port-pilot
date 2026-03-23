@@ -3,6 +3,7 @@ import PortPilotCore
 
 struct PortRowView: View {
     let entry: PortEntry
+    var isMultiPort: Bool = false
 
     @State private var confirmingKill = false
 
@@ -89,6 +90,19 @@ struct PortRowView: View {
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 4)
+        .background(
+            isMultiPort
+                ? RoundedRectangle(cornerRadius: 4).fill(.orange.opacity(0.08))
+                : RoundedRectangle(cornerRadius: 4).fill(.clear)
+        )
+        .overlay(alignment: .leading) {
+            if isMultiPort {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(.orange)
+                    .frame(width: 3)
+                    .padding(.vertical, 2)
+            }
+        }
         .contentShape(Rectangle())
         .contextMenu {
             Button("Copy Port") {

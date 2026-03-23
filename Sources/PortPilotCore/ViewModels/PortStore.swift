@@ -99,6 +99,20 @@ public final class PortStore {
         entries.filter { $0.state == .listen }.count
     }
 
+    /// Projects with 2+ listening ports — potential dupes worth flagging
+    public var multiPortProjects: Set<String> {
+        var portCounts: [String: Int] = [:]
+        for entry in entries where entry.projectPath != nil {
+            portCounts[entry.projectPath!, default: 0] += 1
+        }
+        return Set(portCounts.filter { $0.value >= 2 }.keys)
+    }
+
+    /// True when any dev project has multiple ports (triggers lighthouse glow)
+    public var hasMultiPortProjects: Bool {
+        !multiPortProjects.isEmpty
+    }
+
     // MARK: - Polling
 
     public func startPolling() {

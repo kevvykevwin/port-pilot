@@ -35,7 +35,7 @@ struct MenuBarView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    PortListView(groups: store.grouped)
+                    PortListView(groups: store.grouped, multiPortProjects: store.multiPortProjects)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                 }
