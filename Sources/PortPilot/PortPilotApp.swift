@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import PortPilotCore
 
 @main
@@ -9,72 +10,65 @@ struct PortPilotApp: App {
         MenuBarExtra {
             MenuBarView(store: store)
         } label: {
-            HStack(spacing: 4) {
-                LighthouseIcon()
-                    .frame(width: 16, height: 16)
-                Text("\(store.listeningCount)")
-                    .monospacedDigit()
-            }
+            Image(nsImage: LighthouseIcon.menuBarImage)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-/// Lighthouse icon drawn in SwiftUI — matches the SVG design
-struct LighthouseIcon: View {
-    var body: some View {
-        Canvas { context, size in
-            let sx = size.width / 22
-            let sy = size.height / 22
+/// Generates an NSImage template for the menu bar lighthouse icon
+enum LighthouseIcon {
+    static let menuBarImage: NSImage = {
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: true) { rect in
+            let sx = rect.width / 22
+            let sy = rect.height / 22
+
+            let path = NSBezierPath()
 
             // Roof triangle
-            let roof = Path { p in
-                p.move(to: CGPoint(x: 11 * sx, y: 1.5 * sy))
-                p.addLine(to: CGPoint(x: 8 * sx, y: 4.2 * sy))
-                p.addLine(to: CGPoint(x: 14 * sx, y: 4.2 * sy))
-                p.closeSubpath()
-            }
-            context.fill(roof, with: .foreground)
+            path.move(to: NSPoint(x: 11 * sx, y: 1.5 * sy))
+            path.line(to: NSPoint(x: 8 * sx, y: 4.2 * sy))
+            path.line(to: NSPoint(x: 14 * sx, y: 4.2 * sy))
+            path.close()
 
             // Lantern room
-            context.fill(Path(CGRect(x: 8.9 * sx, y: 4.2 * sy, width: 4.2 * sx, height: 2.6 * sy)), with: .foreground)
+            path.appendRect(NSRect(x: 8.9 * sx, y: 4.2 * sy, width: 4.2 * sx, height: 2.6 * sy))
 
             // Catwalk
-            context.fill(Path(CGRect(x: 8.0 * sx, y: 6.8 * sy, width: 6.0 * sx, height: 1.2 * sy)), with: .foreground)
+            path.appendRect(NSRect(x: 8.0 * sx, y: 6.8 * sy, width: 6.0 * sx, height: 1.2 * sy))
 
             // Light beam
-            let beam = Path { p in
-                p.move(to: CGPoint(x: 14.0 * sx, y: 5.4 * sy))
-                p.addLine(to: CGPoint(x: 20.5 * sx, y: 4.4 * sy))
-                p.addLine(to: CGPoint(x: 20.5 * sx, y: 6.8 * sy))
-                p.closeSubpath()
-            }
-            context.fill(beam, with: .foreground)
+            path.move(to: NSPoint(x: 14.0 * sx, y: 5.4 * sy))
+            path.line(to: NSPoint(x: 20.5 * sx, y: 4.4 * sy))
+            path.line(to: NSPoint(x: 20.5 * sx, y: 6.8 * sy))
+            path.close()
 
-            // Tower legs (tapered)
-            let leftLeg = Path { p in
-                p.move(to: CGPoint(x: 8.7 * sx, y: 8.0 * sy))
-                p.addLine(to: CGPoint(x: 9.9 * sx, y: 8.0 * sy))
-                p.addLine(to: CGPoint(x: 9.2 * sx, y: 17.0 * sy))
-                p.addLine(to: CGPoint(x: 8.0 * sx, y: 17.0 * sy))
-                p.closeSubpath()
-            }
-            context.fill(leftLeg, with: .foreground)
+            // Left tower leg
+            path.move(to: NSPoint(x: 8.7 * sx, y: 8.0 * sy))
+            path.line(to: NSPoint(x: 9.9 * sx, y: 8.0 * sy))
+            path.line(to: NSPoint(x: 9.2 * sx, y: 17.0 * sy))
+            path.line(to: NSPoint(x: 8.0 * sx, y: 17.0 * sy))
+            path.close()
 
-            let rightLeg = Path { p in
-                p.move(to: CGPoint(x: 12.1 * sx, y: 8.0 * sy))
-                p.addLine(to: CGPoint(x: 13.3 * sx, y: 8.0 * sy))
-                p.addLine(to: CGPoint(x: 14.0 * sx, y: 17.0 * sy))
-                p.addLine(to: CGPoint(x: 12.8 * sx, y: 17.0 * sy))
-                p.closeSubpath()
-            }
-            context.fill(rightLeg, with: .foreground)
+            // Right tower leg
+            path.move(to: NSPoint(x: 12.1 * sx, y: 8.0 * sy))
+            path.line(to: NSPoint(x: 13.3 * sx, y: 8.0 * sy))
+            path.line(to: NSPoint(x: 14.0 * sx, y: 17.0 * sy))
+            path.line(to: NSPoint(x: 12.8 * sx, y: 17.0 * sy))
+            path.close()
 
             // Door
-            context.fill(Path(CGRect(x: 10.4 * sx, y: 14.8 * sy, width: 1.2 * sx, height: 2.2 * sy)), with: .foreground)
+            path.appendRect(NSRect(x: 10.4 * sx, y: 14.8 * sy, width: 1.2 * sx, height: 2.2 * sy))
 
             // Base
-            context.fill(Path(CGRect(x: 7.0 * sx, y: 17.0 * sy, width: 8.0 * sx, height: 1.6 * sy)), with: .foreground)
+            path.appendRect(NSRect(x: 7.0 * sx, y: 17.0 * sy, width: 8.0 * sx, height: 1.6 * sy))
+
+            NSColor.black.setFill()
+            path.fill()
+            return true
         }
-    }
+        image.isTemplate = true  // macOS auto-tints for light/dark mode
+        return image
+    }()
 }
