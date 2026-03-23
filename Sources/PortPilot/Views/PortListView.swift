@@ -50,7 +50,7 @@ private struct CollapsibleSection: View {
                         .font(.caption)
                         .fontWeight(.semibold)
                         .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
+                        .textCase(nil)
                     Spacer()
                     Text("\(group.entries.count)")
                         .font(.caption2)
