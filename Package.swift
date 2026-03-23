@@ -17,7 +17,7 @@ let package = Package(
             dependencies: ["PortPilotCore"],
             path: "Sources/PortPilot"
         ),
-        .executableTarget(
+        .testTarget(
             name: "PortPilotTests",
             dependencies: ["PortPilotCore"],
             path: "Tests/PortPilotTests"
