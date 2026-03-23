@@ -12,11 +12,13 @@ public struct PortGroup: Identifiable, Sendable {
     public let id: String
     public let name: String
     public let entries: [PortEntry]
+    public let collapsedByDefault: Bool
 
-    public init(id: String, name: String, entries: [PortEntry]) {
+    public init(id: String, name: String, entries: [PortEntry], collapsedByDefault: Bool = false) {
         self.id = id
         self.name = name
         self.entries = entries
+        self.collapsedByDefault = collapsedByDefault
     }
 }
 
@@ -191,13 +193,15 @@ public final class PortStore {
             let cat = PortCategory.categorize(entry.port)
             groups[cat, default: []].append(entry)
         }
-        let order: [PortCategory] = [.system, .databases, .devServers, .highPorts]
+        // Dev servers first — those are the ports you care about while coding
+        let order: [PortCategory] = [.devServers, .databases, .system, .highPorts]
         return order.compactMap { cat in
             guard let entries = groups[cat], !entries.isEmpty else { return nil }
             return PortGroup(
                 id: "range-\(cat.rawValue)",
                 name: cat.displayName,
-                entries: entries.sorted { $0.port < $1.port }
+                entries: entries.sorted { $0.port < $1.port },
+                collapsedByDefault: cat == .highPorts
             )
         }
     }
