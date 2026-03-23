@@ -173,18 +173,55 @@ public final class PortStore {
     }
 
     private func groupByProject(_ entries: [PortEntry]) -> [PortGroup] {
-        var groups: [String: [PortEntry]] = [:]
+        var projectGroups: [String: [PortEntry]] = [:]
+        var macApps: [PortEntry] = []
+
         for entry in entries {
-            let key = entry.projectPath ?? "(no project)"
-            groups[key, default: []].append(entry)
+            if let project = entry.projectPath {
+                projectGroups[project, default: []].append(entry)
+            } else if Self.isMacApp(entry) {
+                macApps.append(entry)
+            } else {
+                projectGroups["Other", default: []].append(entry)
+            }
         }
-        return groups.map { key, entries in
+
+        // Dev projects first (sorted), then "macOS Apps" collapsed at bottom
+        var result = projectGroups.map { key, entries in
             PortGroup(
                 id: "project-\(key)",
                 name: key,
                 entries: entries.sorted { $0.port < $1.port }
             )
         }.sorted { $0.name < $1.name }
+
+        if !macApps.isEmpty {
+            result.append(PortGroup(
+                id: "macos-apps",
+                name: "macOS Apps",
+                entries: macApps.sorted { $0.port < $1.port },
+                collapsedByDefault: true
+            ))
+        }
+
+        return result
+    }
+
+    /// Detect if a port entry belongs to a macOS app (not a dev server)
+    private static func isMacApp(_ entry: PortEntry) -> Bool {
+        let path = entry.executablePath
+        // Apps in /Applications, /System, or Apple frameworks
+        if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
+        // Apple system services (ControlCenter, rapportd, etc.)
+        if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
+        // macOS apps with .app bundle paths
+        if path.contains(".app/") { return true }
+        // Known macOS app process names
+        let knownApps: Set<String> = [
+            "Spotify", "LINE", "ControlCenter", "rapportd", "figma_agent",
+            "Slack", "Discord", "zoom.us", "Notion", "Safari",
+        ]
+        return knownApps.contains(entry.processName)
     }
 
     private func groupByPortRange(_ entries: [PortEntry]) -> [PortGroup] {
