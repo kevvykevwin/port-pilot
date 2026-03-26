@@ -44,6 +44,13 @@ struct PortRowView: View {
                     .font(.caption)
                     .lineLimit(1)
 
+                if let desc = entry.vsCodeExtensionDescription {
+                    Text(desc)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
                 HStack(spacing: 4) {
                     // Project tag
                     if let project = projectLabel {

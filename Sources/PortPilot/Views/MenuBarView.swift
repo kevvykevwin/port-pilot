@@ -77,5 +77,6 @@ struct MenuBarView: View {
             .padding(.vertical, 8)
         }
         .frame(width: 320, height: 500)
+        .preferredColorScheme(.dark)
     }
 }
