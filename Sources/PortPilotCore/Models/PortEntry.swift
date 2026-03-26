@@ -31,6 +31,12 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
         self.projectPath = projectPath
     }
 
+    public var vsCodeExtensionDescription: String? {
+        guard processName.hasPrefix("Code Helper") else { return nil }
+        guard let extID = VSCodeExtensions.extractExtensionID(from: executablePath) else { return nil }
+        return VSCodeExtensions.knownExtensions[extID] ?? extID
+    }
+
     public enum PortProtocol: String, Sendable { case tcp, udp }
     public enum PortState: String, Sendable { case listen, established, other }
     public enum AddressFamily: String, Sendable { case ipv4, ipv6 }
