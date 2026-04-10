@@ -114,6 +114,8 @@ public final class PortStore {
     private let scanner: any PortScanning
     private let resolver: ProjectResolver
     private var scanTask: Task<Void, Never>?
+    private var previousSnapshot: PortSnapshot?
+    @ObservationIgnored public private(set) var lastDiff: SnapshotDiff?
 
     public init(scanner: any PortScanning = LsofScanner(), resolver: ProjectResolver = ProjectResolver()) {
         self.scanner = scanner
@@ -157,6 +159,24 @@ public final class PortStore {
     public var hasMultiPortProjects: Bool {
         !multiPortProjects.isEmpty
     }
+
+    /// Ports claimed by 2+ different PIDs — hard conflicts
+    public var conflicts: [PortConflict] {
+        ConflictDetector.detect(in: entries)
+    }
+
+    public var hasConflicts: Bool {
+        !conflicts.isEmpty
+    }
+
+    public var conflictingPorts: Set<UInt16> {
+        Set(conflicts.map(\.port))
+    }
+
+    /// Callback fired after every refresh with diff + current conflicts.
+    /// Used by ConflictNotifier to dispatch macOS notifications.
+    @ObservationIgnored
+    public var onRefreshComplete: (@MainActor @Sendable (_ diff: SnapshotDiff?, _ conflicts: [PortConflict]) -> Void)?
 
     // MARK: - Polling
 
@@ -204,6 +224,17 @@ public final class PortStore {
         }
 
         entries = scanned
+
+        let currentSnapshot = PortSnapshot(entries: scanned)
+        if let previous = previousSnapshot {
+            lastDiff = currentSnapshot.diff(from: previous)
+        } else {
+            lastDiff = nil
+        }
+        previousSnapshot = currentSnapshot
+
+        onRefreshComplete?(lastDiff, conflicts)
+
         isScanning = false
     }
 

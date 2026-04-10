@@ -11,6 +11,7 @@ Running 3-5 dev projects means port confusion — "what's on 3000?", "why is 800
 - **Project detection** — resolves process working directories to project roots (`.git`, `package.json`, `pyproject.toml`)
 - **Smart categorization** — separates dev servers (node, python, bun) from macOS apps (Spotify, Figma) by process identity, not just port range
 - **Two-click kill** — SIGTERM with confirmation, SIGKILL fallback
+- **Conflict detection** — red lighthouse + macOS notification when two processes claim the same port (debounced per-port)
 - **Multi-port alerts** — amber highlights when a project has 2+ listening ports, lighthouse beacon glows
 - **Grouped views** — by Project or by Type (Dev Servers, Databases, System, macOS Apps)
 - **Search** — filter by port number, process name, or project
