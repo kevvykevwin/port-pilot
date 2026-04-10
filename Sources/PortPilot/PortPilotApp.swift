@@ -5,21 +5,30 @@ import PortPilotCore
 @main
 struct PortPilotApp: App {
     @State private var store = PortStore()
+    private let notifier = ConflictNotifier()
 
     var body: some Scene {
         MenuBarExtra {
             MenuBarView(store: store)
         } label: {
-            Image(nsImage: store.hasMultiPortProjects
-                ? LighthouseIcon.menuBarImageActive
-                : LighthouseIcon.menuBarImage)
+            Image(nsImage: store.hasConflicts
+                ? LighthouseIcon.menuBarImageConflict
+                : store.hasMultiPortProjects
+                    ? LighthouseIcon.menuBarImageActive
+                    : LighthouseIcon.menuBarImage)
         }
         .menuBarExtraStyle(.window)
     }
 
     init() {
+        notifier.requestPermission()
+        // notifier outlives store; strong capture is intentional
+        let capturedNotifier = notifier
+        store.onRefreshComplete = { diff, conflicts in
+            capturedNotifier.handleRefresh(diff: diff, conflicts: conflicts)
+        }
         // Start polling immediately so the lighthouse icon reflects
-        // multi-port state without needing to open the popover.
+        // state without needing to open the popover.
         store.startPolling()
     }
 }
@@ -29,6 +38,8 @@ enum LighthouseIcon {
     static let menuBarImage: NSImage = makeImage(active: false)
     /// Lighthouse with glowing amber beacon — used when multi-port projects detected
     static let menuBarImageActive: NSImage = makeImage(active: true)
+    /// Lighthouse with red beacon — used when true port conflicts detected
+    static let menuBarImageConflict: NSImage = makeImage(active: true, beamColor: .red)
 
     /// Builds the lighthouse path into `path` using the scaled coordinate space.
     private static func buildLighthousePath(sx: CGFloat, sy: CGFloat) -> NSBezierPath {
@@ -66,7 +77,7 @@ enum LighthouseIcon {
         return path
     }
 
-    private static func makeImage(active: Bool) -> NSImage {
+    private static func makeImage(active: Bool, beamColor: NSColor = .orange) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: true) { rect in
             let sx = rect.width / 22
@@ -75,19 +86,19 @@ enum LighthouseIcon {
             NSColor.black.setFill()
             path.fill()
             if active {
-                // Amber glow beam — same triangle as the light beam, painted on top
+                // Glow beam — same triangle as the light beam, painted on top
                 let beam = NSBezierPath()
                 beam.move(to: NSPoint(x: 14.0 * sx, y: 5.4 * sy))
                 beam.line(to: NSPoint(x: 20.5 * sx, y: 4.4 * sy))
                 beam.line(to: NSPoint(x: 20.5 * sx, y: 6.8 * sy))
                 beam.close()
-                NSColor.orange.setFill()
+                beamColor.setFill()
                 beam.fill()
             }
             return true
         }
         // Template images are auto-tinted for light/dark mode.
-        // Active variant must NOT be a template — the amber beam must keep its color.
+        // Active variant must NOT be a template — the colored beam must keep its color.
         image.isTemplate = !active
         return image
     }

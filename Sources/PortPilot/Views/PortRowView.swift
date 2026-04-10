@@ -4,6 +4,7 @@ import PortPilotCore
 struct PortRowView: View {
     let entry: PortEntry
     var isMultiPort: Bool = false
+    var isConflicting: Bool = false
 
     @State private var confirmingKill = false
 
@@ -37,6 +38,14 @@ struct PortRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.yellow)
                     .help("Infrastructure — kill with caution")
+            }
+
+            // Conflict warning
+            if isConflicting {
+                Image(systemName: "exclamationmark.2")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .help("Port conflict — multiple processes on this port")
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -104,14 +113,16 @@ struct PortRowView: View {
         .padding(.vertical, 4)
         .padding(.horizontal, 4)
         .background(
-            isMultiPort
-                ? RoundedRectangle(cornerRadius: 4).fill(.orange.opacity(0.08))
-                : RoundedRectangle(cornerRadius: 4).fill(.clear)
+            RoundedRectangle(cornerRadius: 4).fill(
+                isConflicting ? Color.red.opacity(0.08)
+                : isMultiPort ? Color.orange.opacity(0.08)
+                : Color.clear
+            )
         )
         .overlay(alignment: .leading) {
-            if isMultiPort {
+            if isConflicting || isMultiPort {
                 RoundedRectangle(cornerRadius: 2)
-                    .fill(.orange)
+                    .fill(isConflicting ? Color.red : Color.orange)
                     .frame(width: 3)
                     .padding(.vertical, 2)
             }
