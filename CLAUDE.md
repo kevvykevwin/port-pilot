@@ -51,3 +51,11 @@ Tests/
 - No external dependencies (zero SPM packages)
 - Non-sandboxed (required for `proc_*` and `lsof` access)
 - `LSUIElement=true` in Info.plist (no Dock icon)
+
+## Compound Learnings
+
+### 2026-04-10
+- **Proactive port management**: Developer is exploring auto-rerouting and conflict detection for dev servers, suggesting the project is evolving from passive monitoring to active port management with automatic conflict resolution
+- **Uncertainty with testing**: Developer questions if tests "were tested properly" when reviewing implementation, indicating a pattern of double-checking test coverage and validity after feature implementation
+- **Git hook project isolation**: Developer specifically asks about making post-merge hooks project-specific rather than global, showing preference for contained automation that doesn't affect other repositories
+- **Release automation workflow**: Developer follows a consistent pattern of integrating tests → opening PR → updating local version → bumping release numbers as a single workflow step
