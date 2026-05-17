@@ -17,12 +17,17 @@ public struct PortConflict: Identifiable, Sendable {
         let labels = entries.map { entry -> String in
             entry.projectPath ?? entry.processName
         }
-        let unique = Set(labels)
-        // If all labels are identical (e.g., two "postgres"), disambiguate with PID
-        if unique.count == 1 {
-            return entries.map { "\($0.projectPath ?? $0.processName) (pid \($0.pid))" }
-                .joined(separator: " vs ")
+        let counts = Dictionary(labels.map { ($0, 1) }, uniquingKeysWith: +)
+
+        guard counts.values.contains(where: { $0 > 1 }) else {
+            return labels.sorted().joined(separator: " vs ")
         }
-        return unique.sorted().joined(separator: " vs ")
+
+        return entries.map { entry in
+            let label = entry.projectPath ?? entry.processName
+            return counts[label, default: 0] > 1 ? "\(label) (pid \(entry.pid))" : label
+        }
+        .sorted()
+        .joined(separator: " vs ")
     }
 }
