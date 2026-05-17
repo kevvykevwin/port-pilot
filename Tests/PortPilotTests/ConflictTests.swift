@@ -68,6 +68,15 @@ final class ConflictDetectorTests: XCTestCase {
         let conflict = PortConflict(port: 5432, entries: [postgres1, postgres2])
         XCTAssertEqual(conflict.conflictLabel, "postgres (pid 100) vs postgres (pid 200)")
     }
+
+    func testConflictLabelDisambiguatesRepeatedLabelsInMixedConflict() {
+        let node1 = makeConflictEntry(pid: 100, port: 3000, name: "node")
+        let node2 = makeConflictEntry(pid: 200, port: 3000, name: "node")
+        let python = makeConflictEntry(pid: 300, port: 3000, name: "python")
+
+        let conflict = PortConflict(port: 3000, entries: [node1, node2, python])
+        XCTAssertEqual(conflict.conflictLabel, "node (pid 100) vs node (pid 200) vs python")
+    }
 }
 
 // MARK: - PortStore Conflict Property Tests
