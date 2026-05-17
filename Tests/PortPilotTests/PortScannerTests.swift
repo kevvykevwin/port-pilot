@@ -166,6 +166,17 @@ final class PortStoreTests: XCTestCase {
         XCTAssertEqual(store.filteredEntries.count, 2)
     }
 
+    func testWhitespaceSearchReturnsAll() {
+        let store = PortStore()
+        store.entries = [
+            makeEntry(pid: 1, port: 3000, name: "node"),
+            makeEntry(pid: 2, port: 8080, name: "python"),
+        ]
+        store.searchText = " \n\t "
+
+        XCTAssertEqual(store.filteredEntries.count, 2)
+    }
+
     func testGroupByProject() {
         let store = PortStore()
         var e1 = makeEntry(pid: 1, port: 3000, name: "node")

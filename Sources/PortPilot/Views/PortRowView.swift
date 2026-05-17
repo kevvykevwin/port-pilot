@@ -7,6 +7,7 @@ struct PortRowView: View {
     var isConflicting: Bool = false
 
     @State private var confirmingKill = false
+    @State private var killConfirmResetTask: Task<Void, Never>?
 
     private static let killConfirmResetNs: UInt64 = 2_000_000_000  // 2s before button resets
 
@@ -83,13 +84,20 @@ struct PortRowView: View {
             // Kill button with confirmation
             Button {
                 if confirmingKill {
+                    killConfirmResetTask?.cancel()
+                    killConfirmResetTask = nil
                     _ = ProcessKiller.terminate(pid: entry.pid)
                     confirmingKill = false
                 } else {
                     confirmingKill = true
-                    Task {
+                    killConfirmResetTask?.cancel()
+                    killConfirmResetTask = Task {
                         try? await Task.sleep(nanoseconds: Self.killConfirmResetNs)
-                        confirmingKill = false
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run {
+                            confirmingKill = false
+                            killConfirmResetTask = nil
+                        }
                     }
                 }
             } label: {
@@ -132,6 +140,10 @@ struct PortRowView: View {
             Button("Copy Port")         { copy(String(entry.port)) }
             Button("Copy PID")          { copy(String(entry.pid)) }
             Button("Copy Kill Command") { copy("kill -9 \(entry.pid)") }
+        }
+        .onDisappear {
+            killConfirmResetTask?.cancel()
+            killConfirmResetTask = nil
         }
     }
 }
