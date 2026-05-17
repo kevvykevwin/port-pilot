@@ -12,6 +12,10 @@ public enum LibProc {
     // MARK: - PID Enumeration
 
     /// Returns all active PIDs on the system.
+    ///
+    /// `proc_listallpids` returns the PID count, not bytes — Apple's libproc
+    /// wrapper divides by `sizeof(int)` internally before returning. Dividing
+    /// again truncates the result to ~25% on systems with 4-byte `pid_t`.
     public static func listAllPids() -> [pid_t] {
         let pidCount = proc_listallpids(nil, 0)
         guard pidCount > 0 else { return [] }
