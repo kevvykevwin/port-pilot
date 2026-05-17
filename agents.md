@@ -1,87 +1,61 @@
-# Port Pilot — Agent Guide
+# Port Pilot
 
-Reference for AI agents working on this codebase.
+Native macOS menu bar app for managing local dev ports. Swift 6, SwiftUI, SPM.
 
-## Quick Context
-
-Port Pilot is a macOS menu bar utility (~600KB) that shows which local ports are in use, which project owns them, and lets you kill processes. Built with Swift 6, SwiftUI, no external dependencies.
-
-## Agent Routing
-
-| Task | Agent | Model |
-|------|-------|-------|
-| Code review | `swift-code-reviewer` | opus |
-| Security audit | `security-auditor` | opus |
-| Architecture changes | `code-architect` | opus |
-| Simplification | `code-simplifier` | sonnet |
-| Test generation | `test-generator` | sonnet |
-| Performance analysis | `performance-oracle` | sonnet |
-| Bug investigation | `investigate` | sonnet |
-| Build validation | `build-validator` | haiku |
-| File exploration | Explore agent | haiku |
-
-## Build Commands for Agents
+## Build & Test
 
 ```bash
-# Verify build
-swift build -c release
-
-# Run tests
-swift test
-
-# Build .app bundle
-./scripts/build-app.sh
-
-# Relaunch after changes
-pkill -f "PortPilot.app"; sleep 1; open ~/Projects/portpilot/build/PortPilot.app
+swift build              # debug build
+swift build -c release   # release build
+swift test               # 15 XCTest tests
+swift run PortPilot      # launch menu bar app (GUI)
+./scripts/build-app.sh   # build .app bundle with ad-hoc signing
 ```
 
-## Critical Files (read these first)
-
-| File | Why |
-|------|-----|
-| `Sources/PortPilotCore/ViewModels/PortStore.swift` | Central state — grouping, search, polling, categorization |
-| `Sources/PortPilotCore/Services/LsofScanner.swift` | Primary scanner — async continuation pattern |
-| `Sources/PortPilotCore/Services/LibProc.swift` | All unsafe C interop — single isolation point |
-| `Sources/PortPilotCore/Services/ProjectResolver.swift` | Cache with NSLock — thread safety critical |
-| `Sources/PortPilot/PortPilotApp.swift` | Menu bar setup + lighthouse icon drawing |
-
-## Known Gotchas
-
-1. **`MenuBarExtra` labels only render `Image` and `Text`** — no Canvas, no custom views. The lighthouse icon must be an `NSImage`.
-2. **`libproc` `proc_pidinfo(PROC_PIDLISTFDS)` has limited visibility** even for user-owned processes on macOS. That's why `LsofScanner` (setuid root) is primary.
-3. **`LsofScanner.runLsof()`** reads pipe data inside `terminationHandler` — safe because `-sTCP:LISTEN` output is well under 64KB pipe buffer. Don't add flags that increase output without addressing this.
-4. **`PortStore` is `@MainActor @Observable`** — all access must be on MainActor. Tests use `@MainActor` class annotation.
-5. **`ProjectResolver` cache uses `String??`** (double optional) — `nil` = cache miss, `.some(nil)` = cached negative result (no project found).
-6. **No Xcode project file** — this is pure SPM. Open `Package.swift` in Xcode if you need the IDE.
-7. **`isTemplate` on NSImage** — normal lighthouse is `true` (auto-tints), amber beacon is `false` (keeps orange color). Don't set both to template.
-
-## Concurrency Model
+## Project Structure
 
 ```
-App.init() → startPolling()
-  └── Task { [weak self] in
-        while !Task.isCancelled {
-          guard let self else { return }  // re-check each iteration
-          await self.refresh()            // MainActor
-            └── LsofScanner.scan()        // background via continuation
-            └── ProjectResolver.resolve()  // NSLock-protected cache
-          try await Task.sleep(...)       // breaks on cancellation
-        }
-      }
+Sources/
+├── PortPilotCore/       # library target (models, services, view models)
+│   ├── Models/          # PortEntry, PortSnapshot
+│   ├── Services/        # LibProc, LsofScanner, PortScanner, ProjectResolver, ProcessKiller
+│   └── ViewModels/      # PortStore (+ GroupMode, PortGroup, PortCategory)
+└── PortPilot/           # executable target (SwiftUI app)
+    ├── PortPilotApp.swift  # @main, MenuBarExtra, LighthouseIcon
+    └── Views/              # MenuBarView, PortListView, PortRowView, EmptyStateView
+Tests/
+└── PortPilotTests/      # XCTest suite
 ```
 
-## Test Strategy
+## Key Patterns
 
-- **Integration tests** hit the real system (spawn sockets, spawn processes)
-- **Unit tests** use `MockScanner` and canned data
-- **No mocking of `libproc`** — tested indirectly via scanner integration
-- **No UI tests** — SwiftUI views tested via PortStore state assertions
+- **Two targets**: `PortPilotCore` (library, all logic) + `PortPilot` (app, SwiftUI views). All core types are `public`.
+- **Scanner protocol**: `PortScanning` — `LsofScanner` is primary (setuid root visibility), `PortScanner` (libproc) is fast fallback. Mock via protocol for tests.
+- **Unsafe code isolation**: All `proc_*` C interop lives in `LibProc.swift`. Uses Array buffers, not manual allocate/deallocate.
+- **Concurrency**: `LsofScanner` uses `withCheckedThrowingContinuation` (not blocking `waitUntilExit`). `PortStore` polling uses `[weak self]` inside loop body with cancellation break.
+- **Thread safety**: `ProjectResolver` cache uses `NSLock` + `withLock` helper (defer-scoped). Cache keyed on `(PID, processStartTime)` to handle PID reuse.
+- **macOS app detection**: `PortCategory.isMacApp()` — single source of truth. Checks executable path (`/Applications/`, `.app/`, `/System/`) and known process names.
+- **Menu bar icon**: `NSImage` drawn via `NSBezierPath` (not Canvas/SF Symbol — those don't render in `MenuBarExtra` labels). `isTemplate=true` for light/dark auto-tinting, `isTemplate=false` for amber beacon.
 
-## v0.2 Priorities
+## Testing
 
-1. Kill result feedback in UI (KillResult is currently discarded in PortRowView)
-2. LsofScanner error surfacing (currently silent on failure)
-3. Edge case tests for lsof parsing
-4. Docker container awareness
-5. Global hotkey (Cmd+Shift+P)
+- Tests use XCTest (requires Xcode or Xcode Command Line Tools with full Xcode installed)
+- Scanner tests spawn real TCP listeners and processes — they test against the live system
+- PortStore tests use `MockScanner` for deterministic results
+- `@MainActor` tests for PortStore (it's `@Observable @MainActor`)
+
+## Conventions
+
+- Swift 6 strict concurrency
+- `Sendable` on all models and services
+- No external dependencies (zero SPM packages)
+- Non-sandboxed (required for `proc_*` and `lsof` access)
+- `LSUIElement=true` in Info.plist (no Dock icon)
+
+## Compound Learnings
+
+### 2026-04-10
+- **Proactive port management**: Developer is exploring auto-rerouting and conflict detection for dev servers, suggesting the project is evolving from passive monitoring to active port management with automatic conflict resolution
+- **Uncertainty with testing**: Developer questions if tests "were tested properly" when reviewing implementation, indicating a pattern of double-checking test coverage and validity after feature implementation
+- **Git hook project isolation**: Developer specifically asks about making post-merge hooks project-specific rather than global, showing preference for contained automation that doesn't affect other repositories
+- **Release automation workflow**: Developer follows a consistent pattern of integrating tests → opening PR → updating local version → bumping release numbers as a single workflow step
