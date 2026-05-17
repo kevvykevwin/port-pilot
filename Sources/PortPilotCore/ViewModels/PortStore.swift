@@ -125,8 +125,8 @@ public final class PortStore {
     // MARK: - Computed properties
 
     public var filteredEntries: [PortEntry] {
-        guard !searchText.isEmpty else { return entries }
-        let query = searchText.lowercased()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return entries }
         return entries.filter { entry in
             String(entry.port).contains(query)
                 || entry.processName.lowercased().contains(query)

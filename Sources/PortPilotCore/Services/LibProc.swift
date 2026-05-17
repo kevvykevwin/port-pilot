@@ -13,16 +13,15 @@ public enum LibProc {
 
     /// Returns all active PIDs on the system.
     public static func listAllPids() -> [pid_t] {
-        let bufferSize = proc_listallpids(nil, 0)
-        guard bufferSize > 0 else { return [] }
+        let pidCount = proc_listallpids(nil, 0)
+        guard pidCount > 0 else { return [] }
 
-        var pids = [pid_t](repeating: 0, count: Int(bufferSize))
-        let actualSize = pids.withUnsafeMutableBufferPointer { buffer in
+        var pids = [pid_t](repeating: 0, count: Int(pidCount))
+        let actualCount = pids.withUnsafeMutableBufferPointer { buffer in
             proc_listallpids(buffer.baseAddress, Int32(buffer.count * MemoryLayout<pid_t>.size))
         }
-        guard actualSize > 0 else { return [] }
-        let count = Int(actualSize) / MemoryLayout<pid_t>.size
-        return Array(pids.prefix(count))
+        guard actualCount > 0 else { return [] }
+        return Array(pids.prefix(Int(actualCount)))
     }
 
     // MARK: - File Descriptors
