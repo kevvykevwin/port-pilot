@@ -54,8 +54,9 @@ Tests/
 
 ## Compound Learnings
 
-### 2026-04-10
-- **Proactive port management**: Developer is exploring auto-rerouting and conflict detection for dev servers, suggesting the project is evolving from passive monitoring to active port management with automatic conflict resolution
-- **Uncertainty with testing**: Developer questions if tests "were tested properly" when reviewing implementation, indicating a pattern of double-checking test coverage and validity after feature implementation
-- **Git hook project isolation**: Developer specifically asks about making post-merge hooks project-specific rather than global, showing preference for contained automation that doesn't affect other repositories
-- **Release automation workflow**: Developer follows a consistent pattern of integrating tests → opening PR → updating local version → bumping release numbers as a single workflow step
+
+
+### 2026-05-18
+- **Post-merge cleanup workflow**: Developer has a systematic `/post-merge-cleanup` command pattern with numbered steps (4, 5) suggesting a structured checklist approach for handling merge aftermath tasks
+- **Version bump oversight**: Developer acknowledges missing version bumps during deployment but chooses to defer to next PR rather than interrupt current workflow, indicating preference for forward momentum over immediate corrections
+- **Worktree deployment pattern**: Uses git worktrees for commit/deploy/PR workflow, suggesting a branching strategy that isolates deployment preparation from main development work
