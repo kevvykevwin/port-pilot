@@ -3,8 +3,8 @@
 ## Current State
 
 **Version**: v0.1.0 (released)
-**Branch**: `feat/always-poll` (PR #1 open → main)
-**Tests**: 15/15 passing (`swift test`)
+**Branch**: `fix/vscode-extension-false-positive` (PR open → main)
+**Tests**: 48/48 passing (`swift test`)
 **Build**: clean (release)
 **Repo**: https://github.com/kevvykevwin/port-pilot
 
@@ -67,7 +67,7 @@ PortPilot (app)
 | PortScanner | 2 | Integration (spawn listener + self-test) |
 | PortSnapshot | 2 | Unit (canned diff data) |
 | ProjectResolver | 3 | Unit (cache, markers, setup) |
-| PortStore | 6 | Unit (search, grouping, dedup) |
+| PortStore | 7 | Unit (search, grouping, dedup, editor-helper grouping) |
 | ProcessKiller | 1 | Integration (spawn + kill process) |
 
 ## v0.2 Roadmap
@@ -95,3 +95,4 @@ PortPilot (app)
 | 2026-03-22 | Code review + simplifier | Fixed concurrency, ARC, lock safety, DRY |
 | 2026-03-22 | Deployed to GitHub | v0.1.0 release, MIT license |
 | 2026-03-23 | Always-poll PR #1 | Beacon reflects state on launch |
+| 2026-06-13 | VS Code extension false-positive fix | Pylance/Code Helper helpers no longer surface as phantom projects; group under macOS Apps |
