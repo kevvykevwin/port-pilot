@@ -198,6 +198,36 @@ final class PortStoreTests: XCTestCase {
         XCTAssertEqual(scGroup?.entries.count, 2)
     }
 
+    /// Regression: VS Code "Code Helper (Plugin)" language servers (e.g. Pylance)
+    /// run with cwd inside the extension dir, which the resolver used to surface as
+    /// a phantom project named "ms-python.vscode-pylance-2026.2.1". Editor helpers
+    /// must group under macOS Apps regardless of any resolved projectPath.
+    func testEditorHelperGroupsUnderMacAppsNotAsProject() {
+        let store = PortStore()
+        var pylance = makeEntry(
+            pid: 1, port: 49861, name: "Code Helper (Plugin)",
+            executablePath: "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"
+        )
+        pylance.projectPath = "ms-python.vscode-pylance-2026.2.1"  // the phantom the bug produced
+        var realServer = makeEntry(pid: 2, port: 3000, name: "node")
+        realServer.projectPath = "sift-coffee"
+
+        store.entries = [pylance, realServer]
+        store.groupMode = .project
+
+        let groups = store.grouped
+        XCTAssertNil(
+            groups.first { $0.name == "ms-python.vscode-pylance-2026.2.1" },
+            "Editor helper must not appear as its own project"
+        )
+        XCTAssertNil(
+            groups.first { $0.name == "Other" },
+            "Editor helper must not fall through to the Other bucket"
+        )
+        XCTAssertEqual(groups.first { $0.name == "macOS Apps" }?.entries.count, 1)
+        XCTAssertEqual(groups.first { $0.name == "sift-coffee" }?.entries.count, 1)
+    }
+
     func testGroupByPortRange() {
         let store = PortStore()
         store.entries = [
@@ -266,11 +296,12 @@ final class ProcessKillerTests: XCTestCase {
 
 private func makeEntry(
     pid: pid_t, port: UInt16, name: String,
-    family: PortEntry.AddressFamily = .ipv4
+    family: PortEntry.AddressFamily = .ipv4,
+    executablePath: String? = nil
 ) -> PortEntry {
     PortEntry(
         pid: pid, port: port, processName: name,
-        executablePath: "/usr/bin/\(name)", protocol: .tcp,
+        executablePath: executablePath ?? "/usr/bin/\(name)", protocol: .tcp,
         state: .listen, family: family,
         localAddress: family == .ipv4 ? "127.0.0.1" : "::1",
         processStartTime: .now

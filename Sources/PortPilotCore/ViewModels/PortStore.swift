@@ -215,9 +215,15 @@ public final class PortStore {
         // IPv6 dedup: merge entries with same (port, pid) but different address families
         scanned = dedupIPv6(scanned)
 
-        // Resolve project paths
+        // Resolve project paths — but never for editor/app helper processes.
+        // A VS Code "Code Helper (Plugin)" language server runs with its cwd set
+        // to the extension install dir (e.g. ~/.vscode/extensions/ms-python.
+        // vscode-pylance-2026.2.1), which contains a package.json and would
+        // otherwise resolve to a phantom "project" named after the extension.
+        // These belong in the macOS Apps group, not a dev-project group.
         for i in scanned.indices {
             let entry = scanned[i]
+            guard !PortCategory.isMacApp(entry) else { continue }
             if let project = resolver.resolve(pid: entry.pid, startTime: entry.processStartTime) {
                 scanned[i].projectPath = project
             }
@@ -272,10 +278,13 @@ public final class PortStore {
         var macApps: [PortEntry] = []
 
         for entry in entries {
-            if let project = entry.projectPath {
-                projectGroups[project, default: []].append(entry)
-            } else if PortCategory.isMacApp(entry) {
+            // isMacApp wins over projectPath (consistent with categorize): an
+            // editor/app helper never belongs to a dev project, even if its cwd
+            // happened to resolve to one.
+            if PortCategory.isMacApp(entry) {
                 macApps.append(entry)
+            } else if let project = entry.projectPath {
+                projectGroups[project, default: []].append(entry)
             } else {
                 projectGroups["Other", default: []].append(entry)
             }

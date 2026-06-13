@@ -109,6 +109,14 @@ public final class ProjectResolver: Sendable {
     /// Walks up from `startPath` looking for project marker files/dirs.
     /// Returns the directory name of the project root, or nil.
     private func findProjectRoot(from startPath: String) -> String? {
+        // Editor extension install dirs (~/.vscode/extensions/<ext>/…, .cursor, …)
+        // ship a package.json and would otherwise resolve to a phantom "project"
+        // named after the extension (e.g. "ms-python.vscode-pylance-2026.2.1").
+        // Anything running inside one is editor infrastructure, not a user project.
+        if VSCodeExtensions.extractExtensionID(from: startPath) != nil {
+            return nil
+        }
+
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         var current = startPath
