@@ -150,7 +150,10 @@ public final class PortStore {
 
     /// Projects with 2+ listening ports — potential dupes worth flagging
     public var multiPortProjects: Set<String> {
-        let counts = Dictionary(grouping: entries.compactMap(\.projectPath), by: { $0 })
+        let listeningProjectPaths = entries
+            .filter { $0.state == .listen }
+            .compactMap(\.projectPath)
+        let counts = Dictionary(grouping: listeningProjectPaths, by: { $0 })
             .filter { $0.value.count >= 2 }
         return Set(counts.keys)
     }
