@@ -245,6 +245,21 @@ final class PortStoreTests: XCTestCase {
         XCTAssertTrue(groupNames.contains("High Ports"), "got: \(groupNames)")
     }
 
+    func testMultiPortProjectsCountsOnlyListeningEntries() {
+        let store = PortStore()
+        var listening = makeEntry(pid: 1, port: 3000, name: "node", state: .listen)
+        listening.projectPath = "sift-coffee"
+        var established = makeEntry(pid: 2, port: 3001, name: "node", state: .established)
+        established.projectPath = "sift-coffee"
+        var otherProjectPort = makeEntry(pid: 3, port: 5173, name: "vite", state: .listen)
+        otherProjectPort.projectPath = "portpilot"
+
+        store.entries = [listening, established, otherProjectPort]
+
+        XCTAssertFalse(store.hasMultiPortProjects)
+        XCTAssertTrue(store.multiPortProjects.isEmpty)
+    }
+
     func testIPv6Dedup() async {
         let mockScanner = MockScanner(entries: [
             makeEntry(pid: 10, port: 4000, name: "server", family: .ipv6),
@@ -297,12 +312,13 @@ final class ProcessKillerTests: XCTestCase {
 private func makeEntry(
     pid: pid_t, port: UInt16, name: String,
     family: PortEntry.AddressFamily = .ipv4,
+    state: PortEntry.PortState = .listen,
     executablePath: String? = nil
 ) -> PortEntry {
     PortEntry(
         pid: pid, port: port, processName: name,
         executablePath: executablePath ?? "/usr/bin/\(name)", protocol: .tcp,
-        state: .listen, family: family,
+        state: state, family: family,
         localAddress: family == .ipv4 ? "127.0.0.1" : "::1",
         processStartTime: .now
     )
