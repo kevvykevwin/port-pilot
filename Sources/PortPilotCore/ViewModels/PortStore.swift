@@ -180,8 +180,33 @@ public final class PortStore {
 
     // MARK: - Polling
 
-    private static let pollIntervalNormal: UInt64    = 2_000_000_000  // 2s
-    private static let pollIntervalLowPower: UInt64  = 5_000_000_000  // 5s
+    // Fast cadence only while the menu is open; slow background cadence otherwise.
+    // Each refresh() forks an lsof subprocess (kernel fd-table walk) — keeping that
+    // at 2s around the clock is what flags the app as "Using Significant Energy".
+    private static let pollIntervalActive: UInt64     =  2_000_000_000  // 2s — menu open
+    private static let pollIntervalBackground: UInt64 = 30_000_000_000  // 30s — menu closed
+    private static let pollIntervalLowPower: UInt64   = 60_000_000_000  // 60s — Low Power Mode
+
+    private var isActive = false
+
+    private func nextInterval() -> UInt64 {
+        // Active (menu open) always polls fast — the window is short-lived, so the
+        // energy cost is bounded, and stale data while the user is looking is worse.
+        // Low Power Mode only stretches the slow background cadence.
+        if isActive { return Self.pollIntervalActive }
+        return ProcessInfo.processInfo.isLowPowerModeEnabled
+            ? Self.pollIntervalLowPower
+            : Self.pollIntervalBackground
+    }
+
+    /// Switch cadence when the menu opens/closes. Opening restarts the loop so the
+    /// list reflects current state immediately and switches to the fast interval;
+    /// closing lets the running loop pick up the slow interval on its next tick.
+    public func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        isActive = active
+        if active { startPolling() }
+    }
 
     public func startPolling() {
         stopPolling()
@@ -189,11 +214,8 @@ public final class PortStore {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refresh()
-                let interval = ProcessInfo.processInfo.isLowPowerModeEnabled
-                    ? Self.pollIntervalLowPower
-                    : Self.pollIntervalNormal
                 do {
-                    try await Task.sleep(nanoseconds: interval)
+                    try await Task.sleep(nanoseconds: self.nextInterval())
                 } catch {
                     break
                 }
@@ -211,6 +233,14 @@ public final class PortStore {
     public func refresh() async {
         isScanning = true
         var scanned = await scanner.scan()
+
+        // A menu-open restart cancels the prior polling task; if it was suspended
+        // inside scan() above, bail before publishing so the dying run and the new
+        // one can't both mutate state and fire a phantom conflict notification.
+        if Task.isCancelled {
+            isScanning = false
+            return
+        }
 
         // IPv6 dedup: merge entries with same (port, pid) but different address families
         scanned = dedupIPv6(scanned)
