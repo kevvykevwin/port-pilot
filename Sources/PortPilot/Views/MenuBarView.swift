@@ -82,5 +82,9 @@ struct MenuBarView: View {
         }
         .frame(width: 320, height: 500)
         .preferredColorScheme(.dark)
+        // The window's content view appears/disappears as the menu opens/closes.
+        // Use that to run fast (2s) polling only while visible.
+        .onAppear { store.setActive(true) }
+        .onDisappear { store.setActive(false) }
     }
 }
