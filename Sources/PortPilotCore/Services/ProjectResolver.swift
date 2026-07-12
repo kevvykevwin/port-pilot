@@ -10,11 +10,6 @@ public final class ProjectResolver: Sendable {
         let startTime: Date
     }
 
-    private struct CacheEntry {
-        let key: CacheKey
-        let value: String?
-    }
-
     private let lock = NSLock()
     private let _cache = _MutableState()
 
