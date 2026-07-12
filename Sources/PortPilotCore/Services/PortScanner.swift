@@ -127,7 +127,6 @@ public final class PortScanner: PortScanning, Sendable {
     /// Verifies the scanner can see its own process.
     public func selfTest() async -> Bool {
         let myPid = getpid()
-        let entries = await scan()
         // We may not have a listening port, but we should at least be able to
         // enumerate PIDs that include our own.
         let pids = LibProc.listAllPids()
