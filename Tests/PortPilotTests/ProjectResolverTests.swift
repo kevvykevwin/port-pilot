@@ -26,15 +26,48 @@ final class ProjectResolverTests: XCTestCase {
         _ = result3 as String?
     }
 
-    func testGitMarkerDirectorySetup() throws {
-        let tmpBase = FileManager.default.temporaryDirectory
-            .appendingPathComponent("portpilot-test-\(Int.random(in: 1_000_000...9_999_999))")
-        let gitDir = tmpBase.appendingPathComponent("my-project/.git")
-        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpBase) }
+    func testFindProjectRootRecognizesGitDirectoryFromNestedPath() throws {
+        let fixture = try makeTemporaryFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
 
-        var isDir: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &isDir))
-        XCTAssertTrue(isDir.boolValue)
+        let project = fixture.appendingPathComponent("normal-project")
+        let nested = project.appendingPathComponent("Sources/Feature")
+        try FileManager.default.createDirectory(
+            at: project.appendingPathComponent(".git"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        XCTAssertEqual(ProjectResolver().findProjectRoot(from: nested.path), "normal-project")
+    }
+
+    func testFindProjectRootRecognizesWorktreeGitFileFromNestedPath() throws {
+        let fixture = try makeTemporaryFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+
+        let project = fixture.appendingPathComponent("worktree-project")
+        let nested = project.appendingPathComponent("Sources/Feature")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let gitFile = project.appendingPathComponent(".git")
+        try Data("gitdir: /tmp/example\n".utf8).write(to: gitFile)
+
+        XCTAssertEqual(ProjectResolver().findProjectRoot(from: nested.path), "worktree-project")
+    }
+
+    func testFindProjectRootReturnsNilWithoutProjectMarkers() throws {
+        let fixture = try makeTemporaryFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+
+        let nested = fixture.appendingPathComponent("plain-directory/nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        XCTAssertNil(ProjectResolver().findProjectRoot(from: nested.path))
+    }
+
+    private func makeTemporaryFixture() throws -> URL {
+        let fixture = FileManager.default.temporaryDirectory
+            .appendingPathComponent("portpilot-project-resolver-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
+        return fixture
     }
 }

@@ -103,7 +103,7 @@ public final class ProjectResolver: Sendable {
 
     /// Walks up from `startPath` looking for project marker files/dirs.
     /// Returns the directory name of the project root, or nil.
-    private func findProjectRoot(from startPath: String) -> String? {
+    func findProjectRoot(from startPath: String) -> String? {
         // Editor extension install dirs (~/.vscode/extensions/<ext>/…, .cursor, …)
         // ship a package.json and would otherwise resolve to a phantom "project"
         // named after the extension (e.g. "ms-python.vscode-pylance-2026.2.1").
@@ -119,10 +119,7 @@ public final class ProjectResolver: Sendable {
         while current != "/" && current != home {
             for marker in Self.projectMarkers {
                 let markerPath = (current as NSString).appendingPathComponent(marker)
-                var isDir: ObjCBool = false
-                if fm.fileExists(atPath: markerPath, isDirectory: &isDir) {
-                    // .git must be a directory; others are files
-                    if marker == ".git" && !isDir.boolValue { continue }
+                if fm.fileExists(atPath: markerPath) {
                     return (current as NSString).lastPathComponent
                 }
             }
