@@ -3,21 +3,31 @@ import Foundation
 import os.log
 
 public protocol PortScanning: Sendable {
-    func scan() async -> [PortEntry]
+    func scan() async -> PortScanResult
 }
 
 public final class PortScanner: PortScanning, Sendable {
     private let logger = Logger(subsystem: "com.portpilot", category: "PortScanner")
     private let signposter = OSSignposter(subsystem: "com.portpilot", category: "PortScanner")
+    private let pidProvider: @Sendable () -> [pid_t]
 
-    public init() {}
+    public init() {
+        pidProvider = { LibProc.listAllPids() }
+    }
 
-    public func scan() async -> [PortEntry] {
+    init(pidProvider: @escaping @Sendable () -> [pid_t]) {
+        self.pidProvider = pidProvider
+    }
+
+    public func scan() async -> PortScanResult {
         let state = signposter.beginInterval("scan")
         defer { signposter.endInterval("scan", state) }
 
         let startTime = CFAbsoluteTimeGetCurrent()
-        let pids = LibProc.listAllPids()
+        let pids = pidProvider()
+        guard !pids.isEmpty else {
+            return .failure(.unavailable)
+        }
         var entries: [PortEntry] = []
 
         for pid in pids {
@@ -121,7 +131,7 @@ public final class PortScanner: PortScanning, Sendable {
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         logger.info("Scan completed: \(entries.count) entries in \(elapsed, format: .fixed(precision: 3))s")
-        return entries
+        return .success(entries: entries, source: .libprocFallback)
     }
 
     /// Verifies the scanner can see its own process.
@@ -129,7 +139,7 @@ public final class PortScanner: PortScanning, Sendable {
         let myPid = getpid()
         // We may not have a listening port, but we should at least be able to
         // enumerate PIDs that include our own.
-        let pids = LibProc.listAllPids()
+        let pids = pidProvider()
         return pids.contains(myPid)
     }
 

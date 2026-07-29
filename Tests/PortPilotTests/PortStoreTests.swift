@@ -148,6 +148,75 @@ final class PortStoreTests: XCTestCase {
         XCTAssertEqual(port4000?.family, .ipv4, "IPv4 should be preferred in dedup")
     }
 
+    func testTotalFailureRetainsLastSuccessfulEntriesAndDiff() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+        var callbackCount = 0
+        store.onRefreshComplete = { _, _ in callbackCount += 1 }
+
+        let successfulRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        await scanner.completeRequest(
+            0,
+            with: [makeEntry(pid: 1, port: 3000, name: "server")]
+        )
+        await successfulRefresh.value
+
+        let failedRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(2)
+        await scanner.completeRequest(1, with: .failure(.allScannersFailed))
+        await failedRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [3000])
+        XCTAssertNil(store.lastDiff)
+        XCTAssertEqual(store.scanError, .allScannersFailed)
+        XCTAssertEqual(store.lastScanSource, .lsof)
+        XCTAssertEqual(callbackCount, 1, "Failure must not publish a false removal diff")
+        XCTAssertFalse(store.isScanning)
+    }
+
+    func testSuccessfulEmptyClearsFailureAndPublishesHealthyEmpty() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+
+        let failedRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        await scanner.completeRequest(0, with: .failure(.allScannersFailed))
+        await failedRefresh.value
+        XCTAssertNotNil(store.scanError)
+
+        let emptyRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(2)
+        await scanner.completeRequest(1, with: [])
+        await emptyRefresh.value
+
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertNil(store.scanError)
+        XCTAssertEqual(store.lastScanSource, .lsof)
+    }
+
+    func testStaleFailureCannotReplaceNewerSuccessfulState() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+
+        let firstRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        let secondRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(2)
+
+        await scanner.completeRequest(
+            1,
+            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
+        )
+        await secondRefresh.value
+        await scanner.completeRequest(0, with: .failure(.allScannersFailed))
+        await firstRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [4000])
+        XCTAssertNil(store.scanError)
+        XCTAssertEqual(store.lastScanSource, .lsof)
+    }
+
     func testStaleRefreshCompletingFirstCannotPublish() async {
         let scanner = ControlledScanner()
         let store = PortStore(scanner: scanner)

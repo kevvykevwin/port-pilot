@@ -110,6 +110,8 @@ public final class PortStore {
     public var searchText: String = ""
     public var groupMode: GroupMode = .project
     public var isScanning = false
+    public private(set) var scanError: PortScanError?
+    public private(set) var lastScanSource: PortScanSource?
 
     private let scanner: any PortScanning
     private let resolver: ProjectResolver
@@ -118,7 +120,10 @@ public final class PortStore {
     private var previousSnapshot: PortSnapshot?
     @ObservationIgnored public private(set) var lastDiff: SnapshotDiff?
 
-    public init(scanner: any PortScanning = LsofScanner(), resolver: ProjectResolver = ProjectResolver()) {
+    public init(
+        scanner: any PortScanning = ResilientPortScanner(),
+        resolver: ProjectResolver = ProjectResolver()
+    ) {
         self.scanner = scanner
         self.resolver = resolver
     }
@@ -238,7 +243,7 @@ public final class PortStore {
         refreshGeneration &+= 1
         let generation = refreshGeneration
         isScanning = true
-        var scanned = await scanner.scan()
+        let scanResult = await scanner.scan()
 
         // Scans may overlap when polling and manual refreshes interleave. Only the
         // newest request may publish; an obsolete request must not clear the
@@ -251,6 +256,17 @@ public final class PortStore {
             isScanning = false
             return
         }
+
+        guard case .success(var scanned, let source) = scanResult else {
+            if case .failure(let error) = scanResult {
+                scanError = error
+            }
+            isScanning = false
+            return
+        }
+
+        scanError = nil
+        lastScanSource = source
 
         // IPv6 dedup: merge entries with same (port, pid) but different address families
         scanned = dedupIPv6(scanned)

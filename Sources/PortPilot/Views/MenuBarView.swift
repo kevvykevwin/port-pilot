@@ -30,8 +30,30 @@ struct MenuBarView: View {
             Divider()
 
             // MARK: - Port List or Empty State
+            if store.scanError != nil && !store.entries.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Scan failed — showing last results")
+                        .font(.caption)
+                    Spacer()
+                    Button("Retry") {
+                        Task { await store.refresh() }
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                Divider()
+            }
+
             if store.filteredEntries.isEmpty {
-                EmptyStateView(hasEntries: !store.entries.isEmpty)
+                EmptyStateView(
+                    hasEntries: !store.entries.isEmpty,
+                    scanFailed: store.scanError != nil
+                ) {
+                    Task { await store.refresh() }
+                }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
