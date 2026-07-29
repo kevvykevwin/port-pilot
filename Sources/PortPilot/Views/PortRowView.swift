@@ -6,8 +6,23 @@ struct PortRowView: View {
     var isMultiPort: Bool = false
     var isConflicting: Bool = false
 
-    @State private var confirmingKill = false
+    private enum KillState: Equatable {
+        case idle
+        case confirming
+        case terminating
+        case forceKillNeeded
+        case forceKilling
+        case terminated
+        case permissionDenied
+        case staleProcess
+        case processGone
+        case identityUnavailable
+        case failed(String)
+    }
+
+    @State private var killState: KillState = .idle
     @State private var killConfirmResetTask: Task<Void, Never>?
+    @State private var killTask: Task<Void, Never>?
 
     private static let killConfirmResetNs: UInt64 = 2_000_000_000  // 2s before button resets
 
@@ -24,6 +39,160 @@ struct PortRowView: View {
         guard let path = entry.projectPath else { return nil }
         // Show just the last path component as the project name
         return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private var killHelp: String {
+        switch killState {
+        case .idle:
+            return "Kill process \(entry.pid)"
+        case .confirming:
+            return "Click again to terminate process"
+        case .terminating:
+            return "Waiting for process to exit"
+        case .forceKillNeeded:
+            return "Process ignored SIGTERM; click to send SIGKILL"
+        case .forceKilling:
+            return "Force killing process"
+        case .terminated:
+            return "Process terminated"
+        case .permissionDenied:
+            return "Permission denied"
+        case .staleProcess:
+            return "PID belongs to a different process; no signal was sent"
+        case .processGone:
+            return "Process already exited"
+        case .identityUnavailable:
+            return "Could not verify current process identity; no further signal was sent"
+        case .failed(let message):
+            return "Termination failed: \(message)"
+        }
+    }
+
+    private func beginConfirmation() {
+        guard killTask == nil else { return }
+
+        killState = .confirming
+        killConfirmResetTask?.cancel()
+        killConfirmResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: Self.killConfirmResetNs)
+            guard !Task.isCancelled else { return }
+            killState = .idle
+            killConfirmResetTask = nil
+        }
+    }
+
+    private func beginGracefulTermination() {
+        guard killTask == nil else { return }
+
+        killConfirmResetTask?.cancel()
+        killConfirmResetTask = nil
+        killState = .terminating
+        killTask = Task { @MainActor in
+            let result = await ProcessKiller.terminateWithGrace(
+                pid: entry.pid,
+                expectedStartTime: entry.processStartTime
+            )
+            guard !Task.isCancelled else { return }
+            apply(result)
+            killTask = nil
+        }
+    }
+
+    private func beginForceKill() {
+        guard killTask == nil, killState == .forceKillNeeded else { return }
+
+        killState = .forceKilling
+        let pid = entry.pid
+        let expectedStartTime = entry.processStartTime
+        killTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            let result = ProcessKiller.forceKill(
+                pid: pid,
+                expectedStartTime: expectedStartTime
+            )
+            guard !Task.isCancelled else { return }
+            apply(result)
+            killTask = nil
+        }
+    }
+
+    private func apply(_ result: KillResult) {
+        switch result {
+        case .terminated:
+            killState = .terminated
+        case .forceKillNeeded:
+            killState = .forceKillNeeded
+        case .permissionDenied:
+            killState = .permissionDenied
+        case .processGone:
+            killState = .processGone
+        case .staleProcess:
+            killState = .staleProcess
+        case .identityUnavailable:
+            killState = .identityUnavailable
+        case .failed(let message):
+            killState = .failed(message)
+        }
+    }
+
+    private func handleKillButton() {
+        switch killState {
+        case .idle:
+            beginConfirmation()
+        case .confirming:
+            beginGracefulTermination()
+        case .forceKillNeeded:
+            beginForceKill()
+        case .terminating, .forceKilling:
+            break
+        case .terminated, .permissionDenied, .staleProcess, .processGone,
+             .identityUnavailable, .failed:
+            killState = .idle
+        }
+    }
+
+    @ViewBuilder
+    private var killButtonLabel: some View {
+        switch killState {
+        case .idle:
+            Image(systemName: "xmark.circle")
+                .font(.caption)
+                .foregroundStyle(.red.opacity(0.7))
+        case .confirming:
+            statusLabel("Kill?", color: .red, filled: true)
+        case .terminating:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 42)
+        case .forceKillNeeded:
+            statusLabel("Force?", color: .red, filled: true)
+        case .forceKilling:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 42)
+        case .terminated:
+            statusLabel("Stopped", color: .green)
+        case .permissionDenied:
+            statusLabel("Denied", color: .orange)
+        case .staleProcess:
+            statusLabel("Changed", color: .orange)
+        case .processGone:
+            statusLabel("Gone", color: .secondary)
+        case .identityUnavailable:
+            statusLabel("Unverified", color: .orange)
+        case .failed:
+            statusLabel("Failed", color: .red)
+        }
+    }
+
+    private func statusLabel(_ text: String, color: Color, filled: Bool = false) -> some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundStyle(filled ? Color.white : color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(filled ? color : color.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 
     var body: some View {
@@ -83,40 +252,13 @@ struct PortRowView: View {
 
             // Kill button with confirmation
             Button {
-                if confirmingKill {
-                    killConfirmResetTask?.cancel()
-                    killConfirmResetTask = nil
-                    _ = ProcessKiller.terminate(pid: entry.pid)
-                    confirmingKill = false
-                } else {
-                    confirmingKill = true
-                    killConfirmResetTask?.cancel()
-                    killConfirmResetTask = Task {
-                        try? await Task.sleep(nanoseconds: Self.killConfirmResetNs)
-                        guard !Task.isCancelled else { return }
-                        await MainActor.run {
-                            confirmingKill = false
-                            killConfirmResetTask = nil
-                        }
-                    }
-                }
+                handleKillButton()
             } label: {
-                if confirmingKill {
-                    Text("Kill?")
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.red)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                } else {
-                    Image(systemName: "xmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(.red.opacity(0.7))
-                }
+                killButtonLabel
             }
             .buttonStyle(.borderless)
-            .help(confirmingKill ? "Click again to kill process" : "Kill process \(entry.pid)")
+            .disabled(killState == .terminating || killState == .forceKilling)
+            .help(killHelp)
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 4)
@@ -144,6 +286,8 @@ struct PortRowView: View {
         .onDisappear {
             killConfirmResetTask?.cancel()
             killConfirmResetTask = nil
+            killTask?.cancel()
+            killTask = nil
         }
     }
 }
