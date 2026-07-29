@@ -26,6 +26,96 @@ final class ConflictDetectorTests: XCTestCase {
         XCTAssertEqual(conflicts[0].entries.count, 2)
     }
 
+    func testSpecificIPv4AddressesDoNotOverlap() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", address: "127.0.0.1"
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", address: "192.168.1.10"
+            ),
+        ]
+        XCTAssertTrue(ConflictDetector.detect(in: entries).isEmpty)
+    }
+
+    func testIPv4WildcardOverlapsSpecificAddress() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", address: "0.0.0.0"
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", address: "127.0.0.1"
+            ),
+        ]
+        XCTAssertEqual(ConflictDetector.detect(in: entries).count, 1)
+    }
+
+    func testIdenticalIPv6AddressesConflict() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", family: .ipv6, address: "::1"
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", family: .ipv6, address: "::1"
+            ),
+        ]
+        XCTAssertEqual(ConflictDetector.detect(in: entries).count, 1)
+    }
+
+    func testIPv6WildcardOverlapsSpecificAddress() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", family: .ipv6, address: "::"
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", family: .ipv6, address: "::1"
+            ),
+        ]
+        XCTAssertEqual(ConflictDetector.detect(in: entries).count, 1)
+    }
+
+    func testIPv4AndIPv6BindingsAreDisjoint() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", address: "0.0.0.0"
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", family: .ipv6, address: "::"
+            ),
+        ]
+        XCTAssertTrue(ConflictDetector.detect(in: entries).isEmpty)
+    }
+
+    func testNonListeningAndUDPEntriesDoNotConflict() {
+        let entries = [
+            makeConflictEntry(
+                pid: 1, port: 3000, name: "node", state: .established
+            ),
+            makeConflictEntry(
+                pid: 2, port: 3000, name: "python", protocol: .udp, state: .other
+            ),
+            makeConflictEntry(pid: 3, port: 3000, name: "ruby"),
+        ]
+        XCTAssertTrue(ConflictDetector.detect(in: entries).isEmpty)
+    }
+
+    func testConflictExcludesThirdNonOverlappingEntryOnSamePort() {
+        let first = makeConflictEntry(
+            pid: 1, port: 3000, name: "node", address: "127.0.0.1"
+        )
+        let second = makeConflictEntry(
+            pid: 2, port: 3000, name: "python", address: "127.0.0.1"
+        )
+        let disjoint = makeConflictEntry(
+            pid: 3, port: 3000, name: "ruby", address: "192.168.1.10"
+        )
+
+        let conflicts = ConflictDetector.detect(in: [first, second, disjoint])
+
+        XCTAssertEqual(conflicts.count, 1)
+        XCTAssertEqual(Set(conflicts[0].entries.map(\.pid)), Set([1, 2]))
+    }
+
     func testSamePIDNotConflict() {
         // Same PID on same port (post-dedup shouldn't happen, but detector should not flag it)
         let entries = [
@@ -279,19 +369,42 @@ final class ConflictNotificationFilterTests: XCTestCase {
         let result = filter.portsToNotify(diff: diff, conflicts: conflicts)
         XCTAssertTrue(result.isEmpty, "Steady-state (no new entries) should not fire notifications")
     }
+
+    func testNonOverlappingAdditionOnConflictingPortDoesNotNotify() {
+        var filter = ConflictNotificationFilter()
+        let first = makeConflictEntry(
+            pid: 1, port: 3000, name: "node", address: "127.0.0.1"
+        )
+        let second = makeConflictEntry(
+            pid: 2, port: 3000, name: "python", address: "127.0.0.1"
+        )
+        let disjointAddition = makeConflictEntry(
+            pid: 3, port: 3000, name: "ruby", address: "192.168.1.10"
+        )
+        let conflicts = ConflictDetector.detect(in: [first, second, disjointAddition])
+        let diff = SnapshotDiff(added: [disjointAddition], removed: [])
+
+        let result = filter.portsToNotify(diff: diff, conflicts: conflicts)
+
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertTrue(filter.lastNotified.isEmpty)
+    }
 }
 
 // MARK: - Helpers
 
 private func makeConflictEntry(
     pid: pid_t, port: UInt16, name: String,
-    family: PortEntry.AddressFamily = .ipv4
+    family: PortEntry.AddressFamily = .ipv4,
+    address: String? = nil,
+    protocol: PortEntry.PortProtocol = .tcp,
+    state: PortEntry.PortState = .listen
 ) -> PortEntry {
     PortEntry(
         pid: pid, port: port, processName: name,
-        executablePath: "/usr/bin/\(name)", protocol: .tcp,
-        state: .listen, family: family,
-        localAddress: family == .ipv4 ? "127.0.0.1" : "::1",
+        executablePath: "/usr/bin/\(name)", protocol: `protocol`,
+        state: state, family: family,
+        localAddress: address ?? (family == .ipv4 ? "127.0.0.1" : "::1"),
         processStartTime: .now
     )
 }
@@ -299,7 +412,9 @@ private func makeConflictEntry(
 private final class MutableMockScanner: PortScanning, @unchecked Sendable {
     var entries: [PortEntry]
     init(entries: [PortEntry] = []) { self.entries = entries }
-    func scan() async -> [PortEntry] { entries }
+    func scan() async -> PortScanResult {
+        .success(entries: entries, source: .lsof)
+    }
 }
 
 /// Thread-safe box for capturing values from async callbacks in tests.

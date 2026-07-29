@@ -1,25 +1,34 @@
 import Foundation
 
-/// Fallback scanner using lsof (setuid root) for comprehensive port visibility.
+/// Primary scanner using lsof (setuid root) for comprehensive port visibility.
 /// Parses machine-readable output from `lsof -iTCP -sTCP:LISTEN -P -n -F pcn`.
 public final class LsofScanner: PortScanning, Sendable {
+    private let executablePath: String
 
-    public init() {}
+    public init() {
+        executablePath = "/usr/sbin/lsof"
+    }
 
-    public func scan() async -> [PortEntry] {
+    init(executablePath: String) {
+        self.executablePath = executablePath
+    }
+
+    public func scan() async -> PortScanResult {
         let output: String
         do {
             output = try await runLsof()
+        } catch let error as PortScanError {
+            return .failure(error)
         } catch {
-            return []
+            return .failure(.unavailable)
         }
-        return parseLsofOutput(output)
+        return .success(entries: parseLsofOutput(output), source: .lsof)
     }
 
     private func runLsof() async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+            process.executableURL = URL(fileURLWithPath: executablePath)
             process.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"]
 
             let pipe = Pipe()
@@ -28,16 +37,22 @@ public final class LsofScanner: PortScanning, Sendable {
 
             // NOTE: readDataToEndOfFile inside terminationHandler is safe because
             // -sTCP:LISTEN output is well under the pipe buffer size (~64KB).
-            process.terminationHandler = { _ in
+            process.terminationHandler = { process in
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: output)
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: output)
+                } else {
+                    continuation.resume(
+                        throwing: PortScanError.nonzeroExit(process.terminationStatus)
+                    )
+                }
             }
 
             do {
                 try process.run()
             } catch {
-                continuation.resume(throwing: error)
+                continuation.resume(throwing: PortScanError.launchFailed)
             }
         }
     }

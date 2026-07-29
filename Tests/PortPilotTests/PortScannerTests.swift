@@ -8,7 +8,10 @@ final class PortScannerTests: XCTestCase {
         let listener = try makeListener()
         defer { close(listener.fd) }
 
-        let entries = await LsofScanner().scan()
+        let result = await LsofScanner().scan()
+        guard case .success(let entries, .lsof) = result else {
+            return XCTFail("Expected lsof scan to succeed, got \(result)")
+        }
         let myPid = getpid()
 
         let found = entries.contains {
@@ -24,7 +27,10 @@ final class PortScannerTests: XCTestCase {
         let listener = try makeListener()
         defer { close(listener.fd) }
 
-        let entries = await PortScanner().scan()
+        let result = await PortScanner().scan()
+        guard case .success(let entries, .libprocFallback) = result else {
+            return XCTFail("Expected libproc scan to succeed, got \(result)")
+        }
         let myPid = getpid()
 
         let found = entries.contains {
@@ -136,9 +142,120 @@ final class PortScannerTests: XCTestCase {
         )
     }
 
+    func testLsofScanReportsLaunchFailure() async {
+        let result = await LsofScanner(
+            executablePath: "/definitely/missing/portpilot-lsof"
+        ).scan()
+
+        XCTAssertEqual(result, .failure(.launchFailed))
+    }
+
+    func testLsofScanReportsNonzeroExitStatus() async {
+        let result = await LsofScanner(executablePath: "/usr/bin/false").scan()
+
+        XCTAssertEqual(result, .failure(.nonzeroExit(1)))
+    }
+
     func testSelfTestPasses() async {
         let result = await PortScanner().selfTest()
         XCTAssertTrue(result, "Scanner should see its own process")
+    }
+
+    func testPortScannerReportsUnavailableWhenPidEnumerationIsEmpty() async {
+        let scanner = PortScanner(pidProvider: { [] })
+
+        let result = await scanner.scan()
+        let selfTestResult = await scanner.selfTest()
+
+        XCTAssertEqual(result, .failure(.unavailable))
+        XCTAssertFalse(selfTestResult)
+    }
+
+    func testResilientScannerDoesNotFallbackOnSuccessfulEmptyPrimary() async {
+        let primary = StubScanner(result: .success(entries: [], source: .lsof))
+        let fallback = StubScanner(
+            result: .success(
+                entries: [makeEntry(pid: 1, port: 3000, name: "fallback")],
+                source: .libprocFallback
+            )
+        )
+        let scanner = ResilientPortScanner(primary: primary, fallback: fallback)
+
+        let result = await scanner.scan()
+        let fallbackScanCount = await fallback.scanCount
+
+        XCTAssertEqual(result, .success(entries: [], source: .lsof))
+        XCTAssertEqual(fallbackScanCount, 0)
+    }
+
+    func testResilientScannerPreservesSuccessfulPrimarySource() async {
+        let primary = StubScanner(
+            result: .success(entries: [], source: .libprocFallback)
+        )
+        let fallback = StubScanner(result: .failure(.unavailable))
+        let scanner = ResilientPortScanner(primary: primary, fallback: fallback)
+
+        let result = await scanner.scan()
+        let fallbackScanCount = await fallback.scanCount
+
+        XCTAssertEqual(result, .success(entries: [], source: .libprocFallback))
+        XCTAssertEqual(fallbackScanCount, 0)
+    }
+
+    func testResilientScannerUsesFallbackOnlyAfterPrimaryFailure() async {
+        let fallbackEntry = makeEntry(pid: 1, port: 3000, name: "fallback")
+        let primary = StubScanner(result: .failure(.nonzeroExit(1)))
+        let fallback = StubScanner(
+            result: .success(entries: [fallbackEntry], source: .libprocFallback)
+        )
+        let scanner = ResilientPortScanner(primary: primary, fallback: fallback)
+
+        let result = await scanner.scan()
+        let fallbackScanCount = await fallback.scanCount
+
+        XCTAssertEqual(
+            result,
+            .success(entries: [fallbackEntry], source: .libprocFallback)
+        )
+        XCTAssertEqual(fallbackScanCount, 1)
+    }
+
+    func testResilientScannerFiltersFallbackToTCPListeners() async {
+        let listener = makeEntry(pid: 1, port: 3000, name: "listener")
+        let established = makeEntry(
+            pid: 2, port: 4000, name: "client", state: .established
+        )
+        let udp = PortEntry(
+            pid: 3, port: 5000, processName: "udp",
+            executablePath: "/usr/bin/udp", protocol: .udp, state: .other,
+            family: .ipv4, localAddress: "127.0.0.1", processStartTime: .now
+        )
+        let scanner = ResilientPortScanner(
+            primary: StubScanner(result: .failure(.launchFailed)),
+            fallback: StubScanner(
+                result: .success(
+                    entries: [listener, established, udp],
+                    source: .libprocFallback
+                )
+            )
+        )
+
+        let result = await scanner.scan()
+
+        XCTAssertEqual(
+            result,
+            .success(entries: [listener], source: .libprocFallback)
+        )
+    }
+
+    func testResilientScannerReportsTotalFailure() async {
+        let scanner = ResilientPortScanner(
+            primary: StubScanner(result: .failure(.launchFailed)),
+            fallback: StubScanner(result: .failure(.unavailable))
+        )
+
+        let result = await scanner.scan()
+        XCTAssertEqual(result, .failure(.allScannersFailed))
     }
 
     private func makeListener() throws -> (fd: Int32, port: UInt16) {
@@ -209,5 +326,19 @@ final class PortScannerTests: XCTestCase {
         case bindFailed(Int32)
         case listenFailed(Int32)
         case socketNameFailed(Int32)
+    }
+}
+
+private actor StubScanner: PortScanning {
+    let result: PortScanResult
+    private(set) var scanCount = 0
+
+    init(result: PortScanResult) {
+        self.result = result
+    }
+
+    func scan() async -> PortScanResult {
+        scanCount += 1
+        return result
     }
 }

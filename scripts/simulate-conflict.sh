@@ -4,8 +4,8 @@
 # Two python processes bind to the same port (9999) via different address
 # families (IPv4 + IPv6-only). The kernel allows this because IPV6_V6ONLY
 # tells the IPv6 socket to ignore IPv4-mapped traffic, so the two binds
-# don't overlap at the socket level — but PortPilot still sees two entries
-# on port 9999 with different PIDs, which is exactly what ConflictDetector flags.
+# don't overlap at the socket level. PortPilot should therefore show both
+# listeners without labeling them as a hard conflict.
 #
 # Usage:
 #   ./scripts/simulate-conflict.sh          # launch both binders (blocks)
@@ -54,8 +54,8 @@ PID6=$!
 sleep 0.3
 
 echo ""
-echo "✓ Conflict active on port $PORT (pids $PID4 + $PID6)"
-echo "  Check PortPilot for: red lighthouse, red row highlights, macOS notification"
+echo "✓ Disjoint-family listeners active on port $PORT (pids $PID4 + $PID6)"
+echo "  Check PortPilot shows both listeners without a conflict alert"
 echo "  Ctrl-C to stop both processes"
 echo ""
 

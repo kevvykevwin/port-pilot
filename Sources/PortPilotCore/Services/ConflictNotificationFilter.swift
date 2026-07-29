@@ -23,10 +23,9 @@ public struct ConflictNotificationFilter: Sendable {
         lastNotified = lastNotified.filter { activeConflictPorts.contains($0.key) }
 
         guard let diff, !diff.added.isEmpty else { return [] }
-        let addedPorts = Set(diff.added.map(\.port))
         var result: [PortConflict] = []
 
-        for conflict in conflicts where addedPorts.contains(conflict.port) {
+        for conflict in conflicts where diff.added.contains(where: conflict.entries.contains) {
             if let last = lastNotified[conflict.port],
                now.timeIntervalSince(last) < Self.debounceInterval {
                 continue
