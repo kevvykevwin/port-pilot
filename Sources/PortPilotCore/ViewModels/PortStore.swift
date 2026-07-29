@@ -114,6 +114,7 @@ public final class PortStore {
     private let scanner: any PortScanning
     private let resolver: ProjectResolver
     private var scanTask: Task<Void, Never>?
+    private var refreshGeneration: UInt64 = 0
     private var previousSnapshot: PortSnapshot?
     @ObservationIgnored public private(set) var lastDiff: SnapshotDiff?
 
@@ -234,13 +235,19 @@ public final class PortStore {
     // MARK: - Refresh
 
     public func refresh() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         isScanning = true
         var scanned = await scanner.scan()
 
-        // A menu-open restart cancels the prior polling task; if it was suspended
-        // inside scan() above, bail before publishing so the dying run and the new
-        // one can't both mutate state and fire a phantom conflict notification.
-        if Task.isCancelled {
+        // Scans may overlap when polling and manual refreshes interleave. Only the
+        // newest request may publish; an obsolete request must not clear the
+        // scanning indicator while newer work is still in flight.
+        guard generation == refreshGeneration else { return }
+
+        // A menu-open restart cancels the prior polling task. If the cancelled task
+        // is still the newest request, clear its indicator without publishing.
+        guard !Task.isCancelled else {
             isScanning = false
             return
         }
