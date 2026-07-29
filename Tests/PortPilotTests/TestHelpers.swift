@@ -21,3 +21,41 @@ struct MockScanner: PortScanning {
     let entries: [PortEntry]
     func scan() async -> [PortEntry] { entries }
 }
+
+actor ControlledScanner: PortScanning {
+    private var nextRequestID = 0
+    private var continuations: [Int: CheckedContinuation<[PortEntry], Never>] = [:]
+    private var requestCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func scan() async -> [PortEntry] {
+        await withCheckedContinuation { continuation in
+            let requestID = nextRequestID
+            nextRequestID += 1
+            continuations[requestID] = continuation
+            resumeSatisfiedWaiters()
+        }
+    }
+
+    func waitForRequestCount(_ count: Int) async {
+        guard nextRequestID < count else { return }
+        await withCheckedContinuation { continuation in
+            requestCountWaiters.append((count, continuation))
+        }
+    }
+
+    func completeRequest(_ requestID: Int, with entries: [PortEntry]) {
+        precondition(
+            continuations[requestID] != nil,
+            "Request \(requestID) is not pending"
+        )
+        continuations.removeValue(forKey: requestID)?.resume(returning: entries)
+    }
+
+    private func resumeSatisfiedWaiters() {
+        let satisfied = requestCountWaiters.filter { nextRequestID >= $0.count }
+        requestCountWaiters.removeAll { nextRequestID >= $0.count }
+        for waiter in satisfied {
+            waiter.continuation.resume()
+        }
+    }
+}

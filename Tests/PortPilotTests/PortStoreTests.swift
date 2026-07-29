@@ -147,4 +147,89 @@ final class PortStoreTests: XCTestCase {
         let port4000 = store.entries.first { $0.port == 4000 }
         XCTAssertEqual(port4000?.family, .ipv4, "IPv4 should be preferred in dedup")
     }
+
+    func testStaleRefreshCompletingFirstCannotPublish() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+        var callbackPorts: [[UInt16]] = []
+        store.onRefreshComplete = { _, _ in
+            callbackPorts.append(store.entries.map(\.port))
+        }
+
+        let firstRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        let secondRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(2)
+
+        await scanner.completeRequest(
+            0,
+            with: [makeEntry(pid: 1, port: 3000, name: "stale")]
+        )
+        await firstRefresh.value
+
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertNil(store.lastDiff)
+        XCTAssertTrue(store.isScanning, "Newest refresh is still in flight")
+        XCTAssertTrue(callbackPorts.isEmpty)
+
+        await scanner.completeRequest(
+            1,
+            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
+        )
+        await secondRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [4000])
+        XCTAssertNil(store.lastDiff)
+        XCTAssertFalse(store.isScanning)
+        XCTAssertEqual(callbackPorts, [[4000]])
+    }
+
+    func testNewestRefreshCompletingFirstRemainsPublished() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+        var callbackPorts: [[UInt16]] = []
+        store.onRefreshComplete = { _, _ in
+            callbackPorts.append(store.entries.map(\.port))
+        }
+
+        let firstRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        let secondRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(2)
+
+        await scanner.completeRequest(
+            1,
+            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
+        )
+        await secondRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [4000])
+        XCTAssertNil(store.lastDiff)
+        XCTAssertFalse(store.isScanning)
+        XCTAssertEqual(callbackPorts, [[4000]])
+
+        await scanner.completeRequest(
+            0,
+            with: [makeEntry(pid: 1, port: 3000, name: "stale")]
+        )
+        await firstRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [4000])
+        XCTAssertNil(store.lastDiff)
+        XCTAssertFalse(store.isScanning)
+        XCTAssertEqual(callbackPorts, [[4000]])
+
+        let thirdRefresh = Task { await store.refresh() }
+        await scanner.waitForRequestCount(3)
+        await scanner.completeRequest(
+            2,
+            with: [makeEntry(pid: 3, port: 5000, name: "next")]
+        )
+        await thirdRefresh.value
+
+        XCTAssertEqual(store.entries.map(\.port), [5000])
+        XCTAssertEqual(store.lastDiff?.added.map(\.port), [5000])
+        XCTAssertEqual(store.lastDiff?.removed.map(\.port), [4000])
+        XCTAssertEqual(callbackPorts, [[4000], [5000]])
+    }
 }
