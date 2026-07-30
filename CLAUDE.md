@@ -10,6 +10,10 @@ swift build -c release   # release build
 swift test               # run the XCTest suite
 swift run PortPilot      # launch menu bar app (GUI)
 ./scripts/build-app.sh   # build .app bundle with ad-hoc signing
+
+./Tests/shell/test-auto-update.sh   # tests for the unattended installer (sandboxed, no Swift build)
+./scripts/auto-update.sh --dry-run  # what the updater would do right now
+./scripts/release.sh --dry-run      # validate a release without tagging
 ```
 
 ## Project Structure
@@ -56,7 +60,8 @@ Tests/
 - No external dependencies (zero SPM packages)
 - Non-sandboxed (required for `proc_*` and `lsof` access)
 - `LSUIElement=true` in Info.plist (no Dock icon)
-- App bundle metadata is version 0.4.0, build 3, in `scripts/build-app.sh`
+- **Version lives only in the `VERSION` file.** `scripts/build-app.sh` parses it to stamp `Info.plist`, `scripts/release.sh` parses it for the `v<version>` tag, and `scripts/auto-update.sh` compares it against the installed bundle. Never hardcode a version anywhere else — it drifted across four places before this was centralised.
+- Shell scripts in `scripts/` are covered by `Tests/shell/`, not XCTest. `auto-update.sh` replaces the bundle in `/Applications` unattended, so treat its failure paths as load-bearing: every one must leave a launchable app installed.
 
 ## Compound Learnings
 

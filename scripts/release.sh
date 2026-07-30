@@ -31,10 +31,15 @@ cd "$PROJECT_DIR"
 die() { echo "error: $*" >&2; exit 1; }
 
 [ -f VERSION ] || die "VERSION file missing"
-# shellcheck source=../VERSION
-source VERSION
-: "${VERSION:?VERSION not set in VERSION file}"
-: "${BUILD:?BUILD not set in VERSION file}"
+# Parsed, not sourced — the file is read by three scripts and a stray `exit` or
+# `set -x` in it would break all of them.
+read_version_field() {
+    sed -n "s/^[[:space:]]*$1=//p" VERSION | head -1 | tr -d '"'"'"' \t\r'
+}
+VERSION="$(read_version_field VERSION)"
+BUILD="$(read_version_field BUILD)"
+[ -n "$VERSION" ] || die "could not parse VERSION= from the VERSION file"
+[ -n "$BUILD" ] || die "could not parse BUILD= from the VERSION file"
 TAG="v$VERSION"
 
 echo "Preparing release $TAG (build $BUILD)"
@@ -45,11 +50,22 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "working tree has uncommitted changes — commit them first"
 
-if git rev-parse "$TAG" >/dev/null 2>&1; then
+# SwiftPM compiles untracked files under its target dirs, so without this the
+# "tests pass at this commit" check below could be satisfied by code that is not
+# actually in the commit being tagged.
+[ -z "$(git ls-files --others --exclude-standard -- Sources Tests Assets)" ] \
+    || die "untracked files under Sources/Tests/Assets would be compiled but not tagged — commit or remove them"
+
+# Fetch before the tag check: a tag someone else already pushed is invisible
+# locally until it is fetched, and discovering it after tagging is too late.
+git fetch --quiet origin "$BRANCH" --tags 2>/dev/null || echo "warning: could not fetch origin (offline?)"
+
+# refs/tags/ specifically — bare `git rev-parse "$TAG"` resolves any ref or
+# unambiguous SHA prefix, not just tags.
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     die "tag $TAG already exists — bump VERSION before releasing"
 fi
 
-git fetch --quiet origin "$BRANCH" --tags 2>/dev/null || echo "warning: could not fetch origin (offline?)"
 if git rev-parse "origin/$BRANCH" >/dev/null 2>&1; then
     [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ] \
         || die "local $BRANCH differs from origin/$BRANCH — push or pull first so the tag matches what others get"
@@ -89,6 +105,7 @@ echo "Pushed $TAG"
 
 if command -v gh >/dev/null 2>&1; then
     NOTES_FILE="$(mktemp -t portpilot-release-notes)"
+    trap 'rm -f "$NOTES_FILE"' EXIT
     {
         echo "## Install"
         echo
@@ -108,11 +125,20 @@ if command -v gh >/dev/null 2>&1; then
         echo "## Changes"
     } > "$NOTES_FILE"
 
-    gh release create "$TAG" \
+    # The tag is already pushed at this point, so a failure here leaves it public
+    # with no release attached — print the exact retry rather than just dying.
+    if ! gh release create "$TAG" \
         --title "Port Pilot $VERSION" \
         --notes-file "$NOTES_FILE" \
-        --generate-notes
-    rm -f "$NOTES_FILE"
+        --generate-notes; then
+        echo
+        echo "error: tag $TAG was pushed but publishing the release failed." >&2
+        echo "Retry with:" >&2
+        echo "  gh release create $TAG --title \"Port Pilot $VERSION\" --notes-file $NOTES_FILE --generate-notes" >&2
+        echo "(or delete the tag: git push origin :refs/tags/$TAG && git tag -d $TAG)" >&2
+        trap - EXIT   # keep the notes file around for the retry
+        exit 1
+    fi
     echo "Published GitHub release $TAG"
 else
     echo "gh CLI not found — tag pushed, but no GitHub release created."

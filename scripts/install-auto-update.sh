@@ -28,6 +28,17 @@ case "${1:-install}" in
         fi
         echo "plist: $PLIST"
         echo "log:   $LOG_DIR/auto-update.log"
+        # The plist bakes in an absolute path, so moving or deleting the clone
+        # leaves an agent that fails every 6h with nothing reporting it.
+        if [ -f "$PLIST" ]; then
+            RECORDED="$(sed -n 's|.*<string>\(/.*/auto-update\.sh\)</string>.*|\1|p' "$PLIST" | head -1)"
+            if [ -n "$RECORDED" ] && [ ! -x "$RECORDED" ]; then
+                echo "WARNING: the agent points at $RECORDED, which no longer exists." >&2
+                echo "         Re-run this script from the current clone, or --uninstall." >&2
+                exit 1
+            fi
+            [ -n "$RECORDED" ] && echo "script: $RECORDED (present)"
+        fi
         exit 0
         ;;
     --uninstall)
