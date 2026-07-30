@@ -149,6 +149,21 @@ esac
 exit 0
 OSA
 
+    # mv: real, but can pause immediately after the backup move — that is the one
+    # window where the install path holds nothing, and the only way to test that a
+    # signal arriving then still leaves a launchable app behind.
+    cat > "$SHIM/mv" << 'MVSHIM'
+#!/bin/bash
+/bin/mv "$@"
+RC=$?
+if [ "${PAUSE_AFTER_BACKUP:-0}" = "1" ]; then
+    case "$*" in
+        *backups*) touch "$PAUSE_MARKER"; sleep 5 ;;
+    esac
+fi
+exit $RC
+MVSHIM
+
     # git: real, except `fetch` can be made to hang so the timeout branch is
     # reachable. Everything else must behave exactly like git.
     REAL_GIT="$(command -v git)"
@@ -776,6 +791,40 @@ test_linked_worktree_is_accepted() {
     teardown
 }
 
+# The core guarantee: a signal must never leave /Applications without an app. The
+# dangerous window is between moving the old bundle aside and swapping in the new.
+test_signal_mid_install_restores_the_app() {
+    start "a signal during the install window still leaves an app installed"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+
+    env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
+        PORTPILOT_PROJECT_DIR="$PROJECT" PORTPILOT_INSTALL_ROOT="$INSTALL" \
+        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
+        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
+        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
+        PAUSE_AFTER_BACKUP=1 PAUSE_MARKER="$ROOT/paused" \
+        bash "$REAL_SCRIPT" >/dev/null 2>&1 &
+    UPDATER_PID=$!
+
+    # Wait until it is inside the window (old bundle moved aside, nothing installed).
+    WAITED=0
+    while [ ! -f "$ROOT/paused" ] && [ "$WAITED" -lt 40 ]; do sleep 1; WAITED=$((WAITED + 1)); done
+    if [ -f "$ROOT/paused" ]; then
+        ok "reached the mid-install window"
+        assert_absent "install path is empty inside the window" "$INSTALL/PortPilot.app"
+        kill -TERM "$UPDATER_PID" 2>/dev/null || true
+        wait "$UPDATER_PID" 2>/dev/null || true
+        assert_eq "app restored after the signal" "$(installed_version_of)" "0.0.1"
+        assert_eq "no staged bundle left behind" "$(staged_bundle_count)" "0"
+    else
+        bad "never reached the mid-install window"
+        kill -TERM "$UPDATER_PID" 2>/dev/null || true
+    fi
+    teardown
+}
+
 # ------------------------------------------------------------------------ main
 test_up_to_date
 test_dirty_sources_skip
@@ -806,6 +855,7 @@ test_advanced_clone_without_install_still_updates
 test_unknown_provenance_triggers_update
 test_dirty_build_clears_provenance
 test_linked_worktree_is_accepted
+test_signal_mid_install_restores_the_app
 test_dead_lock_holder_is_cleared
 test_live_lock_holder_is_respected
 test_lock_prevents_concurrent_run

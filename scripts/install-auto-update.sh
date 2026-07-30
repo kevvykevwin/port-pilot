@@ -53,6 +53,16 @@ esac
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
+# A clone path is a filesystem path, not XML. A directory named e.g. "R&D" would
+# otherwise produce a malformed plist and make both bootstrap and load fail.
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+                            -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+PROJECT_DIR_XML="$(xml_escape "$PROJECT_DIR")"
+LOG_DIR_XML="$(xml_escape "$LOG_DIR")"
+LABEL_XML="$(xml_escape "$LABEL")"
+
 # launchd gives an agent a minimal PATH, so swift/git must be resolvable.
 cat > "$PLIST" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -60,11 +70,11 @@ cat > "$PLIST" << PLIST_EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>$LABEL</string>
+    <string>$LABEL_XML</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$PROJECT_DIR/scripts/auto-update.sh</string>
+        <string>$PROJECT_DIR_XML/scripts/auto-update.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -78,7 +88,7 @@ cat > "$PLIST" << PLIST_EOF
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/auto-update.launchd.err</string>
+    <string>$LOG_DIR_XML/auto-update.launchd.err</string>
 </dict>
 </plist>
 PLIST_EOF
