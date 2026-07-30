@@ -37,7 +37,10 @@ FAILED_LAUNCH_MEMO="$STATE_DIR/last-failed-launch"
 # so a commit that leaves VERSION untouched and then fails to build would look
 # "already up to date" forever while the old bundle stayed installed.
 INSTALLED_SHA_FILE="$STATE_DIR/installed-sha"
-LOCK_DIR="${TMPDIR:-/tmp}/portpilot-auto-update.lock"
+# UID-scoped: without TMPDIR every account would share /tmp/portpilot-auto-update.lock,
+# where one user's run suppresses another's and a stale lock owned by someone else
+# cannot be cleared.
+LOCK_DIR="${TMPDIR:-/tmp}/portpilot-auto-update-$(id -u).lock"
 LOCK_MAX_AGE_MIN=60
 KEEP_BACKUPS=3
 # How many times to retry a commit that installs but will not launch, when there
@@ -194,9 +197,18 @@ cleanup() {
             RESTORE_SRC="${CANDIDATE_BACKUP}"
         fi
         if [ -n "$RESTORE_SRC" ]; then
+            # An instance we started only to verify must not outlive its bundle.
+            if [ -n "${LAUNCHED_PID:-}" ]; then
+                kill -TERM "${LAUNCHED_PID}" 2>/dev/null || true
+            fi
             rm -rf "$INSTALLED_APP" 2>/dev/null || true
             if mv "$RESTORE_SRC" "$INSTALLED_APP" 2>/dev/null; then
                 log "interrupted before the new version was verified; restored v${INST_VERSION:-previous}"
+                # Leave the user as we found them: if their app was running when
+                # we started, it should be running again now.
+                if [ "${WAS_RUNNING:-false}" = true ]; then
+                    open "$INSTALLED_APP" >/dev/null 2>&1 || true
+                fi
             fi
         fi
     fi
@@ -208,6 +220,8 @@ cleanup() {
 BACKUP_PATH=""
 CANDIDATE_BACKUP=""
 LAUNCH_VERIFIED=false
+WAS_RUNNING=false
+LAUNCHED_PID=""
 # cleanup alone is not enough for a signal: replacing bash's default termination
 # behaviour without exiting would let the run continue past the point where its
 # lock and staged bundle have already been removed, while launchd is free to
@@ -414,7 +428,6 @@ if [ "$FORCE" = false ]; then
 fi
 
 # ----------------------------------------------------------------- install it
-WAS_RUNNING=false
 app_running && WAS_RUNNING=true
 
 quit_app() {
@@ -538,7 +551,6 @@ fi
 
 open "$INSTALLED_APP" >/dev/null 2>&1 || true
 LAUNCHED=false
-LAUNCHED_PID=""
 for _ in $(seq 1 10); do
     if app_running; then
         LAUNCHED=true
