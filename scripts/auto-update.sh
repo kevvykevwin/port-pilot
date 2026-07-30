@@ -177,21 +177,23 @@ printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
 # EXIT trap for a default-action signal. Without these the lock outlives the run
 # and a staged bundle is left behind mid-install.
 cleanup() {
-    # There is one window — between moving the old bundle aside and swapping the
-    # new one in — where the install path holds nothing at all. A signal arriving
-    # then would otherwise leave the user with no app, which is exactly the
-    # guarantee this script exists to keep. Put the backup back first.
-    if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ] && [ ! -d "$INSTALLED_APP" ]; then
+    # Anything between moving the old bundle aside and a VERIFIED launch is an
+    # incomplete install: the path may hold nothing, or hold a bundle that was
+    # never confirmed to start. Either way the previous app is the safer state, so
+    # a signal arriving in that span puts it back.
+    if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ] && [ "${LAUNCH_VERIFIED:-false}" != true ]; then
+        rm -rf "$INSTALLED_APP" 2>/dev/null || true
         if mv "${BACKUP_PATH}" "$INSTALLED_APP" 2>/dev/null; then
-            log "interrupted mid-install; restored v${INST_VERSION:-previous}"
+            log "interrupted before the new version was verified; restored v${INST_VERSION:-previous}"
         fi
     fi
     rm -rf "$LOCK_DIR" 2>/dev/null || true
     rm -rf "$STAGED_APP" 2>/dev/null || true
 }
-# BACKUP_PATH is referenced by cleanup before the install phase sets it, and the
-# traps can fire at any point, so it must always be defined under `set -u`.
+# Both are referenced by cleanup before the install phase sets them, and the traps
+# can fire at any point, so they must always be defined under `set -u`.
 BACKUP_PATH=""
+LAUNCH_VERIFIED=false
 # cleanup alone is not enough for a signal: replacing bash's default termination
 # behaviour without exiting would let the run continue past the point where its
 # lock and staged bundle have already been removed, while launchd is free to
@@ -372,6 +374,21 @@ fi
 [ -d "$BUILT_APP" ] || die "expected bundle missing at $BUILT_APP"
 [ -x "$BUILT_APP/Contents/MacOS/$APP_NAME" ] || die "built bundle has no executable — refusing to install"
 
+# This runs in a live clone, so the tree can move between the preflight check and
+# the end of the build. Installing then would ship a bundle of mixed state while
+# recording TARGET_SHA as its provenance — a lie that also suppresses future runs.
+POST_SHA="$(git rev-parse HEAD)"
+if [ "$POST_SHA" != "$TARGET_SHA" ]; then
+    die "HEAD moved from ${TARGET_SHA:0:7} to ${POST_SHA:0:7} while building — discarding this build, will retry next run"
+fi
+if [ "$FORCE" = false ]; then
+    POST_DIRTY="$(git status --porcelain --untracked-files=no -- Sources Tests Assets Package.swift Package.resolved VERSION scripts 2>/dev/null || true)"
+    POST_UNTRACKED="$(git ls-files --others --exclude-standard -- Sources Tests Assets 2>/dev/null || true)"
+    if [ -n "$POST_DIRTY" ] || [ -n "$POST_UNTRACKED" ]; then
+        die "build inputs changed while building — discarding this build, will retry next run"
+    fi
+fi
+
 # ----------------------------------------------------------------- install it
 WAS_RUNNING=false
 app_running && WAS_RUNNING=true
@@ -491,6 +508,10 @@ if [ "$LAUNCHED" = false ]; then
     notify "v$SRC_VERSION would not start and rollback FAILED. No app installed."
     die "new version would not start and no working install could be restored — older backups (if any) are in $BACKUP_DIR"
 fi
+
+# From here the install is committed: the bundle is in place and confirmed to run,
+# so cleanup must stop treating the backup as the state to return to.
+LAUNCH_VERIFIED=true
 
 # Leave the user's app in the state we found it: we only started it to check.
 if [ "$WAS_RUNNING" = false ]; then
