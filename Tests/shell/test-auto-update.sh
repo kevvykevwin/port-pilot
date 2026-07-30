@@ -181,6 +181,13 @@ install_app_version() {
 PLIST
 }
 
+# Steady state: the updater has recorded which commit the installed bundle came
+# from. Without this an install is "unknown provenance" and rebuilding is correct.
+seed_installed_sha() {
+    mkdir -p "$STATE"
+    git -C "$PROJECT" rev-parse "${1:-origin/main}" > "$STATE/installed-sha"
+}
+
 # The staged bundle is pid-suffixed, so any assertion on a fixed name is vacuous.
 staged_bundle_count() {
     ls -1d "$INSTALL"/.PortPilot.app.new* 2>/dev/null | wc -l | tr -d ' '
@@ -233,6 +240,7 @@ test_up_to_date() {
     start "idle run with a current install does nothing"
     setup
     install_app_version 0.4.0
+    seed_installed_sha
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "reports up to date" "$OUTPUT" "already up to date"
@@ -388,6 +396,7 @@ test_local_ahead_does_not_trigger_update() {
     install_app_version 0.4.0
     printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
     git -C "$PROJECT" commit -qam "unpushed local commit"
+    seed_installed_sha HEAD
 
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
@@ -496,6 +505,7 @@ test_non_integer_poll_falls_back() {
     start "a non-integer poll interval falls back instead of spinning forever"
     setup
     install_app_version 0.4.0
+    seed_installed_sha
     run_updater PORTPILOT_POLL_SECS=0.5
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "still completed its decision" "$OUTPUT" "already up to date"
@@ -685,9 +695,84 @@ test_zero_poll_falls_back() {
     start "a zero poll interval falls back instead of busy-looping"
     setup
     install_app_version 0.4.0
+    seed_installed_sha
     run_updater PORTPILOT_POLL_SECS=0
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "completed its decision" "$OUTPUT" "already up to date"
+    teardown
+}
+
+# The hole codex found: a fast-forward advances the clone before the build runs,
+# so if the new commit leaves VERSION untouched and the build fails, versions
+# match on the next run and the new code would never be installed.
+test_advanced_clone_without_install_still_updates() {
+    start "a commit whose build never installed is still installed later"
+    setup
+    install_app_version 0.4.0
+    # Provenance points at an older commit while VERSION is unchanged at 0.4.0,
+    # exactly the state left behind by an advanced clone with a failed build.
+    OLD_SHA="$(git -C "$PROJECT" rev-parse HEAD)"
+    printf '// upstream change that does not touch VERSION\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "upstream change"
+    git -C "$PROJECT" push -q origin main
+    printf '%s\n' "$OLD_SHA" > "$STATE/installed-sha"
+
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "cites the stale installed build" "$OUTPUT" "installed build is from"
+    assert_eq "records the new commit as installed" \
+        "$(cat "$STATE/installed-sha")" "$(git -C "$PROJECT" rev-parse HEAD)"
+    teardown
+}
+
+# An install the updater has never seen has unknown provenance; rebuilding once
+# is the safe interpretation.
+test_unknown_provenance_triggers_update() {
+    start "an install of unknown provenance is rebuilt once"
+    setup
+    install_app_version 0.4.0          # no seed_installed_sha
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "says provenance is unknown" "$OUTPUT" "an unknown commit"
+    assert_exists "provenance recorded afterwards" "$STATE/installed-sha"
+    teardown
+}
+
+# A --force build over a dirty tree must not claim a commit is installed.
+test_dirty_build_clears_provenance() {
+    start "a dirty --force build does not claim a commit is installed"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+    printf '// local edit\n' >> "$PROJECT/Sources/Main.swift"
+    run_updater --force
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_absent "provenance record dropped" "$STATE/installed-sha"
+    teardown
+}
+
+# This repo's workflow is worktree-based, where .git is a file, not a directory.
+test_linked_worktree_is_accepted() {
+    start "a linked git worktree is accepted as a valid checkout"
+    setup
+    install_app_version 0.0.1
+    # Detached: `main` is already checked out in the primary clone. The point of
+    # this test is only that a worktree is not rejected as "not a repository";
+    # the branch guard is covered separately.
+    git -C "$PROJECT" worktree add -q --detach "$ROOT/wt" main >/dev/null 2>&1
+    assert_exists "worktree .git is a file" "$ROOT/wt/.git"
+    OUTPUT="$(env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
+        PORTPILOT_PROJECT_DIR="$ROOT/wt" PORTPILOT_INSTALL_ROOT="$INSTALL" \
+        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
+        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
+        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
+        bash "$REAL_SCRIPT" --dry-run 2>&1)"
+    STATUS=$?
+    assert_eq "exits 0" "$STATUS" "0"
+    case "$OUTPUT" in
+        *"not a git working tree"*) bad "worktree was rejected" ;;
+        *) ok "worktree was not rejected" ;;
+    esac
     teardown
 }
 
@@ -717,6 +802,10 @@ test_timeout_kills_grandchildren
 test_hung_fetch_is_reported_distinctly
 test_repair_retries_are_bounded
 test_dirty_force_failure_does_not_blacklist
+test_advanced_clone_without_install_still_updates
+test_unknown_provenance_triggers_update
+test_dirty_build_clears_provenance
+test_linked_worktree_is_accepted
 test_dead_lock_holder_is_cleared
 test_live_lock_holder_is_respected
 test_lock_prevents_concurrent_run

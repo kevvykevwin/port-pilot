@@ -32,6 +32,11 @@ LOG_MAX_BYTES=$((2 * 1024 * 1024))
 STATE_DIR="${PORTPILOT_STATE_DIR:-$HOME/Library/Application Support/PortPilot}"
 BACKUP_DIR="$STATE_DIR/backups"
 FAILED_LAUNCH_MEMO="$STATE_DIR/last-failed-launch"
+# Which commit the installed bundle was actually built from. Version equality is
+# not a proxy for this: a fast-forward advances the clone before the build runs,
+# so a commit that leaves VERSION untouched and then fails to build would look
+# "already up to date" forever while the old bundle stayed installed.
+INSTALLED_SHA_FILE="$STATE_DIR/installed-sha"
 LOCK_DIR="${TMPDIR:-/tmp}/portpilot-auto-update.lock"
 LOCK_MAX_AGE_MIN=60
 KEEP_BACKUPS=3
@@ -101,6 +106,16 @@ notify() {
     osascript -e "display notification \"$1\" with title \"Port Pilot update\"" >/dev/null 2>&1 || true
 }
 
+# Match only the installed bundle's executable. A name-only match also catches a
+# development build from `swift run PortPilot`, which quit_app would then pkill
+# and launch verification would mistake for the newly installed app.
+app_pids() {
+    pgrep -f "$INSTALLED_APP/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+}
+app_running() {
+    [ -n "$(app_pids)" ]
+}
+
 INSTALL_PHASE_STARTED=false
 die() {
     log "ERROR: $*"
@@ -165,7 +180,14 @@ cleanup() {
     rm -rf "$LOCK_DIR" 2>/dev/null || true
     rm -rf "$STAGED_APP" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM HUP
+# cleanup alone is not enough for a signal: replacing bash's default termination
+# behaviour without exiting would let the run continue past the point where its
+# lock and staged bundle have already been removed, while launchd is free to
+# start another. Signals clean up and then die; EXIT stays for normal paths.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 # We hold the lock now, so any staged bundle still lying around belongs to a run
 # that was killed before its trap fired. Clear them before staging our own.
@@ -178,7 +200,9 @@ done
 # ------------------------------------------------------------------ preflight
 command -v git   >/dev/null 2>&1 || die "git not found on PATH"
 command -v swift >/dev/null 2>&1 || die "swift toolchain not found on PATH (Xcode / CLT missing?)"
-[ -d "$PROJECT_DIR/.git" ] || die "$PROJECT_DIR is not a git repository"
+# `.git` is a FILE in a linked worktree, and this repo's workflow is worktree-based.
+git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$PROJECT_DIR is not a git working tree"
 [ -x "$PROJECT_DIR/scripts/build-app.sh" ] || die "scripts/build-app.sh missing or not executable"
 [ -f "$PROJECT_DIR/VERSION" ] || die "VERSION file missing — cannot determine target version"
 
@@ -251,9 +275,19 @@ else
     TARGET_SHA="$LOCAL_SHA"
 fi
 
+# The commit the installed bundle was built from, as recorded by the last
+# successful install. Empty means unknown provenance (first run under the
+# updater, or a hand-installed app), which counts as needing an update.
+INSTALLED_SHA="$(sed -n 1p "$INSTALLED_SHA_FILE" 2>/dev/null || true)"
+
 REASONS=()
 [ "$BEHIND" -gt 0 ] && REASONS+=("$BEHIND new upstream commit(s)")
 [ "$SRC_VERSION" != "$INST_VERSION" ] && REASONS+=("installed $INST_VERSION != source $SRC_VERSION")
+# This is what catches a fast-forward whose build never made it into the bundle:
+# the clone has moved on, VERSION may be unchanged, but nothing was installed.
+if [ "$INSTALLED_SHA" != "$TARGET_SHA" ]; then
+    REASONS+=("installed build is from ${INSTALLED_SHA:-an unknown commit}, target is ${TARGET_SHA:0:7}")
+fi
 [ "$FORCE" = true ] && REASONS+=("--force")
 
 # Local main being AHEAD of origin is not a reason to reinstall — treating it as
@@ -328,19 +362,23 @@ fi
 
 # ----------------------------------------------------------------- install it
 WAS_RUNNING=false
-pgrep -x "$APP_NAME" >/dev/null 2>&1 && WAS_RUNNING=true
+app_running && WAS_RUNNING=true
 
 quit_app() {
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
+    app_running || return 0
     osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
     for _ in $(seq 1 10); do
-        pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
+        app_running || return 0
         sleep 1
     done
     log "graceful quit timed out; sending SIGTERM"
-    pkill -x "$APP_NAME" 2>/dev/null || true
+    # Signal the pids we resolved from the installed bundle, not every process
+    # that happens to share the name.
+    for pid in $(app_pids); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
     for _ in $(seq 1 5); do
-        pgrep -x "$APP_NAME" >/dev/null 2>&1 || return 0
+        app_running || return 0
         sleep 1
     done
     return 1
@@ -410,9 +448,9 @@ open "$INSTALLED_APP" >/dev/null 2>&1 || true
 LAUNCHED=false
 LAUNCHED_PID=""
 for _ in $(seq 1 10); do
-    if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    if app_running; then
         LAUNCHED=true
-        LAUNCHED_PID="$(pgrep -x "$APP_NAME" 2>/dev/null | head -1 || true)"
+        LAUNCHED_PID="$(app_pids | head -1)"
         break
     fi
     sleep 1
@@ -421,7 +459,7 @@ done
 # briefly and then vanishes, which would otherwise count as success.
 if [ "$LAUNCHED" = true ]; then
     sleep "$LAUNCH_SETTLE_SECS"
-    pgrep -x "$APP_NAME" >/dev/null 2>&1 || { LAUNCHED=false; log "v$SRC_VERSION started then exited"; }
+    app_running || { LAUNCHED=false; log "v$SRC_VERSION started then exited"; }
 fi
 
 if [ "$LAUNCHED" = false ]; then
@@ -445,7 +483,7 @@ fi
 
 # Leave the user's app in the state we found it: we only started it to check.
 if [ "$WAS_RUNNING" = false ]; then
-    CURRENT_PID="$(pgrep -x "$APP_NAME" 2>/dev/null | head -1 || true)"
+    CURRENT_PID="$(app_pids | head -1)"
     if [ -n "$LAUNCHED_PID" ] && [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$LAUNCHED_PID" ]; then
         # Someone started it during the ~18s verification window; leave theirs alone.
         log "launch verified; $APP_NAME was started by someone else meanwhile — leaving it running"
@@ -457,6 +495,15 @@ fi
 
 # Clear the memo: this commit installed and launched fine.
 rm -f "$FAILED_LAUNCH_MEMO" 2>/dev/null || true
+
+mkdir -p "$STATE_DIR"
+if [ "$DIRTY_BUILD" = true ]; then
+    # The bundle contains uncommitted code, so no commit describes it. Drop the
+    # record rather than claim this commit is installed.
+    rm -f "$INSTALLED_SHA_FILE" 2>/dev/null || true
+else
+    printf '%s\n' "$TARGET_SHA" > "$INSTALLED_SHA_FILE" 2>/dev/null || true
+fi
 
 log "updated v$INST_VERSION -> v$SRC_VERSION @ $(git rev-parse --short HEAD)"
 

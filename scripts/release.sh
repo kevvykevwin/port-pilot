@@ -62,8 +62,17 @@ git fetch --quiet origin "$BRANCH" --tags 2>/dev/null || echo "warning: could no
 
 # refs/tags/ specifically — bare `git rev-parse "$TAG"` resolves any ref or
 # unambiguous SHA prefix, not just tags.
+REUSE_TAG=false
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
-    die "tag $TAG already exists — bump VERSION before releasing"
+    # A local-only run creates the tag and tells you to re-run with --push. That
+    # instruction has to actually work, so --push may adopt an existing tag that
+    # already points at HEAD instead of refusing it.
+    if [ "$PUSH" = true ] && [ "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$(git rev-parse HEAD)" ]; then
+        REUSE_TAG=true
+        echo "Tag $TAG already exists at HEAD — publishing it."
+    else
+        die "tag $TAG already exists — bump VERSION before releasing"
+    fi
 fi
 
 if git rev-parse "origin/$BRANCH" >/dev/null 2>&1; then
@@ -91,8 +100,10 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # ------------------------------------------------------------------------ tag
-git tag -a "$TAG" -m "Port Pilot $VERSION (build $BUILD)"
-echo "Created local tag $TAG at $(git rev-parse --short HEAD)"
+if [ "$REUSE_TAG" = false ]; then
+    git tag -a "$TAG" -m "Port Pilot $VERSION (build $BUILD)"
+    echo "Created local tag $TAG at $(git rev-parse --short HEAD)"
+fi
 
 if [ "$PUSH" = false ]; then
     echo
