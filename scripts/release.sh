@@ -58,7 +58,15 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
 # Fetch before the tag check: a tag someone else already pushed is invisible
 # locally until it is fetched, and discovering it after tagging is too late.
-git fetch --quiet origin "$BRANCH" --tags 2>/dev/null || echo "warning: could not fetch origin (offline?)"
+# For a local-only run a stale ref is tolerable, but publishing compares HEAD
+# against origin/main to prove the tag matches what others will get — and pushing
+# a tag does not update main. A failed fetch there means tagging an unknown state.
+if ! git fetch --quiet origin "$BRANCH" --tags 2>/dev/null; then
+    if [ "$PUSH" = true ]; then
+        die "could not fetch origin — refusing to publish a release against a possibly stale origin/$BRANCH"
+    fi
+    echo "warning: could not fetch origin (offline?) — local tag only"
+fi
 
 # refs/tags/ specifically — bare `git rev-parse "$TAG"` resolves any ref or
 # unambiguous SHA prefix, not just tags.

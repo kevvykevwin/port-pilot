@@ -70,9 +70,18 @@ automates that — it fast-forwards `main`, rebuilds, runs the tests, and reinst
 ./scripts/install-auto-update.sh --uninstall
 ```
 
-It refuses to run when you have uncommitted changes to build inputs, when `main` has
-diverged from `origin/main`, or when you're on a feature branch — so it never overwrites
-work in progress. Logs land in `~/Library/Logs/PortPilot/auto-update.log`.
+It only ever installs a commit that is on `origin/main`, and refuses to run when you
+have uncommitted changes to build inputs, unpushed commits on `main`, a `main` that has
+diverged from `origin/main`, or a feature branch checked out — so it never installs
+unreviewed work or overwrites work in progress. `--force` overrides those refusals.
+
+Every failure path leaves a launchable app installed: it builds and tests before
+uninstalling anything, stages the new bundle beside the target and swaps it in with an
+atomic rename, verifies the app actually starts, and otherwise rolls back — including
+when interrupted by a signal mid-install. A commit that installs but will not launch is
+recorded and not retried, so a bad build cannot quit and replace your app every six
+hours. Logs land in `~/Library/Logs/PortPilot/auto-update.log`, and failures also raise
+a desktop notification.
 
 ## Development
 
