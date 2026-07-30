@@ -77,7 +77,9 @@ swift test >/dev/null 2>&1 || die "tests failed — not releasing"
 
 echo "Verifying bundle stamps $VERSION..."
 ./scripts/build-app.sh >/dev/null 2>&1 || die "build-app.sh failed"
-BUILT_VERSION="$(defaults read "$PROJECT_DIR/build/PortPilot.app/Contents/Info.plist" CFBundleShortVersionString)"
+# plutil, not defaults: this plist is rewritten at the same path on every release,
+# and defaults goes through cfprefsd, which can serve the previous value.
+BUILT_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$PROJECT_DIR/build/PortPilot.app/Contents/Info.plist")"
 [ "$BUILT_VERSION" = "$VERSION" ] || die "bundle reports $BUILT_VERSION but VERSION says $VERSION"
 
 echo "All checks passed."

@@ -94,7 +94,9 @@ FAKE_BUILD
     git -C "$PROJECT" branch -q --set-upstream-to=origin/main main 2>/dev/null || true
 }
 
-teardown() { [ -n "${ROOT:-}" ] && rm -rf "$ROOT"; }
+teardown() { [ -n "${ROOT:-}" ] && rm -rf "$ROOT"; return 0; }
+# An early exit or Ctrl-C would otherwise leak a mktemp tree containing a fake .app.
+trap 'teardown' EXIT INT TERM
 
 make_shims() {
     # swift: always succeeds; the real toolchain is never invoked.
@@ -335,15 +337,145 @@ test_launch_failure_rolls_back_and_is_remembered() {
     teardown
 }
 
-# --force must be able to retry a commit the memo has blacklisted.
-test_force_overrides_memo() {
-    start "--force retries a commit the memo blocked"
+# The memo must actually block, and --force must actually override it. Writing a
+# bogus SHA here would make both halves pass vacuously, since a SHA that matches
+# nothing never blocks anything.
+test_memo_blocks_and_force_overrides() {
+    start "the memo blocks the target commit, and --force overrides it"
     setup
     install_app_version 0.0.1
-    printf 'deadbeef\n' > "$STATE/last-failed-launch"
+    git -C "$PROJECT" rev-parse origin/main > "$STATE/last-failed-launch"
+
+    run_updater
+    assert_eq "without --force: exits 0" "$STATUS" "0"
+    assert_contains "without --force: skips the blacklisted commit" "$OUTPUT" "already failed to launch"
+    assert_eq "without --force: install untouched" "$(installed_version_of)" "0.0.1"
+
     run_updater --force
+    assert_eq "with --force: exits 0" "$STATUS" "0"
+    assert_eq "with --force: update applied" "$(installed_version_of)" "0.4.0"
+    teardown
+}
+
+# An unpushed local commit must not be treated as a reason to reinstall. Treating
+# it as one rebuilt and swapped the bundle on every firing, forever.
+test_local_ahead_does_not_trigger_update() {
+    start "local main ahead of origin does not trigger a reinstall"
+    setup
+    install_app_version 0.4.0
+    printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "unpushed local commit"
+
+    run_updater
     assert_eq "exits 0" "$STATUS" "0"
-    assert_eq "update applied" "$(installed_version_of)" "0.4.0"
+    assert_contains "reports up to date" "$OUTPUT" "already up to date"
+    assert_eq "no backup was taken (nothing was reinstalled)" \
+        "$(ls -1 "$STATE/backups" 2>/dev/null | wc -l | tr -d ' ')" "0"
+    teardown
+}
+
+# The memo is keyed on the commit that would be installed. When local main is
+# ahead of origin that is NOT origin's tip, and keying on the wrong one made the
+# blacklist silently never match — the flap survived.
+test_memo_key_matches_target_when_local_ahead() {
+    start "failed-launch memo still blocks when local main is ahead of origin"
+    setup
+    install_app_version 0.0.1
+    printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "unpushed local commit"
+    touch "$ROOT/app-running"
+
+    run_updater FAKE_LAUNCH_OK=0
+    assert_eq "first run exits non-zero" "$STATUS" "1"
+    assert_eq "rolled back" "$(installed_version_of)" "0.0.1"
+
+    run_updater FAKE_LAUNCH_OK=0
+    assert_eq "second run exits 0" "$STATUS" "0"
+    assert_contains "second run skips the known-bad commit" "$OUTPUT" "already failed to launch"
+    teardown
+}
+
+# The memo must suppress upgrades only. Letting it suppress repairs left the user
+# with no app and an agent that declined to fix it on every firing.
+test_memo_never_blocks_a_repair() {
+    start "the memo does not block repairing a broken install"
+    setup
+    git -C "$PROJECT" rev-parse origin/main > "$STATE/last-failed-launch"
+    mkdir -p "$INSTALL/PortPilot.app/Contents"
+    cat > "$INSTALL/PortPilot.app/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict><key>CFBundleShortVersionString</key><string>0.4.0</string></dict>
+</plist>
+PLIST
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_exists "broken install was repaired" "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"
+    teardown
+}
+
+# Same, for a missing install: a memo must never mean "refuse to install at all".
+test_memo_never_blocks_a_fresh_install() {
+    start "the memo does not block a fresh install"
+    setup
+    git -C "$PROJECT" rev-parse origin/main > "$STATE/last-failed-launch"
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "app installed" "$(installed_version_of)" "0.4.0"
+    teardown
+}
+
+# A successful launch must clear the memo, or the next genuine update is blocked.
+test_memo_cleared_after_success() {
+    start "a successful update clears the failure memo"
+    setup
+    install_app_version 0.0.1
+    touch "$ROOT/app-running"
+    run_updater FAKE_LAUNCH_OK=0
+    assert_exists "memo written by the failed run" "$STATE/last-failed-launch"
+    run_updater --force FAKE_LAUNCH_OK=1
+    assert_eq "recovery run exits 0" "$STATUS" "0"
+    assert_absent "memo cleared" "$STATE/last-failed-launch"
+    teardown
+}
+
+# Launch verification must not be conditional on the app having been running —
+# otherwise a crash-on-launch build installs silently whenever the user quit it.
+test_launch_verified_even_when_app_not_running() {
+    start "a non-launching build rolls back even if the app was not running"
+    setup
+    install_app_version 0.0.1
+    rm -f "$ROOT/app-running"          # app is NOT running
+    run_updater FAKE_LAUNCH_OK=0
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_eq "rolled back rather than silently installed" "$(installed_version_of)" "0.0.1"
+    assert_exists "failure memo written" "$STATE/last-failed-launch"
+    teardown
+}
+
+# A hung child must be killed and the install left alone, not hang the agent.
+test_timeout_aborts_without_touching_install() {
+    start "a hung build times out and leaves the install alone"
+    setup
+    install_app_version 0.0.1
+    printf '#!/bin/bash\nsleep 60\n' > "$SHIM/swift"
+    chmod +x "$SHIM/swift"
+    run_updater PORTPILOT_TEST_TIMEOUT=1
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "reports the timeout" "$OUTPUT" "timed out"
+    assert_eq "install untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+# A garbage interval must not silently disable the timeout machinery.
+test_non_integer_poll_falls_back() {
+    start "a non-integer poll interval falls back instead of spinning forever"
+    setup
+    install_app_version 0.4.0
+    run_updater PORTPILOT_POLL_SECS=0.5
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "still completed its decision" "$OUTPUT" "already up to date"
     teardown
 }
 
@@ -408,7 +540,15 @@ test_staging_failure_leaves_install_intact
 test_partial_copy_never_reaches_install_path
 test_broken_install_is_repaired
 test_launch_failure_rolls_back_and_is_remembered
-test_force_overrides_memo
+test_launch_verified_even_when_app_not_running
+test_memo_blocks_and_force_overrides
+test_memo_key_matches_target_when_local_ahead
+test_memo_never_blocks_a_repair
+test_memo_never_blocks_a_fresh_install
+test_memo_cleared_after_success
+test_local_ahead_does_not_trigger_update
+test_timeout_aborts_without_touching_install
+test_non_integer_poll_falls_back
 test_lock_prevents_concurrent_run
 test_feature_branch_skip
 test_dry_run_mutates_nothing
