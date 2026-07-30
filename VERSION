@@ -1,0 +1,8 @@
+# Single source of truth for Port Pilot's version.
+# Read by scripts/build-app.sh (bundle Info.plist), scripts/auto-update.sh, and
+# scripts/release.sh (git tag). Bump here and nowhere else.
+#
+# VERSION — marketing version, CFBundleShortVersionString, and the git tag (v$VERSION).
+# BUILD   — CFBundleVersion. Must increase monotonically; bump on every released build.
+VERSION=0.4.0
+BUILD=3
