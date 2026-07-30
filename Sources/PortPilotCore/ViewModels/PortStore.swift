@@ -346,11 +346,15 @@ public final class PortStore {
             }
         }
 
+        let displayNames = ProjectDisplayName.labels(
+            for: projectGroups.keys.filter { $0 != "Other" }
+        )
+
         // Dev projects first (sorted), then "macOS Apps" collapsed at bottom
         var result = projectGroups.map { key, entries in
             PortGroup(
                 id: "project-\(key)",
-                name: key,
+                name: key == "Other" ? key : displayNames[key] ?? key,
                 entries: entries.sorted { $0.port < $1.port }
             )
         }.sorted { $0.name < $1.name }

@@ -54,11 +54,11 @@ final class PortStoreTests: XCTestCase {
     func testGroupByProject() {
         let store = PortStore()
         var e1 = makeEntry(pid: 1, port: 3000, name: "node")
-        e1.projectPath = "sift-coffee"
+        e1.projectPath = "/tmp/sift-coffee"
         var e2 = makeEntry(pid: 2, port: 3001, name: "next")
-        e2.projectPath = "sift-coffee"
+        e2.projectPath = "/tmp/sift-coffee"
         var e3 = makeEntry(pid: 3, port: 8080, name: "python")
-        e3.projectPath = "portpilot"
+        e3.projectPath = "/tmp/portpilot"
 
         store.entries = [e1, e2, e3]
         store.groupMode = .project
@@ -70,6 +70,41 @@ final class PortStoreTests: XCTestCase {
         let scGroup = groups.first { $0.name == "sift-coffee" }
         XCTAssertEqual(ppGroup?.entries.count, 1)
         XCTAssertEqual(scGroup?.entries.count, 2)
+    }
+
+    func testEqualBasenamesRemainSeparateWithStableDisambiguatedLabels() {
+        let store = PortStore()
+        var clientA = makeEntry(pid: 1, port: 3000, name: "node")
+        clientA.projectPath = "/tmp/client-a/app"
+        var clientB = makeEntry(pid: 2, port: 4000, name: "node")
+        clientB.projectPath = "/tmp/client-b/app"
+
+        store.entries = [clientA, clientB]
+        store.groupMode = .project
+
+        let groups = store.grouped
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(Set(groups.map(\.id)), Set([
+            "project-/tmp/client-a/app",
+            "project-/tmp/client-b/app",
+        ]))
+        XCTAssertEqual(Set(groups.map(\.name)), Set(["client-a/app", "client-b/app"]))
+        XCTAssertTrue(store.multiPortProjects.isEmpty)
+        XCTAssertFalse(store.hasMultiPortProjects)
+    }
+
+    func testSameRootMultipleListenersStillTriggerMultiPortWarning() {
+        let store = PortStore()
+        var first = makeEntry(pid: 1, port: 3000, name: "node")
+        first.projectPath = "/tmp/client-a/app"
+        var second = makeEntry(pid: 2, port: 3001, name: "node")
+        second.projectPath = "/tmp/client-a/app"
+
+        store.entries = [first, second]
+
+        XCTAssertEqual(store.multiPortProjects, Set(["/tmp/client-a/app"]))
+        XCTAssertTrue(store.hasMultiPortProjects)
+        XCTAssertEqual(store.grouped.map(\.name), ["app"])
     }
 
     /// Regression: VS Code "Code Helper (Plugin)" language servers (e.g. Pylance)

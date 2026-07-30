@@ -5,6 +5,7 @@ struct PortRowView: View {
     let entry: PortEntry
     var isMultiPort: Bool = false
     var isConflicting: Bool = false
+    var projectLabel: String? = nil
 
     private enum KillState: Equatable {
         case idle
@@ -33,12 +34,6 @@ struct PortRowView: View {
 
     private var isInfrastructure: Bool {
         PortCategory.infrastructurePorts.contains(entry.port)
-    }
-
-    private var projectLabel: String? {
-        guard let path = entry.projectPath else { return nil }
-        // Show just the last path component as the project name
-        return URL(fileURLWithPath: path).lastPathComponent
     }
 
     private var killHelp: String {

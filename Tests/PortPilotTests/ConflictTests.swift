@@ -144,11 +144,22 @@ final class ConflictDetectorTests: XCTestCase {
 
     func testConflictLabelMixesProjectAndProcess() {
         var withProject = makeConflictEntry(pid: 1, port: 3000, name: "node")
-        withProject.projectPath = "sift-coffee"
+        withProject.projectPath = "/tmp/sift-coffee"
         let withoutProject = makeConflictEntry(pid: 2, port: 3000, name: "python")
 
         let conflict = PortConflict(port: 3000, entries: [withProject, withoutProject])
         XCTAssertEqual(conflict.conflictLabel, "python vs sift-coffee")
+    }
+
+    func testConflictLabelDisambiguatesEqualProjectBasenames() {
+        var clientA = makeConflictEntry(pid: 1, port: 3000, name: "node")
+        clientA.projectPath = "/tmp/client-a/app"
+        var clientB = makeConflictEntry(pid: 2, port: 3000, name: "python")
+        clientB.projectPath = "/tmp/client-b/app"
+
+        let conflict = PortConflict(port: 3000, entries: [clientA, clientB])
+
+        XCTAssertEqual(conflict.conflictLabel, "client-a/app vs client-b/app")
     }
 
     func testConflictLabelDisambiguatesSameNames() {

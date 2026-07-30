@@ -14,6 +14,12 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
 
     public var id: String { "\(pid)-\(port)-\(`protocol`)" }
 
+    /// Concise project name for display. `projectPath` remains the full root
+    /// path used for grouping and identity.
+    public var projectDisplayName: String? {
+        projectPath.map { ProjectDisplayName.label(for: $0) }
+    }
+
     public init(
         pid: pid_t, port: UInt16, processName: String, executablePath: String,
         protocol: PortProtocol, state: PortState, family: AddressFamily,
@@ -40,4 +46,59 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
     public enum PortProtocol: String, Sendable { case tcp, udp }
     public enum PortState: String, Sendable { case listen, established, other }
     public enum AddressFamily: String, Sendable { case ipv4, ipv6 }
+}
+
+public enum ProjectDisplayName {
+    /// Returns the final path component for a single project root.
+    public static func label(for rootPath: String) -> String {
+        URL(fileURLWithPath: rootPath).standardizedFileURL.lastPathComponent
+    }
+
+    /// Returns concise labels keyed by full project root. Equal basenames gain
+    /// only enough parent context to distinguish the simultaneously shown roots.
+    public static func labels(for rootPaths: some Sequence<String>) -> [String: String] {
+        let roots = Array(Set(rootPaths))
+        let rootsByBaseName = Dictionary(grouping: roots, by: label)
+        var labels: [String: String] = [:]
+
+        for (baseName, matchingRoots) in rootsByBaseName {
+            guard matchingRoots.count > 1 else {
+                labels[matchingRoots[0]] = baseName
+                continue
+            }
+
+            let componentsByRoot = Dictionary(uniqueKeysWithValues: matchingRoots.map {
+                ($0, pathComponents(for: $0))
+            })
+
+            for root in matchingRoots {
+                guard let components = componentsByRoot[root] else { continue }
+                var resolvedLabel = root
+
+                if components.count >= 2 {
+                    for depth in 2...components.count {
+                        let suffix = components.suffix(depth).joined(separator: "/")
+                        let isUnique = matchingRoots.allSatisfy { candidate in
+                            candidate == root
+                                || componentsByRoot[candidate]?.suffix(depth).joined(separator: "/")
+                                    != suffix
+                        }
+                        if isUnique {
+                            resolvedLabel = suffix
+                            break
+                        }
+                    }
+                }
+
+                labels[root] = resolvedLabel
+            }
+        }
+
+        return labels
+    }
+
+    private static func pathComponents(for rootPath: String) -> [String] {
+        URL(fileURLWithPath: rootPath).standardizedFileURL.pathComponents
+            .filter { $0 != "/" }
+    }
 }
