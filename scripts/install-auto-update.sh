@@ -32,6 +32,10 @@ case "${1:-install}" in
         # leaves an agent that fails every 6h with nothing reporting it.
         if [ -f "$PLIST" ]; then
             RECORDED="$(sed -n 's|.*<string>\(/.*/auto-update\.sh\)</string>.*|\1|p' "$PLIST" | head -1)"
+            # The plist stores XML-escaped paths, so decode before hitting the
+            # filesystem or a path containing '&' looks missing. &amp; goes last.
+            RECORDED="$(printf '%s' "$RECORDED" | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' \
+                -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g')"
             if [ -n "$RECORDED" ] && [ ! -x "$RECORDED" ]; then
                 echo "WARNING: the agent points at $RECORDED, which no longer exists." >&2
                 echo "         Re-run this script from the current clone, or --uninstall." >&2

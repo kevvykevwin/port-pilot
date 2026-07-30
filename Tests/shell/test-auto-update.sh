@@ -161,6 +161,13 @@ if [ "${PAUSE_AFTER_BACKUP:-0}" = "1" ]; then
         *backups*) touch "$PAUSE_MARKER"; sleep 5 ;;
     esac
 fi
+# Pause just after the staged bundle is swaped into place, i.e. installed but
+# not yet verified.
+if [ "${PAUSE_AFTER_SWAP:-0}" = "1" ]; then
+    case "$*" in
+        *.app.new.*) touch "$PAUSE_MARKER"; sleep 5 ;;
+    esac
+fi
 exit $RC
 MVSHIM
 
@@ -825,6 +832,63 @@ test_signal_mid_install_restores_the_app() {
     teardown
 }
 
+# An interruption after the swap leaves a bundle that was never confirmed to
+# start. The previous, known-good app is the safer state to return to.
+test_signal_after_swap_restores_previous_version() {
+    start "a signal after the swap but before verification restores the old version"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+
+    env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
+        PORTPILOT_PROJECT_DIR="$PROJECT" PORTPILOT_INSTALL_ROOT="$INSTALL" \
+        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
+        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
+        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
+        PAUSE_AFTER_SWAP=1 PAUSE_MARKER="$ROOT/paused" \
+        bash "$REAL_SCRIPT" >/dev/null 2>&1 &
+    UPDATER_PID=$!
+
+    WAITED=0
+    while [ ! -f "$ROOT/paused" ] && [ "$WAITED" -lt 40 ]; do sleep 1; WAITED=$((WAITED + 1)); done
+    if [ -f "$ROOT/paused" ]; then
+        ok "reached the post-swap window"
+        kill -TERM "$UPDATER_PID" 2>/dev/null || true
+        wait "$UPDATER_PID" 2>/dev/null || true
+        assert_eq "previous version restored" "$(installed_version_of)" "0.0.1"
+        assert_eq "no staged bundle left behind" "$(staged_bundle_count)" "0"
+    else
+        bad "never reached the post-swap window"
+        kill -TERM "$UPDATER_PID" 2>/dev/null || true
+    fi
+    teardown
+}
+
+# The updater builds in a live clone, so the tree can move mid-build. Installing
+# then would ship mixed state while recording TARGET_SHA as its provenance.
+test_tree_moving_mid_build_aborts() {
+    start "a commit landing mid-build discards that build"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+    # `swift test` is where we simulate the developer committing mid-run.
+    cat > "$SHIM/swift" << 'MOVER'
+#!/bin/bash
+if [ "$1" = "test" ]; then
+    printf '// landed mid-build
+' >> "$PORTPILOT_PROJECT_DIR/Sources/Main.swift"
+    git -C "$PORTPILOT_PROJECT_DIR" commit -qam "mid-build commit"
+fi
+exit 0
+MOVER
+    chmod +x "$SHIM/swift"
+    run_updater
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "reports HEAD moving" "$OUTPUT" "while building"
+    assert_eq "install untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
 # ------------------------------------------------------------------------ main
 test_up_to_date
 test_dirty_sources_skip
@@ -856,12 +920,25 @@ test_unknown_provenance_triggers_update
 test_dirty_build_clears_provenance
 test_linked_worktree_is_accepted
 test_signal_mid_install_restores_the_app
+test_signal_after_swap_restores_previous_version
+test_tree_moving_mid_build_aborts
 test_dead_lock_holder_is_cleared
 test_live_lock_holder_is_respected
 test_lock_prevents_concurrent_run
 test_feature_branch_skip
 test_dry_run_mutates_nothing
 test_test_failure_aborts_install
+
+# A test that is defined but never called silently "passes". That happened twice
+# while writing this suite, so make it a failure instead of a quiet no-op.
+UNCALLED=""
+for fn in $(grep -o '^test_[a-z0-9_]*() {' "$0" | sed 's/() {//'); do
+    grep -q "^$fn\$" "$0" || UNCALLED="$UNCALLED $fn"
+done
+if [ -n "$UNCALLED" ]; then
+    printf '\n✘ defined but never run:%s\n' "$UNCALLED"
+    FAIL=$((FAIL + 1))
+fi
 
 printf '\n────────────────────────────\n'
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"
