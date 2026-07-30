@@ -20,7 +20,7 @@ PROJECT_DIR="${PORTPILOT_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 APP_NAME="PortPilot"
 INSTALL_ROOT="${PORTPILOT_INSTALL_ROOT:-/Applications}"
 INSTALLED_APP="$INSTALL_ROOT/$APP_NAME.app"
-STAGED_APP="$INSTALL_ROOT/.$APP_NAME.app.new"
+STAGED_APP="$INSTALL_ROOT/.$APP_NAME.app.new.$$"
 BUILT_APP="$PROJECT_DIR/build/$APP_NAME.app"
 BRANCH="main"
 
@@ -48,13 +48,28 @@ TEST_TIMEOUT_SECS="${PORTPILOT_TEST_TIMEOUT:-600}"
 POLL_SECS="${PORTPILOT_POLL_SECS:-2}"
 LAUNCH_SETTLE_SECS="${PORTPILOT_LAUNCH_SETTLE_SECS:-8}"
 
+# These feed shell arithmetic and `[ -ge ]`, so a non-integer or zero would make
+# run_bounded's counter never advance — the timeout would never fire and the loop
+# would spin forever holding the lock. Force every one back to a sane integer.
+require_positive_int() {
+    case "$2" in
+        ''|*[!0-9]*|0) echo "$3" ;;
+        *) echo "$2" ;;
+    esac
+}
+POLL_SECS="$(require_positive_int POLL_SECS "$POLL_SECS" 2)"
+LAUNCH_SETTLE_SECS="$(require_positive_int LAUNCH_SETTLE_SECS "$LAUNCH_SETTLE_SECS" 8)"
+FETCH_TIMEOUT_SECS="$(require_positive_int FETCH_TIMEOUT_SECS "$FETCH_TIMEOUT_SECS" 120)"
+BUILD_TIMEOUT_SECS="$(require_positive_int BUILD_TIMEOUT_SECS "$BUILD_TIMEOUT_SECS" 900)"
+TEST_TIMEOUT_SECS="$(require_positive_int TEST_TIMEOUT_SECS "$TEST_TIMEOUT_SECS" 600)"
+
 DRY_RUN=false
 FORCE=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --force)   FORCE=true ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -95,13 +110,19 @@ skip() { log "SKIP:  $*"; exit 0; }
 # `git fetch`/`swift build` that hangs holds the lock and stops the agent for good.
 run_bounded() {
     local secs="$1"; shift
+    # Own process group, so a timeout can signal the whole tree. Killing just the
+    # direct child would orphan `swift build`, which keeps the SwiftPM lock and
+    # blocks the next run's `swift test` until that one times out too.
+    set -m
     "$@" &
     local pid=$! waited=0
+    set +m
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$waited" -ge "$secs" ]; then
-            kill -TERM "$pid" 2>/dev/null || true
+            pkill -P "$pid" 2>/dev/null || true
+            kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
             sleep 2
-            kill -KILL "$pid" 2>/dev/null || true
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             return 124
         fi
@@ -128,6 +149,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+# We hold the lock now, so any staged bundle still lying around belongs to a run
+# that was killed before its trap fired. Clear them before staging our own.
+for orphan in "$INSTALL_ROOT/.$APP_NAME.app.new"*; do
+    [ -e "$orphan" ] || continue
+    [ "$orphan" = "$STAGED_APP" ] && continue
+    rm -rf "$orphan" 2>/dev/null && log "cleared orphaned staged bundle $(basename "$orphan")"
+done
+
 # ------------------------------------------------------------------ preflight
 command -v git   >/dev/null 2>&1 || die "git not found on PATH"
 command -v swift >/dev/null 2>&1 || die "swift toolchain not found on PATH (Xcode / CLT missing?)"
@@ -153,8 +182,16 @@ if [ "$FORCE" = false ] && { [ -n "$DIRTY_INPUTS" ] || [ -n "$UNTRACKED_SOURCES"
 fi
 
 # --------------------------------------------------------------- what changed
-if ! run_bounded "$FETCH_TIMEOUT_SECS" git fetch --quiet origin "$BRANCH" 2>/dev/null; then
-    skip "git fetch failed or timed out (offline, or no access to origin)"
+FETCH_RC=0
+run_bounded "$FETCH_TIMEOUT_SECS" git fetch --quiet origin "$BRANCH" 2>/dev/null || FETCH_RC=$?
+if [ "$FETCH_RC" -eq 124 ]; then
+    # Not the same as being offline: something is hanging (a credential helper
+    # GIT_TERMINAL_PROMPT can't suppress, a black-holed connection). Say so,
+    # or it looks like normal offline behaviour forever.
+    notify "git fetch timed out after ${FETCH_TIMEOUT_SECS}s — updates are stalled."
+    skip "git fetch timed out after ${FETCH_TIMEOUT_SECS}s (hung transport or credential prompt)"
+elif [ "$FETCH_RC" -ne 0 ]; then
+    skip "git fetch failed (offline, or no access to origin)"
 fi
 
 LOCAL_SHA="$(git rev-parse HEAD)"
@@ -181,18 +218,29 @@ SRC_VERSION="$(source_version)"
 [ -n "$SRC_VERSION" ] || die "could not parse VERSION= from $PROJECT_DIR/VERSION"
 INST_VERSION="$(installed_version)"
 
-REASONS=()
-if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
-    BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH")"
-    if [ "$BEHIND" -gt 0 ]; then
-        REASONS+=("$BEHIND new upstream commit(s)")
-    else
-        # Local main is ahead of origin — nothing to pull, don't claim otherwise.
-        REASONS+=("local $BRANCH ahead of origin; no upstream changes")
-    fi
+BEHIND=0
+[ "$LOCAL_SHA" != "$REMOTE_SHA" ] && BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH")"
+
+# The one commit this run would actually install. Everything downstream — the
+# failed-launch memo check AND the memo it writes — must agree on this value, or
+# the blacklist silently never matches.
+if [ "$BEHIND" -gt 0 ]; then
+    TARGET_SHA="$REMOTE_SHA"
+else
+    TARGET_SHA="$LOCAL_SHA"
 fi
+
+REASONS=()
+[ "$BEHIND" -gt 0 ] && REASONS+=("$BEHIND new upstream commit(s)")
 [ "$SRC_VERSION" != "$INST_VERSION" ] && REASONS+=("installed $INST_VERSION != source $SRC_VERSION")
 [ "$FORCE" = true ] && REASONS+=("--force")
+
+# Local main being AHEAD of origin is not a reason to reinstall — treating it as
+# one rebuilt and swapped the bundle every 6 hours forever on any machine with an
+# unpushed commit. Worth a log line, nothing more.
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] && [ "$BEHIND" -eq 0 ]; then
+    log "note: local $BRANCH is ahead of origin/$BRANCH — nothing to pull"
+fi
 
 if [ ${#REASONS[@]} -eq 0 ]; then
     skip "already up to date (v$INST_VERSION @ ${LOCAL_SHA:0:7})"
@@ -201,10 +249,14 @@ fi
 # A commit that builds and passes tests can still crash on launch. Without this
 # memo the rollback leaves installed != source forever, and the agent quits and
 # replaces the user's app every 6 hours in an endless flap.
-if [ "$FORCE" = false ] && [ -f "$FAILED_LAUNCH_MEMO" ]; then
+# Only ever suppress an UPGRADE. If the installed app is missing or broken there
+# is nothing to protect, and skipping would leave the user with no working app
+# and an agent that declines to fix it on every firing.
+if [ "$FORCE" = false ] && [ "$INST_VERSION" != "none" ] && [ "$INST_VERSION" != "broken" ] \
+   && [ -f "$FAILED_LAUNCH_MEMO" ]; then
     FAILED_SHA="$(head -1 "$FAILED_LAUNCH_MEMO" 2>/dev/null || true)"
-    if [ -n "$FAILED_SHA" ] && [ "$FAILED_SHA" = "$REMOTE_SHA" ]; then
-        skip "${REMOTE_SHA:0:7} already failed to launch (see $FAILED_LAUNCH_MEMO) — waiting for a newer commit (--force to retry)"
+    if [ -n "$FAILED_SHA" ] && [ "$FAILED_SHA" = "$TARGET_SHA" ]; then
+        skip "${TARGET_SHA:0:7} already failed to launch (see $FAILED_LAUNCH_MEMO) — waiting for a newer commit (--force to retry)"
     fi
 fi
 
@@ -304,36 +356,53 @@ restore_backup() {
     rm -rf "$INSTALLED_APP" 2>/dev/null || true
     [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ] || return 1
     mv "$BACKUP_PATH" "$INSTALLED_APP" || return 1
+    # $BACKUP_DIR lives under $HOME while the install root does not, so if the
+    # home directory is on another volume this mv was a copy, not a rename — and
+    # an interrupted copy can pass a naive health check while being incomplete.
+    if [ ! -x "$INSTALLED_APP/Contents/MacOS/$APP_NAME" ]; then
+        log "restored bundle is incomplete — clearing it rather than leaving a broken app"
+        rm -rf "$INSTALLED_APP" 2>/dev/null || true
+        return 1
+    fi
     log "rolled back to v$INST_VERSION"
     [ "$WAS_RUNNING" = true ] && open "$INSTALLED_APP" >/dev/null 2>&1 || true
     return 0
 }
 
 # ------------------------------------------------------------------- relaunch
-if [ "$WAS_RUNNING" = true ]; then
-    open "$INSTALLED_APP" >/dev/null 2>&1 || true
-    LAUNCHED=false
-    for _ in $(seq 1 10); do
-        if pgrep -x "$APP_NAME" >/dev/null 2>&1; then LAUNCHED=true; break; fi
-        sleep 1
-    done
-    # Surviving the first sighting is not enough — a crash-on-startup app appears
-    # briefly and then vanishes, which would otherwise count as success.
-    if [ "$LAUNCHED" = true ]; then
-        sleep "$LAUNCH_SETTLE_SECS"
-        pgrep -x "$APP_NAME" >/dev/null 2>&1 || { LAUNCHED=false; log "v$SRC_VERSION started then exited"; }
+# Verify the new bundle launches even when the app wasn't running: installing a
+# crash-on-launch build and reporting success is precisely what the memo exists
+# to prevent, and skipping the check whenever the user had quit the app left that
+# hole wide open.
+open "$INSTALLED_APP" >/dev/null 2>&1 || true
+LAUNCHED=false
+for _ in $(seq 1 10); do
+    if pgrep -x "$APP_NAME" >/dev/null 2>&1; then LAUNCHED=true; break; fi
+    sleep 1
+done
+# Surviving the first sighting is not enough — a crash-on-startup app appears
+# briefly and then vanishes, which would otherwise count as success.
+if [ "$LAUNCHED" = true ]; then
+    sleep "$LAUNCH_SETTLE_SECS"
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || { LAUNCHED=false; log "v$SRC_VERSION started then exited"; }
+fi
+
+if [ "$LAUNCHED" = false ]; then
+    mkdir -p "$STATE_DIR"
+    printf '%s\n%s\n' "$TARGET_SHA" "v$SRC_VERSION failed to launch on $(date '+%Y-%m-%d %H:%M:%S')" > "$FAILED_LAUNCH_MEMO"
+    log "recorded failed launch in $FAILED_LAUNCH_MEMO — will not retry this commit"
+    if restore_backup; then
+        notify "v$SRC_VERSION would not start. Rolled back to v$INST_VERSION."
+        die "new version would not start; rolled back"
     fi
-    if [ "$LAUNCHED" = false ]; then
-        mkdir -p "$STATE_DIR"
-        printf '%s\n%s\n' "$(git rev-parse HEAD)" "v$SRC_VERSION failed to launch on $(date '+%Y-%m-%d %H:%M:%S')" > "$FAILED_LAUNCH_MEMO"
-        log "recorded failed launch in $FAILED_LAUNCH_MEMO — will not retry this commit"
-        if restore_backup; then
-            notify "v$SRC_VERSION would not start. Rolled back to v$INST_VERSION."
-            die "new version would not start; rolled back"
-        fi
-        notify "v$SRC_VERSION would not start and rollback FAILED. No app installed."
-        die "new version would not start and rollback failed — backup at ${BACKUP_PATH:-none}"
-    fi
+    notify "v$SRC_VERSION would not start and rollback FAILED. No app installed."
+    die "new version would not start and rollback failed — backup at ${BACKUP_PATH:-none}"
+fi
+
+# Leave the user's app in the state we found it: we only started it to check.
+if [ "$WAS_RUNNING" = false ]; then
+    log "launch verified; returning $APP_NAME to its previous (not running) state"
+    quit_app || log "warning: could not quit $APP_NAME after verification"
 fi
 
 # Clear the memo: this commit installed and launched fine.
