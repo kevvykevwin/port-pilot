@@ -54,6 +54,17 @@ Tests/
 
 ## Compound Learnings
 
+### 2026-06-14
+- **VSCode false positive handling**: Developer encounters VSCode-related warnings/errors that appear to be false positives and seeks to distinguish between actual issues vs. tool artifacts that can be safely resolved or ignored
+- **Streamlined deployment workflow**: Developer uses a compact command sequence pattern: "commit these, /deploy and open a PR" suggesting a preference for batched operations rather than individual git/deployment steps
+- **Post-merge cleanup with numbered steps**: Developer has a systematic `/post-merge-cleanup` command with numbered parameters (6) indicating a structured checklist approach for handling specific cleanup tasks after merges
+- **Local app refresh workflow**: Developer expects to update/restart the locally running PortPilot app after changes, suggesting the development cycle includes live testing of the menu bar app during iteration
+
+### 2026-05-18
+- **Post-merge cleanup workflow**: Developer has a systematic `/post-merge-cleanup` command pattern with numbered steps (4, 5) suggesting a structured checklist approach for handling merge aftermath tasks
+- **Version bump oversight**: Developer acknowledges missing version bumps during deployment but chooses to defer to next PR rather than interrupt current workflow, indicating preference for forward momentum over immediate corrections
+- **Worktree deployment pattern**: Uses git worktrees for commit/deploy/PR workflow, suggesting a branching strategy that isolates deployment preparation from main development work
+
 ### 2026-04-10
 - **Proactive port management**: Developer is exploring auto-rerouting and conflict detection for dev servers, suggesting the project is evolving from passive monitoring to active port management with automatic conflict resolution
 - **Uncertainty with testing**: Developer questions if tests "were tested properly" when reviewing implementation, indicating a pattern of double-checking test coverage and validity after feature implementation
