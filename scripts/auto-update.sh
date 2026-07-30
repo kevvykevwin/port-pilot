@@ -277,16 +277,26 @@ SRC_VERSION="$(source_version)"
 INST_VERSION="$(installed_version)"
 
 BEHIND=0
-[ "$LOCAL_SHA" != "$REMOTE_SHA" ] && BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH" 2>/dev/null || echo 0)"
+AHEAD=0
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+    BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH" 2>/dev/null || echo 0)"
+    AHEAD="$(git rev-list --count "origin/$BRANCH"..HEAD 2>/dev/null || echo 0)"
+fi
 BEHIND="${BEHIND:-0}"
+AHEAD="${AHEAD:-0}"
 
-# The one commit this run would actually install. Everything downstream — the
-# failed-launch memo check AND the memo it writes — must agree on this value, or
-# the blacklist silently never matches.
-if [ "$BEHIND" -gt 0 ]; then
-    TARGET_SHA="$REMOTE_SHA"
+# Unpushed commits on main are local work that nothing has reviewed, and installing
+# them unattended is the same hazard as installing a dirty tree. Skipping here also
+# keeps the invariant everything below relies on: if we proceed, the commit that
+# gets built is origin's tip (either HEAD already equals it, or the fast-forward
+# makes it so), which is what the failed-launch memo and provenance record assume.
+if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -eq 0 ]; then
+    if [ "$FORCE" = false ]; then
+        skip "local $BRANCH has $AHEAD unpushed commit(s) — refusing to install unreviewed local work (push them, or --force)"
+    fi
+    TARGET_SHA="$LOCAL_SHA"   # --force installs what is actually checked out
 else
-    TARGET_SHA="$LOCAL_SHA"
+    TARGET_SHA="$REMOTE_SHA"
 fi
 
 # The commit the installed bundle was built from, as recorded by the last
@@ -304,11 +314,8 @@ if [ "$INSTALLED_SHA" != "$TARGET_SHA" ]; then
 fi
 [ "$FORCE" = true ] && REASONS+=("--force")
 
-# Local main being AHEAD of origin is not a reason to reinstall — treating it as
-# one rebuilt and swapped the bundle every 6 hours forever on any machine with an
-# unpushed commit. Worth a log line, nothing more.
-if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] && [ "$BEHIND" -eq 0 ]; then
-    log "note: local $BRANCH is ahead of origin/$BRANCH — nothing to pull"
+if [ "$AHEAD" -gt 0 ]; then
+    log "note: local $BRANCH is $AHEAD commit(s) ahead of origin/$BRANCH"
 fi
 
 if [ ${#REASONS[@]} -eq 0 ]; then
@@ -343,7 +350,10 @@ fi
 log "update needed: ${REASONS[*]}"
 
 if [ "$DRY_RUN" = true ]; then
-    log "DRY RUN: would fast-forward to ${REMOTE_SHA:0:7}, build, test, and install v$SRC_VERSION over v$INST_VERSION"
+    # SRC_VERSION still comes from the pre-fast-forward tree, so read the target
+    # commit's VERSION to report what a real run would actually install.
+    TARGET_VERSION="$(git show "$TARGET_SHA:VERSION" 2>/dev/null | sed -n 's/^[[:space:]]*VERSION=//p' | head -1 | tr -d '"'"'"' \t\r')"
+    log "DRY RUN: would fast-forward to ${TARGET_SHA:0:7}, build, test, and install v${TARGET_VERSION:-$SRC_VERSION} over v$INST_VERSION"
     exit 0
 fi
 
@@ -472,6 +482,14 @@ restore_backup() {
 # crash-on-launch build and reporting success is precisely what the memo exists
 # to prevent, and skipping the check whenever the user had quit the app left that
 # hole wide open.
+# The user may have launched the old bundle while we were staging. `open` would
+# just activate that surviving process, and the check below would then "verify"
+# the old executable instead of the one just installed.
+if app_running; then
+    log "an instance was started during the install; quitting it so verification tests the new bundle"
+    quit_app || log "warning: could not quit the pre-existing instance"
+fi
+
 open "$INSTALLED_APP" >/dev/null 2>&1 || true
 LAUNCHED=false
 LAUNCHED_PID=""

@@ -410,38 +410,51 @@ test_memo_blocks_and_force_overrides() {
     teardown
 }
 
-# An unpushed local commit must not be treated as a reason to reinstall. Treating
-# it as one rebuilt and swapped the bundle on every firing, forever.
-test_local_ahead_does_not_trigger_update() {
-    start "local main ahead of origin does not trigger a reinstall"
+# Unpushed commits are unreviewed local work. Installing them unattended is the
+# same hazard as installing a dirty tree, so it must refuse outright — and it must
+# refuse without reinstalling anything on every firing.
+test_unpushed_commits_are_refused() {
+    start "unpushed commits on main are refused, not installed"
     setup
     install_app_version 0.4.0
+    seed_installed_sha
     printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
     git -C "$PROJECT" commit -qam "unpushed local commit"
-    seed_installed_sha HEAD
 
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
-    assert_contains "reports up to date" "$OUTPUT" "already up to date"
-    assert_eq "no backup was taken (nothing was reinstalled)" \
+    assert_contains "refuses unreviewed local work" "$OUTPUT" "unpushed commit"
+    assert_eq "install untouched" "$(installed_version_of)" "0.4.0"
+    assert_eq "nothing was reinstalled" \
         "$(ls -1 "$STATE/backups" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+    # --force is the documented override, and it installs what is checked out.
+    run_updater --force
+    assert_eq "--force exits 0" "$STATUS" "0"
+    assert_eq "--force records the local commit as installed" \
+        "$(cat "$STATE/installed-sha")" "$(git -C "$PROJECT" rev-parse HEAD)"
     teardown
 }
 
-# The memo is keyed on the commit that would be installed. When local main is
-# ahead of origin that is NOT origin's tip, and keying on the wrong one made the
-# blacklist silently never match — the flap survived.
-test_memo_key_matches_target_when_local_ahead() {
-    start "failed-launch memo still blocks when local main is ahead of origin"
+# The memo must key on the commit that actually gets built. Upstream commits are
+# the normal case: after the fast-forward the installed commit is origin's tip, so
+# the next run's target must equal what the memo recorded.
+test_memo_key_matches_target_after_fast_forward() {
+    start "failed-launch memo blocks the commit it fast-forwarded to"
     setup
     install_app_version 0.0.1
-    printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
-    git -C "$PROJECT" commit -qam "unpushed local commit"
+    seed_installed_sha
+    printf '// upstream work\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "upstream commit"
+    git -C "$PROJECT" push -q origin main
+    git -C "$PROJECT" reset -q --hard HEAD~1       # local is now genuinely behind
     touch "$ROOT/app-running"
 
     run_updater FAKE_LAUNCH_OK=0
     assert_eq "first run exits non-zero" "$STATUS" "1"
     assert_eq "rolled back" "$(installed_version_of)" "0.0.1"
+    assert_eq "memo records origin's tip" \
+        "$(sed -n 1p "$STATE/last-failed-launch")" "$(git -C "$PROJECT" rev-parse origin/main)"
 
     run_updater FAKE_LAUNCH_OK=0
     assert_eq "second run exits 0" "$STATUS" "0"
@@ -901,11 +914,11 @@ test_broken_install_is_repaired
 test_launch_failure_rolls_back_and_is_remembered
 test_launch_verified_even_when_app_not_running
 test_memo_blocks_and_force_overrides
-test_memo_key_matches_target_when_local_ahead
+test_memo_key_matches_target_after_fast_forward
 test_memo_never_blocks_a_repair
 test_memo_never_blocks_a_fresh_install
 test_memo_cleared_after_success
-test_local_ahead_does_not_trigger_update
+test_unpushed_commits_are_refused
 test_timeout_aborts_without_touching_install
 test_non_integer_poll_falls_back
 test_zero_poll_falls_back
