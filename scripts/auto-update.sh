@@ -11,7 +11,9 @@
 #
 # Usage:
 #   ./scripts/auto-update.sh              # normal run
-#   ./scripts/auto-update.sh --dry-run    # report decisions, mutate nothing
+#   ./scripts/auto-update.sh --dry-run    # report what it would do; builds and
+#                                         # installs nothing, but does still fetch
+#                                         # from origin and append to the log
 #   ./scripts/auto-update.sh --force      # rebuild+reinstall even if nothing changed
 #
 set -euo pipefail
@@ -120,9 +122,15 @@ app_running() {
 }
 
 INSTALL_PHASE_STARTED=false
+# Set once this run has committed to updating. A build or test failure happens
+# before the install phase but still needs to be visible: launchd discards stdout,
+# so otherwise a bad upstream commit stalls updates with the reason buried in a log.
+UPDATE_STARTED=false
 die() {
     log "ERROR: $*"
-    [ "$INSTALL_PHASE_STARTED" = true ] && notify "Update failed: $*"
+    if [ "$INSTALL_PHASE_STARTED" = true ] || [ "$UPDATE_STARTED" = true ]; then
+        notify "Update failed: $*"
+    fi
     exit 1
 }
 skip() { log "SKIP:  $*"; exit 0; }
@@ -154,6 +162,16 @@ run_bounded() {
 }
 
 # ---------------------------------------------------------------- concurrency
+# Claims a stale lock by renaming it aside. mv onto a non-existent source fails,
+# so of two racers exactly one succeeds and the other backs off.
+take_stale_lock() {
+    local aside="$LOCK_DIR.stale.$$"
+    mv "$LOCK_DIR" "$aside" 2>/dev/null || return 1
+    log "clearing stale lock ($1)"
+    rm -rf "$aside" 2>/dev/null || true
+    return 0
+}
+
 # Liveness beats an age heuristic: a worst-case run (fetch + test + build) can
 # legitimately exceed any fixed timeout, and stealing its lock lets a second run
 # swap the same bundle underneath it.
@@ -163,11 +181,13 @@ if [ -d "$LOCK_DIR" ]; then
         if kill -0 "$LOCK_PID" 2>/dev/null; then
             skip "another auto-update run is in progress (pid $LOCK_PID)"
         fi
-        log "clearing stale lock (holder pid $LOCK_PID is gone)"
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        # Two runs can both observe the same dead holder. Deleting and recreating
+        # would let the second delete the first's freshly acquired lock and both
+        # proceed. Claim it by rename instead: that is atomic, so exactly one wins
+        # and the loser finds nothing to move.
+        take_stale_lock "holder pid $LOCK_PID is gone" || skip "another auto-update run claimed the stale lock first"
     elif [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +$LOCK_MAX_AGE_MIN 2>/dev/null)" ]; then
-        log "clearing stale lock (no holder recorded, older than ${LOCK_MAX_AGE_MIN}m)"
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        take_stale_lock "no holder recorded, older than ${LOCK_MAX_AGE_MIN}m" || skip "another auto-update run claimed the stale lock first"
     else
         skip "another auto-update run is in progress"
     fi
@@ -383,6 +403,7 @@ if [ "$FORCE" = false ] && [ -f "$FAILED_LAUNCH_MEMO" ]; then
 fi
 
 log "update needed: ${REASONS[*]}"
+UPDATE_STARTED=true
 
 if [ "$DRY_RUN" = true ]; then
     # SRC_VERSION still comes from the pre-fast-forward tree, so read the target

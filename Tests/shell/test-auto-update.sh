@@ -953,6 +953,27 @@ test_unstoppable_instance_aborts_verification() {
     teardown
 }
 
+# A build failure must be visible: launchd discards stdout, so without a
+# notification a bad upstream commit stalls updates silently.
+test_build_failure_notifies() {
+    start "a pre-install build failure raises a notification"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+    printf '// upstream\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "upstream commit"
+    git -C "$PROJECT" push -q origin main
+    git -C "$PROJECT" reset -q --hard HEAD~1
+    printf '#!/bin/bash\n[ "$1" = "test" ] && exit 1\nexit 0\n' > "$SHIM/swift"
+    chmod +x "$SHIM/swift"
+    run_updater
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "user was notified" \
+        "$(cat "$ROOT/notifications" 2>/dev/null || echo)" "Update failed"
+    assert_eq "install untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
 # ------------------------------------------------------------------------ main
 test_up_to_date
 test_dirty_sources_skip
@@ -983,6 +1004,7 @@ test_advanced_clone_without_install_still_updates
 test_unknown_provenance_triggers_update
 test_dirty_build_clears_provenance
 test_linked_worktree_is_accepted
+test_build_failure_notifies
 test_incomplete_backup_never_replaces_a_good_install
 test_unstoppable_instance_aborts_verification
 test_signal_mid_install_restores_the_app

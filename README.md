@@ -63,7 +63,7 @@ automates that — it fast-forwards `main`, rebuilds, runs the tests, and reinst
 `/Applications` only if the build and tests pass, keeping a backup to roll back to.
 
 ```bash
-./scripts/auto-update.sh --dry-run       # show what it would do
+./scripts/auto-update.sh --dry-run       # show what it would do (fetches; installs nothing)
 ./scripts/auto-update.sh                 # update now if anything changed
 ./scripts/install-auto-update.sh         # check every 6h + at login (launchd)
 ./scripts/install-auto-update.sh --status
@@ -91,6 +91,9 @@ swift run PortPilot
 
 # Run tests
 swift test
+
+# Tests for the install/update scripts (sandboxed; no Swift build, no real install)
+./Tests/shell/test-auto-update.sh
 
 # Build .app bundle
 ./scripts/build-app.sh
