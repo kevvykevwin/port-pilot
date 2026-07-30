@@ -96,7 +96,11 @@ FAKE_BUILD
 
 teardown() { [ -n "${ROOT:-}" ] && rm -rf "$ROOT"; return 0; }
 # An early exit or Ctrl-C would otherwise leak a mktemp tree containing a fake .app.
-trap 'teardown' EXIT INT TERM
+# The signal handlers must exit: cleaning up and then falling through would keep
+# running the remaining tests against paths that no longer exist.
+trap 'teardown' EXIT
+trap 'teardown; exit 130' INT
+trap 'teardown; exit 143' TERM
 
 make_shims() {
     # swift: always succeeds; the real toolchain is never invoked.
@@ -566,7 +570,7 @@ test_lock_prevents_concurrent_run() {
     start "an existing lock makes the run skip"
     setup
     install_app_version 0.0.1
-    mkdir -p "$SANDBOX_TMP/portpilot-auto-update.lock"
+    mkdir -p "$SANDBOX_TMP/portpilot-auto-update-$(id -u).lock"
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "reports the lock" "$OUTPUT" "another auto-update run is in progress"
@@ -718,9 +722,9 @@ test_dead_lock_holder_is_cleared() {
     start "a lock left by a dead process is cleared"
     setup
     install_app_version 0.0.1
-    mkdir -p "$SANDBOX_TMP/portpilot-auto-update.lock"
+    mkdir -p "$SANDBOX_TMP/portpilot-auto-update-$(id -u).lock"
     # A pid that is certain not to be running.
-    printf '999999\n' > "$SANDBOX_TMP/portpilot-auto-update.lock/pid"
+    printf '999999\n' > "$SANDBOX_TMP/portpilot-auto-update-$(id -u).lock/pid"
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "reports clearing the stale lock" "$OUTPUT" "holder pid 999999 is gone"
@@ -732,8 +736,8 @@ test_live_lock_holder_is_respected() {
     start "a lock held by a live process is respected"
     setup
     install_app_version 0.0.1
-    mkdir -p "$SANDBOX_TMP/portpilot-auto-update.lock"
-    printf '%s\n' "$$" > "$SANDBOX_TMP/portpilot-auto-update.lock/pid"   # this test runner
+    mkdir -p "$SANDBOX_TMP/portpilot-auto-update-$(id -u).lock"
+    printf '%s\n' "$$" > "$SANDBOX_TMP/portpilot-auto-update-$(id -u).lock/pid"   # this test runner
     run_updater
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "names the holder" "$OUTPUT" "in progress (pid $$)"
