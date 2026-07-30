@@ -107,6 +107,8 @@ make_shims() {
     cat > "$SHIM/ditto" << 'DITTO'
 #!/bin/bash
 [ "${FAIL_DITTO:-0}" = "1" ] && exit 1
+# The user launching the app while we stage the new bundle.
+[ "${APPEAR_DURING_STAGING:-0}" = "1" ] && echo "${FAKE_LAUNCH_PID:-999999}" > "$FAKE_RUNNING_MARKER"
 if [ "${PARTIAL_DITTO:-0}" = "1" ]; then
     DEST="${2:-}"
     mkdir -p "$DEST/Contents"
@@ -123,7 +125,7 @@ DITTO
 #!/bin/bash
 if [ -f "$FAKE_RUNNING_MARKER" ]; then
     PID="$(cat "$FAKE_RUNNING_MARKER" 2>/dev/null)"
-    [ -n "$PID" ] || PID=4242
+    [ -n "$PID" ] || PID=999999
     echo "$PID"
     exit 0
 fi
@@ -135,7 +137,7 @@ PGREP
     # build that installs fine but crashes on startup.
     cat > "$SHIM/open" << 'OPEN'
 #!/bin/bash
-if [ "${FAKE_LAUNCH_OK:-1}" = "1" ]; then echo "${FAKE_LAUNCH_PID:-4242}" > "$FAKE_RUNNING_MARKER"; else rm -f "$FAKE_RUNNING_MARKER"; fi
+if [ "${FAKE_LAUNCH_OK:-1}" = "1" ]; then echo "${FAKE_LAUNCH_PID:-999999}" > "$FAKE_RUNNING_MARKER"; else rm -f "$FAKE_RUNNING_MARKER"; fi
 exit 0
 OPEN
 
@@ -143,7 +145,7 @@ OPEN
     cat > "$SHIM/osascript" << 'OSA'
 #!/bin/bash
 case "$*" in
-    *"quit app"*)             rm -f "$FAKE_RUNNING_MARKER" ;;
+    *"quit app"*)             [ "${QUIT_FAILS:-0}" = "1" ] || rm -f "$FAKE_RUNNING_MARKER" ;;
     *"display notification"*) printf '%s\n' "$*" >> "$NOTIFY_LOG" ;;
 esac
 exit 0
@@ -154,6 +156,18 @@ OSA
     # signal arriving then still leaves a launchable app behind.
     cat > "$SHIM/mv" << 'MVSHIM'
 #!/bin/bash
+# Simulate a cross-volume mv (copy-then-delete) that fails after copying only
+# part of the bundle, leaving the complete original in place.
+if [ "${PARTIAL_BACKUP:-0}" = "1" ]; then
+    case "$*" in
+        *backups*)
+            SRC="$1"; DST="$2"
+            mkdir -p "$DST/Contents"
+            cp "$SRC/Contents/Info.plist" "$DST/Contents/Info.plist" 2>/dev/null || true
+            exit 0   # reports success, but the executable never made it
+            ;;
+    esac
+fi
 /bin/mv "$@"
 RC=$?
 if [ "${PAUSE_AFTER_BACKUP:-0}" = "1" ]; then
@@ -615,14 +629,16 @@ test_orphan_staged_bundle_is_swept() {
 # If the restored backup is itself incomplete, the updater must clear it rather
 # than leave a bundle that looks healthy but cannot run.
 test_incomplete_restore_is_cleared() {
-    start "an incomplete rollback clears the install rather than leaving it broken"
+    start "an unusable backup is never used as a rollback target"
     setup
     install_app_version 0.0.1
     chmod -x "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"   # backup will be unusable
     touch "$ROOT/app-running"
     run_updater FAKE_LAUNCH_OK=0
     assert_eq "exits non-zero" "$STATUS" "1"
-    assert_contains "reports the incomplete restore" "$OUTPUT" "restored bundle is incomplete"
+    # The unusable bundle is now rejected as a rollback target up front, rather
+    # than being restored and then cleared.
+    assert_contains "refuses to treat it as a rollback point" "$OUTPUT" "no rollback point"
     assert_absent "no broken app left installed" "$INSTALL/PortPilot.app"
     assert_contains "user was notified of the failure" \
         "$(cat "$ROOT/notifications" 2>/dev/null || echo)" "rollback FAILED"
@@ -902,6 +918,37 @@ MOVER
     teardown
 }
 
+# A backup is the thing rollback trusts. An incomplete one must never be adopted,
+# and never at the cost of a complete install that is still in place.
+test_incomplete_backup_never_replaces_a_good_install() {
+    start "an incomplete backup does not replace a complete install"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+    run_updater PARTIAL_BACKUP=1
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "reports the incomplete backup" "$OUTPUT" "backup copy is incomplete"
+    assert_eq "original install preserved" "$(installed_version_of)" "0.0.1"
+    assert_exists "original executable intact" "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"
+    assert_eq "no staged bundle left behind" "$(staged_bundle_count)" "0"
+    teardown
+}
+
+# If a surviving instance cannot be stopped, `open` just activates it and the
+# launch check would accept the OLD executable as proof the new one works.
+test_unstoppable_instance_aborts_verification() {
+    start "an instance that cannot be quit aborts the update"
+    setup
+    install_app_version 0.0.1
+    seed_installed_sha
+    # Not running at the WAS_RUNNING check, then appears and refuses to quit.
+    run_updater QUIT_FAILS=1 APPEAR_DURING_STAGING=1
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "reports it could not verify" "$OUTPUT" "cannot be verified"
+    assert_eq "rolled back to the working version" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
 # ------------------------------------------------------------------------ main
 test_up_to_date
 test_dirty_sources_skip
@@ -932,6 +979,8 @@ test_advanced_clone_without_install_still_updates
 test_unknown_provenance_triggers_update
 test_dirty_build_clears_provenance
 test_linked_worktree_is_accepted
+test_incomplete_backup_never_replaces_a_good_install
+test_unstoppable_instance_aborts_verification
 test_signal_mid_install_restores_the_app
 test_signal_after_swap_restores_previous_version
 test_tree_moving_mid_build_aborts

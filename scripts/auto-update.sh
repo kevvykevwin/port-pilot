@@ -181,10 +181,23 @@ cleanup() {
     # incomplete install: the path may hold nothing, or hold a bundle that was
     # never confirmed to start. Either way the previous app is the safer state, so
     # a signal arriving in that span puts it back.
-    if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ] && [ "${LAUNCH_VERIFIED:-false}" != true ]; then
-        rm -rf "$INSTALLED_APP" 2>/dev/null || true
-        if mv "${BACKUP_PATH}" "$INSTALLED_APP" 2>/dev/null; then
-            log "interrupted before the new version was verified; restored v${INST_VERSION:-previous}"
+    if [ "${LAUNCH_VERIFIED:-false}" != true ]; then
+        # BACKUP_PATH is only assigned once the backup validates, but a signal can
+        # land in the gap between the move completing and that assignment — bash
+        # defers the trap until the running command returns. So fall back to the
+        # in-flight candidate, and only if it too proves complete: an unvalidated
+        # copy must never displace whatever is currently installed.
+        RESTORE_SRC=""
+        if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ]; then
+            RESTORE_SRC="${BACKUP_PATH}"
+        elif [ -n "${CANDIDATE_BACKUP:-}" ] && [ -x "${CANDIDATE_BACKUP}/Contents/MacOS/$APP_NAME" ]; then
+            RESTORE_SRC="${CANDIDATE_BACKUP}"
+        fi
+        if [ -n "$RESTORE_SRC" ]; then
+            rm -rf "$INSTALLED_APP" 2>/dev/null || true
+            if mv "$RESTORE_SRC" "$INSTALLED_APP" 2>/dev/null; then
+                log "interrupted before the new version was verified; restored v${INST_VERSION:-previous}"
+            fi
         fi
     fi
     rm -rf "$LOCK_DIR" 2>/dev/null || true
@@ -193,6 +206,7 @@ cleanup() {
 # Both are referenced by cleanup before the install phase sets them, and the traps
 # can fire at any point, so they must always be defined under `set -u`.
 BACKUP_PATH=""
+CANDIDATE_BACKUP=""
 LAUNCH_VERIFIED=false
 # cleanup alone is not enough for a signal: replacing bash's default termination
 # behaviour without exiting would let the run continue past the point where its
@@ -442,9 +456,29 @@ fi
 # Version goes into a filename; keep it to safe characters.
 SAFE_INST_VERSION="$(printf '%s' "$INST_VERSION" | tr -cd 'A-Za-z0-9._-')"
 if [ -d "$INSTALLED_APP" ]; then
-    BACKUP_PATH="$BACKUP_DIR/$APP_NAME-${SAFE_INST_VERSION:-unknown}-$(date '+%Y%m%d%H%M%S').app"
-    mv "$INSTALLED_APP" "$BACKUP_PATH" || { rm -rf "$STAGED_APP"; die "could not move existing app aside"; }
-    log "previous app backed up to $BACKUP_PATH"
+    # BACKUP_PATH is what cleanup and restore_backup treat as the good copy to
+    # return to, so it is only assigned once the backup is proven complete. The
+    # backup dir is under $HOME while the install root need not be, and a
+    # cross-volume mv is a copy-then-delete that can fail partway.
+    CANDIDATE_BACKUP="$BACKUP_DIR/$APP_NAME-${SAFE_INST_VERSION:-unknown}-$(date '+%Y%m%d%H%M%S').app"
+    if ! mv "$INSTALLED_APP" "$CANDIDATE_BACKUP"; then
+        rm -rf "$CANDIDATE_BACKUP" "$STAGED_APP" 2>/dev/null || true
+        die "could not move existing app aside"
+    fi
+    if [ -x "$CANDIDATE_BACKUP/Contents/MacOS/$APP_NAME" ]; then
+        BACKUP_PATH="$CANDIDATE_BACKUP"
+        log "previous app backed up to $BACKUP_PATH"
+    elif [ -d "$INSTALLED_APP" ]; then
+        # The copy failed before the delete, so the complete original is still
+        # installed. Keep it and abort — never trade it for a partial copy.
+        rm -rf "$CANDIDATE_BACKUP" "$STAGED_APP" 2>/dev/null || true
+        die "backup copy is incomplete — leaving the existing install in place"
+    else
+        # Original already gone and the backup is unusable. There is nothing to
+        # roll back to, so continue: the staged bundle was verified complete.
+        log "backup is incomplete and the original is gone — installing the new bundle with no rollback point"
+        rm -rf "$CANDIDATE_BACKUP" 2>/dev/null || true
+    fi
 fi
 
 # Both operands are on the same volume, so this rename is atomic: the install
@@ -487,7 +521,19 @@ restore_backup() {
 # the old executable instead of the one just installed.
 if app_running; then
     log "an instance was started during the install; quitting it so verification tests the new bundle"
-    quit_app || log "warning: could not quit the pre-existing instance"
+    if ! quit_app; then
+        # `open` would just activate that surviving process, and app_running would
+        # then accept the OLD executable as proof the new one launched — committing
+        # a possibly crash-on-launch update. This is an environment problem, not a
+        # bad build, so roll back without blacklisting the commit.
+        log "could not stop the running instance, so the new bundle cannot be verified"
+        if restore_backup; then
+            notify "Update aborted: a running instance blocked verification. Rolled back to v$INST_VERSION."
+            die "aborted before verification: a running instance could not be stopped; rolled back"
+        fi
+        notify "Update aborted: a running instance blocked verification and rollback FAILED."
+        die "aborted before verification: a running instance could not be stopped and no rollback was possible"
+    fi
 fi
 
 open "$INSTALLED_APP" >/dev/null 2>&1 || true
