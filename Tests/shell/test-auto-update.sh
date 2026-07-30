@@ -117,9 +117,16 @@ exec /usr/bin/ditto "$@"
 DITTO
 
     # pgrep/pkill: app "runs" while the marker file exists.
+    # Prints a pid like the real thing, so the "only quit what we launched" logic
+    # is actually exercised rather than comparing two empty strings.
     cat > "$SHIM/pgrep" << 'PGREP'
 #!/bin/bash
-[ -f "$FAKE_RUNNING_MARKER" ] && exit 0
+if [ -f "$FAKE_RUNNING_MARKER" ]; then
+    PID="$(cat "$FAKE_RUNNING_MARKER" 2>/dev/null)"
+    [ -n "$PID" ] || PID=4242
+    echo "$PID"
+    exit 0
+fi
 exit 1
 PGREP
     printf '#!/bin/bash\nrm -f "$FAKE_RUNNING_MARKER"\nexit 0\n' > "$SHIM/pkill"
@@ -128,7 +135,7 @@ PGREP
     # build that installs fine but crashes on startup.
     cat > "$SHIM/open" << 'OPEN'
 #!/bin/bash
-if [ "${FAKE_LAUNCH_OK:-1}" = "1" ]; then touch "$FAKE_RUNNING_MARKER"; else rm -f "$FAKE_RUNNING_MARKER"; fi
+if [ "${FAKE_LAUNCH_OK:-1}" = "1" ]; then echo "${FAKE_LAUNCH_PID:-4242}" > "$FAKE_RUNNING_MARKER"; else rm -f "$FAKE_RUNNING_MARKER"; fi
 exit 0
 OPEN
 
@@ -141,6 +148,15 @@ case "$*" in
 esac
 exit 0
 OSA
+
+    # git: real, except `fetch` can be made to hang so the timeout branch is
+    # reachable. Everything else must behave exactly like git.
+    REAL_GIT="$(command -v git)"
+    cat > "$SHIM/git" << GITSHIM
+#!/bin/bash
+if [ "\$1" = "fetch" ] && [ "\${HANG_FETCH:-0}" = "1" ]; then sleep 60; exit 0; fi
+exec "$REAL_GIT" "\$@"
+GITSHIM
 
     chmod +x "$SHIM"/*
 }
@@ -165,6 +181,11 @@ install_app_version() {
 PLIST
 }
 
+# The staged bundle is pid-suffixed, so any assertion on a fixed name is vacuous.
+staged_bundle_count() {
+    ls -1d "$INSTALL"/.PortPilot.app.new* 2>/dev/null | wc -l | tr -d ' '
+}
+
 installed_version_of() {
     local plist="$INSTALL/PortPilot.app/Contents/Info.plist"
     [ -f "$plist" ] || { echo "none"; return; }
@@ -173,11 +194,13 @@ installed_version_of() {
 
 # Runs the real script against the sandbox. Extra env comes in as VAR=VAL args.
 run_updater() {
+    # Order-independent: env pairs and flags may be interleaved. Breaking at the
+    # first flag silently dropped any env var that followed it, which made tests
+    # pass for the wrong reason.
     local env_pairs=() arg
     for arg in "$@"; do
         case "$arg" in
             *=*) env_pairs+=("$arg") ;;
-            *)   break ;;
         esac
     done
     local script_args=()
@@ -278,7 +301,7 @@ test_staging_failure_leaves_install_intact() {
     run_updater FAIL_DITTO=1
     assert_eq "exits non-zero" "$STATUS" "1"
     assert_eq "old version still installed" "$(installed_version_of)" "0.0.1"
-    assert_absent "no staged bundle left behind" "$INSTALL/.PortPilot.app.new"
+    assert_eq "no staged bundle left behind" "$(staged_bundle_count)" "0"
     teardown
 }
 
@@ -291,7 +314,7 @@ test_partial_copy_never_reaches_install_path() {
     run_updater PARTIAL_DITTO=1
     assert_eq "exits non-zero" "$STATUS" "1"
     assert_absent "no partial bundle installed" "$INSTALL/PortPilot.app"
-    assert_absent "no staged bundle left behind" "$INSTALL/.PortPilot.app.new"
+    assert_eq "no staged bundle left behind" "$(staged_bundle_count)" "0"
     teardown
 }
 
@@ -530,6 +553,144 @@ test_test_failure_aborts_install() {
     teardown
 }
 
+# A staged bundle orphaned by a killed run must be swept once the lock is held,
+# or /Applications slowly fills with .PortPilot.app.new.<pid> litter.
+test_orphan_staged_bundle_is_swept() {
+    start "an orphaned staged bundle is cleared"
+    setup
+    install_app_version 0.0.1
+    mkdir -p "$INSTALL/.PortPilot.app.new.99999/Contents"
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logged the sweep" "$OUTPUT" "cleared orphaned staged bundle"
+    assert_eq "no staged bundles remain" "$(staged_bundle_count)" "0"
+    teardown
+}
+
+# If the restored backup is itself incomplete, the updater must clear it rather
+# than leave a bundle that looks healthy but cannot run.
+test_incomplete_restore_is_cleared() {
+    start "an incomplete rollback clears the install rather than leaving it broken"
+    setup
+    install_app_version 0.0.1
+    chmod -x "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"   # backup will be unusable
+    touch "$ROOT/app-running"
+    run_updater FAKE_LAUNCH_OK=0
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "reports the incomplete restore" "$OUTPUT" "restored bundle is incomplete"
+    assert_absent "no broken app left installed" "$INSTALL/PortPilot.app"
+    assert_contains "user was notified of the failure" \
+        "$(cat "$ROOT/notifications" 2>/dev/null || echo)" "rollback FAILED"
+    teardown
+}
+
+# A timeout must kill the whole process group, not just the direct child — an
+# orphaned swift build keeps the SwiftPM lock and blocks the next run.
+test_timeout_kills_grandchildren() {
+    start "a timeout kills the child's whole process group"
+    setup
+    install_app_version 0.0.1
+    cat > "$SHIM/swift" << 'HANGER'
+#!/bin/bash
+sleep 60 &
+echo $! > "$GRANDCHILD_PID_FILE"
+wait
+HANGER
+    chmod +x "$SHIM/swift"
+    run_updater PORTPILOT_TEST_TIMEOUT=1 GRANDCHILD_PID_FILE="$ROOT/grandchild"
+    assert_eq "exits non-zero" "$STATUS" "1"
+    GC="$(cat "$ROOT/grandchild" 2>/dev/null || echo)"
+    if [ -n "$GC" ] && kill -0 "$GC" 2>/dev/null; then
+        bad "grandchild $GC survived the timeout"
+        kill -9 "$GC" 2>/dev/null || true
+    else
+        ok "grandchild was killed with its process group"
+    fi
+    teardown
+}
+
+# A hung fetch must be distinguishable from being offline, or a stalled updater
+# looks like normal offline behaviour forever.
+test_hung_fetch_is_reported_distinctly() {
+    start "a hung fetch is reported as a timeout, not as being offline"
+    setup
+    install_app_version 0.0.1
+    run_updater HANG_FETCH=1 PORTPILOT_FETCH_TIMEOUT=1
+    assert_eq "exits 0 (skip)" "$STATUS" "0"
+    assert_contains "names the timeout" "$OUTPUT" "git fetch timed out"
+    assert_contains "user was notified" \
+        "$(cat "$ROOT/notifications" 2>/dev/null || echo)" "timed out"
+    teardown
+}
+
+# With no install to fall back on, retrying a crash-on-launch build must be
+# bounded — otherwise it rebuilds every 6 hours forever.
+test_repair_retries_are_bounded() {
+    start "repair attempts on a non-launching build are bounded"
+    setup
+    # No app installed at all, so the memo cannot suppress the repair attempt.
+    SHA="$(git -C "$PROJECT" rev-parse origin/main)"
+    printf '%s\n3\nfailed earlier\n' "$SHA" > "$STATE/last-failed-launch"
+    run_updater FAKE_LAUNCH_OK=0
+    assert_eq "exits 0 (gave up)" "$STATUS" "0"
+    assert_contains "explains it gave up" "$OUTPUT" "giving up until a newer commit"
+    teardown
+}
+
+# A --force build over a dirty tree must not blacklist the commit: the crash came
+# from uncommitted code, not from what is committed.
+test_dirty_force_failure_does_not_blacklist() {
+    start "a dirty --force build that fails to launch does not blacklist the commit"
+    setup
+    install_app_version 0.0.1
+    printf '// local edit\n' >> "$PROJECT/Sources/Main.swift"
+    touch "$ROOT/app-running"
+    run_updater --force FAKE_LAUNCH_OK=0
+    assert_eq "exits non-zero" "$STATUS" "1"
+    assert_contains "says why it is not recording" "$OUTPUT" "included uncommitted changes"
+    assert_absent "no memo written" "$STATE/last-failed-launch"
+    teardown
+}
+
+# A live lock holder must be respected; a dead one must be cleared.
+test_dead_lock_holder_is_cleared() {
+    start "a lock left by a dead process is cleared"
+    setup
+    install_app_version 0.0.1
+    mkdir -p "$SANDBOX_TMP/portpilot-auto-update.lock"
+    # A pid that is certain not to be running.
+    printf '999999\n' > "$SANDBOX_TMP/portpilot-auto-update.lock/pid"
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "reports clearing the stale lock" "$OUTPUT" "holder pid 999999 is gone"
+    assert_eq "update proceeded" "$(installed_version_of)" "0.4.0"
+    teardown
+}
+
+test_live_lock_holder_is_respected() {
+    start "a lock held by a live process is respected"
+    setup
+    install_app_version 0.0.1
+    mkdir -p "$SANDBOX_TMP/portpilot-auto-update.lock"
+    printf '%s\n' "$$" > "$SANDBOX_TMP/portpilot-auto-update.lock/pid"   # this test runner
+    run_updater
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "names the holder" "$OUTPUT" "in progress (pid $$)"
+    assert_eq "install untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+# Zero must be rejected like any other invalid interval, not busy-loop.
+test_zero_poll_falls_back() {
+    start "a zero poll interval falls back instead of busy-looping"
+    setup
+    install_app_version 0.4.0
+    run_updater PORTPILOT_POLL_SECS=0
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "completed its decision" "$OUTPUT" "already up to date"
+    teardown
+}
+
 # ------------------------------------------------------------------------ main
 test_up_to_date
 test_dirty_sources_skip
@@ -549,6 +710,15 @@ test_memo_cleared_after_success
 test_local_ahead_does_not_trigger_update
 test_timeout_aborts_without_touching_install
 test_non_integer_poll_falls_back
+test_zero_poll_falls_back
+test_orphan_staged_bundle_is_swept
+test_incomplete_restore_is_cleared
+test_timeout_kills_grandchildren
+test_hung_fetch_is_reported_distinctly
+test_repair_retries_are_bounded
+test_dirty_force_failure_does_not_blacklist
+test_dead_lock_holder_is_cleared
+test_live_lock_holder_is_respected
 test_lock_prevents_concurrent_run
 test_feature_branch_skip
 test_dry_run_mutates_nothing

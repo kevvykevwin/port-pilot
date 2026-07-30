@@ -35,6 +35,9 @@ FAILED_LAUNCH_MEMO="$STATE_DIR/last-failed-launch"
 LOCK_DIR="${TMPDIR:-/tmp}/portpilot-auto-update.lock"
 LOCK_MAX_AGE_MIN=60
 KEEP_BACKUPS=3
+# How many times to retry a commit that installs but will not launch, when there
+# is no working install to fall back to. Prevents an unbounded rebuild loop.
+MAX_LAUNCH_ATTEMPTS=3
 
 # Unattended means no tty: git must never wait on a credential or host prompt,
 # or the job hangs forever and launchd will not fire the agent again.
@@ -133,18 +136,33 @@ run_bounded() {
 }
 
 # ---------------------------------------------------------------- concurrency
-if [ -d "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +$LOCK_MAX_AGE_MIN 2>/dev/null)" ]; then
-    log "clearing stale lock (older than ${LOCK_MAX_AGE_MIN}m)"
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+# Liveness beats an age heuristic: a worst-case run (fetch + test + build) can
+# legitimately exceed any fixed timeout, and stealing its lock lets a second run
+# swap the same bundle underneath it.
+if [ -d "$LOCK_DIR" ]; then
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$LOCK_PID" ]; then
+        if kill -0 "$LOCK_PID" 2>/dev/null; then
+            skip "another auto-update run is in progress (pid $LOCK_PID)"
+        fi
+        log "clearing stale lock (holder pid $LOCK_PID is gone)"
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    elif [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +$LOCK_MAX_AGE_MIN 2>/dev/null)" ]; then
+        log "clearing stale lock (no holder recorded, older than ${LOCK_MAX_AGE_MIN}m)"
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    else
+        skip "another auto-update run is in progress"
+    fi
 fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     skip "another auto-update run is in progress"
 fi
+printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
 # TERM/HUP matter: launchd signals agents at logout, and bash does not run an
 # EXIT trap for a default-action signal. Without these the lock outlives the run
 # and a staged bundle is left behind mid-install.
 cleanup() {
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
     rm -rf "$STAGED_APP" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM HUP
@@ -175,7 +193,9 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # SwiftPM globs its target directories and would compile an untracked source file.
 DIRTY_INPUTS="$(git status --porcelain --untracked-files=no -- Sources Tests Assets Package.swift Package.resolved VERSION scripts 2>/dev/null || true)"
 UNTRACKED_SOURCES="$(git ls-files --others --exclude-standard -- Sources Tests Assets 2>/dev/null || true)"
-if [ "$FORCE" = false ] && { [ -n "$DIRTY_INPUTS" ] || [ -n "$UNTRACKED_SOURCES" ]; }; then
+DIRTY_BUILD=false
+{ [ -n "$DIRTY_INPUTS" ] || [ -n "$UNTRACKED_SOURCES" ]; } && DIRTY_BUILD=true
+if [ "$FORCE" = false ] && [ "$DIRTY_BUILD" = true ]; then
     [ -n "$DIRTY_INPUTS" ] && { log "dirty build inputs:"; log "$DIRTY_INPUTS"; }
     [ -n "$UNTRACKED_SOURCES" ] && { log "untracked files that would be compiled:"; log "$UNTRACKED_SOURCES"; }
     skip "uncommitted changes in build inputs — refusing to install an unreviewed build (use --force to override)"
@@ -219,7 +239,8 @@ SRC_VERSION="$(source_version)"
 INST_VERSION="$(installed_version)"
 
 BEHIND=0
-[ "$LOCAL_SHA" != "$REMOTE_SHA" ] && BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH")"
+[ "$LOCAL_SHA" != "$REMOTE_SHA" ] && BEHIND="$(git rev-list --count HEAD.."origin/$BRANCH" 2>/dev/null || echo 0)"
+BEHIND="${BEHIND:-0}"
 
 # The one commit this run would actually install. Everything downstream — the
 # failed-launch memo check AND the memo it writes — must agree on this value, or
@@ -249,14 +270,25 @@ fi
 # A commit that builds and passes tests can still crash on launch. Without this
 # memo the rollback leaves installed != source forever, and the agent quits and
 # replaces the user's app every 6 hours in an endless flap.
-# Only ever suppress an UPGRADE. If the installed app is missing or broken there
-# is nothing to protect, and skipping would leave the user with no working app
-# and an agent that declines to fix it on every firing.
-if [ "$FORCE" = false ] && [ "$INST_VERSION" != "none" ] && [ "$INST_VERSION" != "broken" ] \
-   && [ -f "$FAILED_LAUNCH_MEMO" ]; then
-    FAILED_SHA="$(head -1 "$FAILED_LAUNCH_MEMO" 2>/dev/null || true)"
+# The memo suppresses UPGRADES only. If the installed app is missing or broken
+# there is nothing to protect, and skipping would leave the user with no working
+# app and an agent that declines to fix it on every firing — so a repair is
+# always attempted, but a bounded number of times so it cannot rebuild forever.
+FAILED_ATTEMPTS=0
+if [ "$FORCE" = false ] && [ -f "$FAILED_LAUNCH_MEMO" ]; then
+    FAILED_SHA="$(sed -n 1p "$FAILED_LAUNCH_MEMO" 2>/dev/null || true)"
+    FAILED_ATTEMPTS="$(sed -n 2p "$FAILED_LAUNCH_MEMO" 2>/dev/null || true)"
+    case "$FAILED_ATTEMPTS" in ''|*[!0-9]*) FAILED_ATTEMPTS=1 ;; esac
     if [ -n "$FAILED_SHA" ] && [ "$FAILED_SHA" = "$TARGET_SHA" ]; then
-        skip "${TARGET_SHA:0:7} already failed to launch (see $FAILED_LAUNCH_MEMO) — waiting for a newer commit (--force to retry)"
+        if [ "$INST_VERSION" != "none" ] && [ "$INST_VERSION" != "broken" ]; then
+            skip "${TARGET_SHA:0:7} already failed to launch (see $FAILED_LAUNCH_MEMO) — waiting for a newer commit (--force to retry)"
+        elif [ "$FAILED_ATTEMPTS" -ge "$MAX_LAUNCH_ATTEMPTS" ]; then
+            skip "${TARGET_SHA:0:7} failed to launch $FAILED_ATTEMPTS times and no working install could be restored — giving up until a newer commit lands (--force to retry)"
+        else
+            log "no healthy install and ${TARGET_SHA:0:7} previously failed to launch — retrying (attempt $((FAILED_ATTEMPTS + 1)) of $MAX_LAUNCH_ATTEMPTS)"
+        fi
+    else
+        FAILED_ATTEMPTS=0
     fi
 fi
 
@@ -376,8 +408,13 @@ restore_backup() {
 # hole wide open.
 open "$INSTALLED_APP" >/dev/null 2>&1 || true
 LAUNCHED=false
+LAUNCHED_PID=""
 for _ in $(seq 1 10); do
-    if pgrep -x "$APP_NAME" >/dev/null 2>&1; then LAUNCHED=true; break; fi
+    if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+        LAUNCHED=true
+        LAUNCHED_PID="$(pgrep -x "$APP_NAME" 2>/dev/null | head -1 || true)"
+        break
+    fi
     sleep 1
 done
 # Surviving the first sighting is not enough — a crash-on-startup app appears
@@ -388,21 +425,34 @@ if [ "$LAUNCHED" = true ]; then
 fi
 
 if [ "$LAUNCHED" = false ]; then
-    mkdir -p "$STATE_DIR"
-    printf '%s\n%s\n' "$TARGET_SHA" "v$SRC_VERSION failed to launch on $(date '+%Y-%m-%d %H:%M:%S')" > "$FAILED_LAUNCH_MEMO"
-    log "recorded failed launch in $FAILED_LAUNCH_MEMO — will not retry this commit"
+    if [ "$DIRTY_BUILD" = true ]; then
+        # The crash came from uncommitted working-tree code, so blaming the commit
+        # would refuse a legitimate install of it once the user reverts.
+        log "not recording a failed launch: this build included uncommitted changes"
+    else
+        mkdir -p "$STATE_DIR"
+        printf '%s\n%s\n%s\n' "$TARGET_SHA" "$((FAILED_ATTEMPTS + 1))" \
+            "v$SRC_VERSION failed to launch on $(date '+%Y-%m-%d %H:%M:%S')" > "$FAILED_LAUNCH_MEMO"
+        log "recorded failed launch in $FAILED_LAUNCH_MEMO (attempt $((FAILED_ATTEMPTS + 1)) of $MAX_LAUNCH_ATTEMPTS)"
+    fi
     if restore_backup; then
         notify "v$SRC_VERSION would not start. Rolled back to v$INST_VERSION."
         die "new version would not start; rolled back"
     fi
     notify "v$SRC_VERSION would not start and rollback FAILED. No app installed."
-    die "new version would not start and rollback failed — backup at ${BACKUP_PATH:-none}"
+    die "new version would not start and no working install could be restored — older backups (if any) are in $BACKUP_DIR"
 fi
 
 # Leave the user's app in the state we found it: we only started it to check.
 if [ "$WAS_RUNNING" = false ]; then
-    log "launch verified; returning $APP_NAME to its previous (not running) state"
-    quit_app || log "warning: could not quit $APP_NAME after verification"
+    CURRENT_PID="$(pgrep -x "$APP_NAME" 2>/dev/null | head -1 || true)"
+    if [ -n "$LAUNCHED_PID" ] && [ -n "$CURRENT_PID" ] && [ "$CURRENT_PID" != "$LAUNCHED_PID" ]; then
+        # Someone started it during the ~18s verification window; leave theirs alone.
+        log "launch verified; $APP_NAME was started by someone else meanwhile — leaving it running"
+    else
+        log "launch verified; returning $APP_NAME to its previous (not running) state"
+        quit_app || log "warning: could not quit $APP_NAME after verification"
+    fi
 fi
 
 # Clear the memo: this commit installed and launched fine.
