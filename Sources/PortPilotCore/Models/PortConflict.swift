@@ -11,11 +11,15 @@ public struct PortConflict: Identifiable, Sendable {
 
     public var id: UInt16 { port }
 
-    /// Human label for notifications/UI. Shows project paths where available,
-    /// falls back to process names. Appends PID when names collide.
+    /// Human label for notifications/UI. Shows concise, disambiguated project
+    /// names where available and falls back to process names. Appends PID when
+    /// labels still collide.
     public var conflictLabel: String {
+        let projectLabels = ProjectDisplayName.labels(
+            for: entries.compactMap(\.projectPath)
+        )
         let labels = entries.map { entry -> String in
-            entry.projectPath ?? entry.processName
+            entry.projectPath.flatMap { projectLabels[$0] } ?? entry.processName
         }
         let counts = Dictionary(labels.map { ($0, 1) }, uniquingKeysWith: +)
 
@@ -24,7 +28,7 @@ public struct PortConflict: Identifiable, Sendable {
         }
 
         return entries.map { entry in
-            let label = entry.projectPath ?? entry.processName
+            let label = entry.projectPath.flatMap { projectLabels[$0] } ?? entry.processName
             return counts[label, default: 0] > 1 ? "\(label) (pid \(entry.pid))" : label
         }
         .sorted()

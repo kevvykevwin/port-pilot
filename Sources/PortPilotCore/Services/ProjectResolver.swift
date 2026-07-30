@@ -42,8 +42,8 @@ public final class ProjectResolver: Sendable {
 
     // MARK: - Public API
 
-    /// Resolves a process's working directory to the nearest project root.
-    /// Returns the project directory name (e.g., "sift-coffee") or nil.
+    /// Resolves a process's working directory to its nearest standardized
+    /// project-root path (e.g., "/Users/me/Projects/sift-coffee"), or nil.
     public func resolve(pid: pid_t, startTime: Date) -> String? {
         let key = CacheKey(pid: pid, startTime: startTime)
 
@@ -52,7 +52,7 @@ public final class ProjectResolver: Sendable {
         if let cached { return cached }
 
         // Cache miss — resolve
-        let result = resolveProjectName(pid: pid)
+        let result = resolveProjectRoot(pid: pid)
 
         // Store in cache
         withLock {
@@ -79,7 +79,7 @@ public final class ProjectResolver: Sendable {
 
     // MARK: - Private
 
-    private func resolveProjectName(pid: pid_t) -> String? {
+    private func resolveProjectRoot(pid: pid_t) -> String? {
         guard let cwd = processCwd(pid: pid), !cwd.isEmpty else {
             return nil
         }
@@ -102,7 +102,7 @@ public final class ProjectResolver: Sendable {
     }
 
     /// Walks up from `startPath` looking for project marker files/dirs.
-    /// Returns the directory name of the project root, or nil.
+    /// Returns the standardized path of the project root, or nil.
     func findProjectRoot(from startPath: String) -> String? {
         // Editor extension install dirs (~/.vscode/extensions/<ext>/…, .cursor, …)
         // ship a package.json and would otherwise resolve to a phantom "project"
@@ -120,7 +120,7 @@ public final class ProjectResolver: Sendable {
             for marker in Self.projectMarkers {
                 let markerPath = (current as NSString).appendingPathComponent(marker)
                 if fm.fileExists(atPath: markerPath) {
-                    return (current as NSString).lastPathComponent
+                    return URL(fileURLWithPath: current).standardizedFileURL.path
                 }
             }
             current = (current as NSString).deletingLastPathComponent

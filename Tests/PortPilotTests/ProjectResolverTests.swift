@@ -38,7 +38,10 @@ final class ProjectResolverTests: XCTestCase {
         )
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
 
-        XCTAssertEqual(ProjectResolver().findProjectRoot(from: nested.path), "normal-project")
+        XCTAssertEqual(
+            ProjectResolver().findProjectRoot(from: nested.path),
+            project.standardizedFileURL.path
+        )
     }
 
     func testFindProjectRootRecognizesWorktreeGitFileFromNestedPath() throws {
@@ -51,7 +54,10 @@ final class ProjectResolverTests: XCTestCase {
         let gitFile = project.appendingPathComponent(".git")
         try Data("gitdir: /tmp/example\n".utf8).write(to: gitFile)
 
-        XCTAssertEqual(ProjectResolver().findProjectRoot(from: nested.path), "worktree-project")
+        XCTAssertEqual(
+            ProjectResolver().findProjectRoot(from: nested.path),
+            project.standardizedFileURL.path
+        )
     }
 
     func testFindProjectRootReturnsNilWithoutProjectMarkers() throws {
@@ -62,6 +68,18 @@ final class ProjectResolverTests: XCTestCase {
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
 
         XCTAssertNil(ProjectResolver().findProjectRoot(from: nested.path))
+    }
+
+    func testProjectDisplayNamesAddOnlyRequiredParentContext() {
+        let labels = ProjectDisplayName.labels(for: [
+            "/tmp/client-a/app",
+            "/tmp/client-b/app",
+            "/tmp/standalone/api",
+        ])
+
+        XCTAssertEqual(labels["/tmp/client-a/app"], "client-a/app")
+        XCTAssertEqual(labels["/tmp/client-b/app"], "client-b/app")
+        XCTAssertEqual(labels["/tmp/standalone/api"], "api")
     }
 
     private func makeTemporaryFixture() throws -> URL {

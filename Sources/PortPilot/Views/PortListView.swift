@@ -6,13 +6,20 @@ struct PortListView: View {
     let multiPortProjects: Set<String>
     let conflictingPorts: Set<UInt16>
 
+    private var projectDisplayNames: [String: String] {
+        ProjectDisplayName.labels(
+            for: groups.flatMap(\.entries).compactMap(\.projectPath)
+        )
+    }
+
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 12) {
             ForEach(groups) { group in
                 CollapsibleSection(
                     group: group,
                     multiPortProjects: multiPortProjects,
-                    conflictingPorts: conflictingPorts
+                    conflictingPorts: conflictingPorts,
+                    projectDisplayNames: projectDisplayNames
                 )
             }
         }
@@ -23,12 +30,19 @@ private struct CollapsibleSection: View {
     let group: PortGroup
     let multiPortProjects: Set<String>
     let conflictingPorts: Set<UInt16>
+    let projectDisplayNames: [String: String]
     @State private var isCollapsed: Bool
 
-    init(group: PortGroup, multiPortProjects: Set<String>, conflictingPorts: Set<UInt16>) {
+    init(
+        group: PortGroup,
+        multiPortProjects: Set<String>,
+        conflictingPorts: Set<UInt16>,
+        projectDisplayNames: [String: String]
+    ) {
         self.group = group
         self.multiPortProjects = multiPortProjects
         self.conflictingPorts = conflictingPorts
+        self.projectDisplayNames = projectDisplayNames
         self._isCollapsed = State(initialValue: group.collapsedByDefault)
     }
 
@@ -39,7 +53,8 @@ private struct CollapsibleSection: View {
                     PortRowView(
                         entry: entry,
                         isMultiPort: entry.projectPath.map { multiPortProjects.contains($0) } ?? false,
-                        isConflicting: conflictingPorts.contains(entry.port)
+                        isConflicting: conflictingPorts.contains(entry.port),
+                        projectLabel: entry.projectPath.flatMap { projectDisplayNames[$0] }
                     )
                 }
             }
