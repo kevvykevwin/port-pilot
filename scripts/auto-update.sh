@@ -177,9 +177,21 @@ printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
 # EXIT trap for a default-action signal. Without these the lock outlives the run
 # and a staged bundle is left behind mid-install.
 cleanup() {
+    # There is one window — between moving the old bundle aside and swapping the
+    # new one in — where the install path holds nothing at all. A signal arriving
+    # then would otherwise leave the user with no app, which is exactly the
+    # guarantee this script exists to keep. Put the backup back first.
+    if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ] && [ ! -d "$INSTALLED_APP" ]; then
+        if mv "${BACKUP_PATH}" "$INSTALLED_APP" 2>/dev/null; then
+            log "interrupted mid-install; restored v${INST_VERSION:-previous}"
+        fi
+    fi
     rm -rf "$LOCK_DIR" 2>/dev/null || true
     rm -rf "$STAGED_APP" 2>/dev/null || true
 }
+# BACKUP_PATH is referenced by cleanup before the install phase sets it, and the
+# traps can fire at any point, so it must always be defined under `set -u`.
+BACKUP_PATH=""
 # cleanup alone is not enough for a signal: replacing bash's default termination
 # behaviour without exiting would let the run continue past the point where its
 # lock and staged bundle have already been removed, while launchd is free to
@@ -402,7 +414,6 @@ fi
 
 # Version goes into a filename; keep it to safe characters.
 SAFE_INST_VERSION="$(printf '%s' "$INST_VERSION" | tr -cd 'A-Za-z0-9._-')"
-BACKUP_PATH=""
 if [ -d "$INSTALLED_APP" ]; then
     BACKUP_PATH="$BACKUP_DIR/$APP_NAME-${SAFE_INST_VERSION:-unknown}-$(date '+%Y%m%d%H%M%S').app"
     mv "$INSTALLED_APP" "$BACKUP_PATH" || { rm -rf "$STAGED_APP"; die "could not move existing app aside"; }
