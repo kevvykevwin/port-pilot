@@ -193,7 +193,12 @@ cleanup() {
         RESTORE_SRC=""
         if [ -n "${BACKUP_PATH:-}" ] && [ -d "${BACKUP_PATH:-}" ]; then
             RESTORE_SRC="${BACKUP_PATH}"
-        elif [ -n "${CANDIDATE_BACKUP:-}" ] && [ -x "${CANDIDATE_BACKUP}/Contents/MacOS/$APP_NAME" ]; then
+        elif [ ! -d "$INSTALLED_APP" ] && [ -n "${CANDIDATE_BACKUP:-}" ] \
+             && [ -x "${CANDIDATE_BACKUP}/Contents/MacOS/$APP_NAME" ]; then
+            # Last resort only: an in-flight candidate has not been fully validated
+            # (a cross-volume copy interrupted after the executable but before the
+            # rest still looks executable), so it may only fill an empty install
+            # path — never displace a bundle that is still there.
             RESTORE_SRC="${CANDIDATE_BACKUP}"
         fi
         if [ -n "$RESTORE_SRC" ]; then
@@ -233,11 +238,13 @@ trap 'cleanup; exit 129' HUP
 
 # We hold the lock now, so any staged bundle still lying around belongs to a run
 # that was killed before its trap fired. Clear them before staging our own.
-for orphan in "$INSTALL_ROOT/.$APP_NAME.app.new"*; do
-    [ -e "$orphan" ] || continue
-    [ "$orphan" = "$STAGED_APP" ] && continue
-    rm -rf "$orphan" 2>/dev/null && log "cleared orphaned staged bundle $(basename "$orphan")"
-done
+if [ "$DRY_RUN" = false ]; then
+    for orphan in "$INSTALL_ROOT/.$APP_NAME.app.new"*; do
+        [ -e "$orphan" ] || continue
+        [ "$orphan" = "$STAGED_APP" ] && continue
+        rm -rf "$orphan" 2>/dev/null && log "cleared orphaned staged bundle $(basename "$orphan")"
+    done
+fi
 
 # ------------------------------------------------------------------ preflight
 command -v git   >/dev/null 2>&1 || die "git not found on PATH"

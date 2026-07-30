@@ -61,10 +61,12 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # For a local-only run a stale ref is tolerable, but publishing compares HEAD
 # against origin/main to prove the tag matches what others will get — and pushing
 # a tag does not update main. A failed fetch there means tagging an unknown state.
+FETCH_OK=true
 if ! git fetch --quiet origin "$BRANCH" --tags 2>/dev/null; then
     if [ "$PUSH" = true ]; then
         die "could not fetch origin — refusing to publish a release against a possibly stale origin/$BRANCH"
     fi
+    FETCH_OK=false
     echo "warning: could not fetch origin (offline?) — local tag only"
 fi
 
@@ -83,7 +85,9 @@ if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     fi
 fi
 
-if git rev-parse "origin/$BRANCH" >/dev/null 2>&1; then
+# Only meaningful against a ref we know is current. Enforcing it after a failed
+# fetch would block the offline local-tag workflow the warning above advertises.
+if [ "$FETCH_OK" = true ] && git rev-parse "origin/$BRANCH" >/dev/null 2>&1; then
     [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ] \
         || die "local $BRANCH differs from origin/$BRANCH — push or pull first so the tag matches what others get"
 fi
