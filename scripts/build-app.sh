@@ -4,13 +4,17 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$PROJECT_DIR/build/PortPilot.app"
 
-# Version comes from the VERSION file — never hardcode it here.
+# Version comes from the VERSION file — never hardcode it here. Parsed rather
+# than sourced, so the file stays inert data for all three scripts that read it.
 VERSION_FILE="$PROJECT_DIR/VERSION"
 [ -f "$VERSION_FILE" ] || { echo "error: $VERSION_FILE missing" >&2; exit 1; }
-# shellcheck source=../VERSION
-source "$VERSION_FILE"
-: "${VERSION:?VERSION not set in $VERSION_FILE}"
-: "${BUILD:?BUILD not set in $VERSION_FILE}"
+read_version_field() {
+    sed -n "s/^[[:space:]]*$1=//p" "$VERSION_FILE" | head -1 | tr -d '"'"'"' \t\r'
+}
+VERSION="$(read_version_field VERSION)"
+BUILD="$(read_version_field BUILD)"
+[ -n "$VERSION" ] || { echo "error: could not parse VERSION= from $VERSION_FILE" >&2; exit 1; }
+[ -n "$BUILD" ] || { echo "error: could not parse BUILD= from $VERSION_FILE" >&2; exit 1; }
 
 echo "Building Port Pilot $VERSION (build $BUILD)..."
 cd "$PROJECT_DIR"
