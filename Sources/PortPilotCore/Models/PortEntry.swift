@@ -14,6 +14,14 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
 
     public var id: String { "\(pid)-\(port)-\(`protocol`)" }
 
+    /// Display labels for identifier values. Ports and PIDs are identifiers,
+    /// not quantities — they must never render with locale grouping
+    /// separators (":8,317"). Views must consume these via `Text(verbatim:)`;
+    /// interpolating the raw integers into a `Text` literal selects the
+    /// `LocalizedStringKey` overload, which locale-formats them.
+    public var portLabel: String { ":\(String(port))" }
+    public var pidLabel: String { "pid \(String(pid))" }
+
     /// Concise project name for display. `projectPath` remains the full root
     /// path used for grouping and identity.
     public var projectDisplayName: String? {

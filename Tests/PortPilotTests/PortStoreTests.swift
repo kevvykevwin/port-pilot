@@ -429,6 +429,21 @@ final class PortStoreTests: XCTestCase {
         }
     }
 
+    /// Regression: interpolating raw integers into a Text literal selects the
+    /// LocalizedStringKey overload, which locale-formats them with grouping
+    /// separators (":8,317", "pid 3,965"). Views render these labels via
+    /// Text(verbatim:), so the invariant is enforced here, at the single
+    /// source both display sites consume.
+    func testPortAndPidLabelsNeverUseGroupingSeparators() {
+        let entry = makeEntry(pid: 3965, port: 8317, name: "cliproxyapi")
+        XCTAssertEqual(entry.portLabel, ":8317")
+        XCTAssertEqual(entry.pidLabel, "pid 3965")
+
+        let boundary = makeEntry(pid: 2_147_483_647, port: UInt16.max, name: "x")
+        XCTAssertEqual(boundary.portLabel, ":65535")
+        XCTAssertEqual(boundary.pidLabel, "pid 2147483647")
+    }
+
     /// Docker Desktop binds its infrastructure ports from /Applications/Docker.app,
     /// so infrastructure placement must win over app detection — otherwise
     /// 2375/2376 vanish into the collapsed macOS Apps group.

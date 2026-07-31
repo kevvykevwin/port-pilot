@@ -193,7 +193,7 @@ struct PortRowView: View {
     var body: some View {
         HStack(spacing: 8) {
             // Port number
-            Text(":\(entry.port)")
+            Text(verbatim: entry.portLabel)
                 .font(.system(.body, design: .monospaced))
                 .fontWeight(.medium)
 
@@ -237,7 +237,7 @@ struct PortRowView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 3))
                     }
 
-                    Text("pid \(entry.pid)")
+                    Text(verbatim: entry.pidLabel)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
