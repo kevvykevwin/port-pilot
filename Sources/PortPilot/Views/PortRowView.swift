@@ -33,7 +33,7 @@ struct PortRowView: View {
     }
 
     private var isInfrastructure: Bool {
-        PortCategory.infrastructurePorts.contains(entry.port)
+        PortCategory.isInfrastructure(entry)
     }
 
     private var killHelp: String {

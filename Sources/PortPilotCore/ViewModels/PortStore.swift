@@ -39,18 +39,27 @@ public enum PortCategory: String, Sendable {
 
     /// Known dev runtime process names
     public static let devRuntimes: Set<String> = [
-        "node", "python3", "python", "ruby", "java", "go",
+        "node", "python3", "python", "Python", "ruby", "java", "go",
         "bun", "deno", "cargo", "mix", "beam.smp",
         "next-server", "vite", "webpack", "esbuild", "tsx",
         "uvicorn", "gunicorn", "flask", "rails", "puma",
         "php", "nginx", "caddy",
     ]
 
+    /// Shared infrastructure daemons (portless proxy, Docker). Single source of
+    /// truth — grouping, multi-port detection, refresh, and the row warning all
+    /// route through this.
+    public static func isInfrastructure(_ entry: PortEntry) -> Bool {
+        infrastructurePorts.contains(entry.port)
+    }
+
     /// Categorize using both port AND process context
     public static func categorize(_ entry: PortEntry) -> PortCategory {
         if knownDatabases.contains(entry.port) { return .databases }
+        // Infrastructure wins over app detection: Docker Desktop's daemon binds
+        // 2375/2376 from /Applications/Docker.app, but it's system plumbing.
+        if isInfrastructure(entry) { return .system }
         if isMacApp(entry) { return .apps }
-        if infrastructurePorts.contains(entry.port) { return .system }
         if entry.port <= 1023 { return .system }
         if isDevProcess(entry) { return .devServers }
         if entry.projectPath != nil { return .devServers }
@@ -82,7 +91,15 @@ public enum PortCategory: String, Sendable {
         let path = entry.executablePath
         if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
         if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
-        if path.contains(".app/") { return true }
+        // Framework builds embed their real binary in a helper bundle
+        // (Python.framework/…/Resources/Python.app/Contents/MacOS/Python), so a
+        // Flask/Django/uvicorn dev server would match ".app/" and vanish into
+        // the collapsed macOS Apps group. Exempt only known runtimes: Electron/
+        // Sparkle helpers also nest .app inside .framework (Chrome Framework
+        // .framework/…/Helpers/… Helper.app) and must stay classified as apps.
+        if path.contains(".app/") && !(path.contains(".framework/") && isDevProcess(entry)) {
+            return true
+        }
         let knownApps: Set<String> = [
             "Spotify", "LINE", "ControlCenter", "rapportd", "figma_agent",
             "Slack", "Discord", "zoom.us", "Notion", "Safari",
@@ -158,6 +175,7 @@ public final class PortStore {
     public var multiPortProjects: Set<String> {
         let listeningProjectPaths = entries
             .filter { $0.state == .listen }
+            .filter { !PortCategory.isInfrastructure($0) }
             .compactMap(\.projectPath)
         let counts = Dictionary(grouping: listeningProjectPaths, by: { $0 })
             .filter { $0.value.count >= 2 }
@@ -277,9 +295,15 @@ public final class PortStore {
         // vscode-pylance-2026.2.1), which contains a package.json and would
         // otherwise resolve to a phantom "project" named after the extension.
         // These belong in the macOS Apps group, not a dev-project group.
+        //
+        // Infrastructure ports (portless proxy, Docker daemon) are skipped for
+        // the same reason: a shared daemon inherits the cwd of whichever project
+        // first auto-started it, which would adopt it into that project's group
+        // and trip the multi-port warning as a false dupe.
         for i in scanned.indices {
             let entry = scanned[i]
             guard !PortCategory.isMacApp(entry) else { continue }
+            guard !PortCategory.isInfrastructure(entry) else { continue }
             if let project = resolver.resolve(pid: entry.pid, startTime: entry.processStartTime) {
                 scanned[i].projectPath = project
             }
@@ -337,7 +361,13 @@ public final class PortStore {
             // isMacApp wins over projectPath (consistent with categorize): an
             // editor/app helper never belongs to a dev project, even if its cwd
             // happened to resolve to one.
-            if PortCategory.isMacApp(entry) {
+            if PortCategory.isInfrastructure(entry) {
+                // A shared daemon (portless proxy, Docker) inherits the cwd of
+                // whichever project first started it — never a real member of
+                // that project's group. Wins over isMacApp so Docker Desktop's
+                // 2375/2376 land here too, not in the collapsed apps group.
+                projectGroups["Other", default: []].append(entry)
+            } else if PortCategory.isMacApp(entry) {
                 macApps.append(entry)
             } else if let project = entry.projectPath {
                 projectGroups[project, default: []].append(entry)
