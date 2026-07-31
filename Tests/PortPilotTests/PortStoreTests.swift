@@ -336,4 +336,138 @@ final class PortStoreTests: XCTestCase {
         XCTAssertEqual(store.lastDiff?.removed.map(\.port), [4000])
         XCTAssertEqual(callbackPorts, [[4000], [5000]])
     }
+
+    /// Regression: macOS framework builds of Python (python.org installer,
+    /// Homebrew) run their interpreter from an embedded bundle —
+    /// Python.framework/…/Resources/Python.app/Contents/MacOS/Python — so the
+    /// ".app/" heuristic classified every Flask/Django/uvicorn dev server as a
+    /// macOS app, skipped its project resolution, and hid it in the collapsed
+    /// macOS Apps group.
+    func testFrameworkPythonIsADevServerNotAMacApp() {
+        let frameworkPython = makeEntry(
+            pid: 1, port: 5000, name: "Python",
+            executablePath: "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        )
+        XCTAssertFalse(PortCategory.isMacApp(frameworkPython))
+        XCTAssertEqual(PortCategory.categorize(frameworkPython), .devServers)
+
+        let homebrewPython = makeEntry(
+            pid: 2, port: 8000, name: "Python",
+            executablePath: "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+        )
+        XCTAssertFalse(PortCategory.isMacApp(homebrewPython))
+        XCTAssertEqual(PortCategory.categorize(homebrewPython), .devServers)
+
+        // A high port proves the devRuntimes entry for "Python": without it,
+        // the framework exemption disarms and categorize returns .apps instead
+        // of .devServers.
+        let highPortPython = makeEntry(
+            pid: 3, port: 12000, name: "Python",
+            executablePath: "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        )
+        XCTAssertEqual(PortCategory.categorize(highPortPython), .devServers)
+
+        // The ".app/" heuristic must keep catching genuine app helpers.
+        let codeHelper = makeEntry(
+            pid: 4, port: 49861, name: "Code Helper (Plugin)",
+            executablePath: "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"
+        )
+        XCTAssertTrue(PortCategory.isMacApp(codeHelper))
+
+        // Electron/Sparkle helpers nest .app inside .framework — the framework
+        // exemption must not disarm app detection for them, even outside
+        // /Applications (e.g. ~/Applications, Downloads-run apps).
+        let chromeHelper = makeEntry(
+            pid: 5, port: 50000, name: "Google Chrome Helper",
+            executablePath: "/Users/dev/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/140.0/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+        )
+        XCTAssertTrue(PortCategory.isMacApp(chromeHelper))
+    }
+
+    func testFrameworkPythonGroupsUnderItsProject() {
+        let store = PortStore()
+        var flask = makeEntry(
+            pid: 1, port: 5001, name: "Python",
+            executablePath: "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+        )
+        flask.projectPath = "/tmp/client-a/api"
+
+        store.entries = [flask]
+        store.groupMode = .project
+
+        let groups = store.grouped
+        XCTAssertNil(groups.first { $0.name == "macOS Apps" })
+        XCTAssertEqual(groups.first { $0.name == "api" }?.entries.count, 1)
+    }
+
+    /// Regression: the portless proxy daemon (port 1355) inherits the cwd of
+    /// whichever project first auto-started it. It must not be adopted into
+    /// that project's group, and must not trip the multi-port warning as a
+    /// false dupe alongside the project's real dev server.
+    func testInfrastructurePortIsNotAdoptedIntoProjectGroup() {
+        for infraPort in PortCategory.infrastructurePorts {
+            let store = PortStore()
+            var daemon = makeEntry(pid: 1, port: infraPort, name: "node")
+            daemon.projectPath = "/tmp/client-a/portal"  // cwd adoption the bug produced
+            var devServer = makeEntry(pid: 2, port: 4596, name: "node")
+            devServer.projectPath = "/tmp/client-a/portal"
+
+            store.entries = [daemon, devServer]
+            store.groupMode = .project
+
+            let groups = store.grouped
+            XCTAssertEqual(
+                groups.first { $0.name == "portal" }?.entries.map(\.port), [4596],
+                "port \(infraPort)"
+            )
+            XCTAssertEqual(
+                groups.first { $0.name == "Other" }?.entries.map(\.port), [infraPort],
+                "port \(infraPort)"
+            )
+            XCTAssertTrue(store.multiPortProjects.isEmpty, "port \(infraPort)")
+            XCTAssertFalse(store.hasMultiPortProjects, "port \(infraPort)")
+        }
+    }
+
+    /// Docker Desktop binds its infrastructure ports from /Applications/Docker.app,
+    /// so infrastructure placement must win over app detection — otherwise
+    /// 2375/2376 vanish into the collapsed macOS Apps group.
+    func testInfrastructurePortWinsOverMacAppDetection() {
+        let dockerDaemon = makeEntry(
+            pid: 1, port: 2375, name: "com.docker.backend",
+            executablePath: "/Applications/Docker.app/Contents/MacOS/com.docker.backend"
+        )
+        XCTAssertEqual(PortCategory.categorize(dockerDaemon), .system)
+
+        let store = PortStore()
+        store.entries = [dockerDaemon]
+        store.groupMode = .project
+
+        let groups = store.grouped
+        XCTAssertEqual(groups.first { $0.name == "Other" }?.entries.map(\.port), [2375])
+        XCTAssertNil(groups.first { $0.name == "macOS Apps" })
+    }
+
+    /// refresh() must not spend a resolver call on infrastructure ports — and
+    /// must leave their projectPath nil even though the daemon process has a
+    /// perfectly resolvable cwd. Uses the test process's own pid: its cwd is
+    /// the package root, which resolves via Package.swift, so a regression
+    /// flips the nil assertion.
+    func testRefreshSkipsProjectResolutionForInfrastructurePorts() async {
+        let scanner = MockScanner(entries: [
+            makeEntry(pid: getpid(), port: 1355, name: "node"),
+            makeEntry(pid: getpid(), port: 4596, name: "node"),
+        ])
+        let store = PortStore(scanner: scanner)
+
+        await store.refresh()
+
+        let daemon = store.entries.first { $0.port == 1355 }
+        let devServer = store.entries.first { $0.port == 4596 }
+        XCTAssertNil(daemon?.projectPath)
+        XCTAssertNotNil(
+            devServer?.projectPath,
+            "control entry must resolve — otherwise this test proves nothing"
+        )
+    }
 }
