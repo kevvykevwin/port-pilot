@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 
 public enum KillResult: Sendable, Equatable {
-    case terminated            // Target exited, or the checked signal was sent successfully
+    case signalSent            // Signal accepted; exit has not been verified
+    case terminated            // Target incarnation exited during the grace period
     case forceKillNeeded       // SIGTERM sent, target still alive after grace period
     case permissionDenied      // EPERM — not owner
     case processGone           // ESRCH — already exited
@@ -91,7 +92,7 @@ public enum ProcessKiller {
             identityLookup: identityLookup,
             signalSender: signalSender
         )
-        guard initialResult == .terminated else { return initialResult }
+        guard initialResult == .signalSent else { return initialResult }
 
         let deadline = Date().addingTimeInterval(max(0, graceSeconds))
         while Date() < deadline {
@@ -196,7 +197,7 @@ public enum ProcessKiller {
 
         switch signalSender(pid, signal) {
         case .success:
-            return .terminated
+            return .signalSent
         case .failure(EPERM):
             return .permissionDenied
         case .failure(ESRCH):

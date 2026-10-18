@@ -1,63 +1,39 @@
 import Foundation
 
-/// Primary scanner using lsof (setuid root) for comprehensive port visibility.
-/// Parses machine-readable output from `lsof -iTCP -sTCP:LISTEN -P -n -F pcn`.
+/// Primary scanner using lsof for the TCP listeners visible to the current user.
+/// Parses machine-readable output from `lsof -iTCP -sTCP:LISTEN -P -n -F pcftn`.
 public final class LsofScanner: PortScanning, Sendable {
     private let executablePath: String
+    private let arguments: [String]
+    private let timeout: TimeInterval
+    private let outputLimit: Int
 
-    public init() {
-        executablePath = "/usr/sbin/lsof"
-    }
+    public convenience init() { self.init(executablePath: "/usr/sbin/lsof") }
 
-    init(executablePath: String) {
+    init(executablePath: String, arguments: [String] = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcftn"],
+         timeout: TimeInterval = 5, outputLimit: Int = 4 * 1024 * 1024) {
         self.executablePath = executablePath
+        self.arguments = arguments
+        self.timeout = timeout
+        self.outputLimit = outputLimit
     }
 
     public func scan() async -> PortScanResult {
-        let output: String
         do {
-            output = try await runLsof()
+            let output = try await ListenerProcess(
+                executablePath: executablePath, arguments: arguments,
+                timeout: timeout, outputLimit: outputLimit
+            ).run()
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+            return .success(entries: parseLsofOutput(output), source: .lsof)
         } catch let error as PortScanError {
             return .failure(error)
         } catch {
             return .failure(.unavailable)
         }
-        return .success(entries: parseLsofOutput(output), source: .lsof)
     }
 
-    private func runLsof() async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executablePath)
-            process.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"]
-
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-
-            // NOTE: readDataToEndOfFile inside terminationHandler is safe because
-            // -sTCP:LISTEN output is well under the pipe buffer size (~64KB).
-            process.terminationHandler = { process in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: output)
-                } else {
-                    continuation.resume(
-                        throwing: PortScanError.nonzeroExit(process.terminationStatus)
-                    )
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: PortScanError.launchFailed)
-            }
-        }
-    }
-
-    /// Parse lsof -F pcn output format:
+    /// Parse lsof -F pcftn output format:
     /// p<pid>         — process ID
     /// c<command>     — command name
     /// n<name>        — network name (e.g., *:3000, 127.0.0.1:8080)
@@ -65,6 +41,8 @@ public final class LsofScanner: PortScanning, Sendable {
         var entries: [PortEntry] = []
         var currentPid: pid_t = 0
         var currentCommand = ""
+        var currentFamily: PortEntry.AddressFamily?
+        var metadata: [pid_t: (Date, String, String?)] = [:]
 
         for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
             let str = String(line)
@@ -74,11 +52,25 @@ public final class LsofScanner: PortScanning, Sendable {
             switch prefix {
             case "p":
                 currentPid = pid_t(value) ?? 0
+                currentFamily = nil
+                currentCommand = ""
             case "c":
                 currentCommand = value
+            case "f":
+                currentFamily = nil
+            case "t":
+                currentFamily = value == "IPv6" ? .ipv6 : value == "IPv4" ? .ipv4 : nil
             case "n":
                 guard currentPid > 0 else { continue }
-                if let entry = parseNetworkName(value, pid: currentPid, command: currentCommand) {
+                if metadata[currentPid] == nil {
+                    metadata[currentPid] = (
+                        LibProc.processStartTime(pid: currentPid) ?? .distantPast,
+                        LibProc.processPath(pid: currentPid) ?? "",
+                        LibProc.processScriptPath(pid: currentPid)
+                    )
+                }
+                if let entry = parseNetworkName(value, pid: currentPid, command: currentCommand,
+                                               family: currentFamily, metadata: metadata[currentPid]!) {
                     entries.append(entry)
                 }
             default:
@@ -89,7 +81,9 @@ public final class LsofScanner: PortScanning, Sendable {
         return entries
     }
 
-    private func parseNetworkName(_ name: String, pid: pid_t, command: String) -> PortEntry? {
+    private func parseNetworkName(_ name: String, pid: pid_t, command: String,
+                                  family explicitFamily: PortEntry.AddressFamily?,
+                                  metadata: (Date, String, String?)) -> PortEntry? {
         // Format: "address:port" or "*:port" or "[::1]:port"
         let parts: (address: String, portStr: String)
 
@@ -111,21 +105,20 @@ public final class LsofScanner: PortScanning, Sendable {
 
         guard let port = UInt16(parts.portStr), port > 0 else { return nil }
 
-        let family: PortEntry.AddressFamily = parts.address.contains(":") ? .ipv6 : .ipv4
-        let displayAddress = parts.address == "*" ? "0.0.0.0" : parts.address
-
-        let startTime = LibProc.processStartTime(pid: pid) ?? .distantPast
+        let family: PortEntry.AddressFamily = explicitFamily ?? (parts.address.contains(":") ? .ipv6 : .ipv4)
+        let displayAddress = parts.address == "*" ? (family == .ipv6 ? "::" : "0.0.0.0") : parts.address
 
         return PortEntry(
             pid: pid,
             port: port,
             processName: command,
-            executablePath: LibProc.processPath(pid: pid) ?? "",
+            executablePath: metadata.1,
             protocol: .tcp,
             state: .listen,
             family: family,
             localAddress: displayAddress,
-            processStartTime: startTime
+            processStartTime: metadata.0,
+            scriptPath: metadata.2
         )
     }
 }

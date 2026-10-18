@@ -10,6 +10,9 @@ public enum PortScanError: Error, Sendable, Equatable {
     case nonzeroExit(Int32)
     case unavailable
     case allScannersFailed
+    case timedOut
+    case cancelled
+    case outputLimitExceeded
 }
 
 public enum PortScanResult: Sendable, Equatable {
@@ -35,10 +38,13 @@ public struct ResilientPortScanner: PortScanning, Sendable {
         switch await primary.scan() {
         case .success(let entries, let source):
             return .success(entries: entries, source: source)
+        case .failure(.cancelled):
+            return .failure(.cancelled)
         case .failure:
             break
         }
 
+        guard !Task.isCancelled else { return .failure(.cancelled) }
         switch await fallback.scan() {
         case .success(let entries, let source):
             let listeners = entries.filter {

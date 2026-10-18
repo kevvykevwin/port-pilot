@@ -22,102 +22,6 @@ public struct PortGroup: Identifiable, Sendable {
     }
 }
 
-// MARK: - PortCategory
-
-public enum PortCategory: String, Sendable {
-    case devServers  // actual dev tools (node, python, etc.)
-    case databases   // well-known DB ports
-    case apps        // macOS apps using any port
-    case system      // system services
-    case highPorts   // 10000+
-
-    public static let knownDatabases: Set<UInt16> = [
-        3306, 5432, 6379, 27017, 9200, 26257, 8529, 7687,
-    ]
-
-    public static let infrastructurePorts: Set<UInt16> = [1355, 2375, 2376]
-
-    /// Known dev runtime process names
-    public static let devRuntimes: Set<String> = [
-        "node", "python3", "python", "Python", "ruby", "java", "go",
-        "bun", "deno", "cargo", "mix", "beam.smp",
-        "next-server", "vite", "webpack", "esbuild", "tsx",
-        "uvicorn", "gunicorn", "flask", "rails", "puma",
-        "php", "nginx", "caddy",
-    ]
-
-    /// Shared infrastructure daemons (portless proxy, Docker). Single source of
-    /// truth — grouping, multi-port detection, refresh, and the row warning all
-    /// route through this.
-    public static func isInfrastructure(_ entry: PortEntry) -> Bool {
-        infrastructurePorts.contains(entry.port)
-    }
-
-    /// Categorize using both port AND process context
-    public static func categorize(_ entry: PortEntry) -> PortCategory {
-        if knownDatabases.contains(entry.port) { return .databases }
-        // Infrastructure wins over app detection: Docker Desktop's daemon binds
-        // 2375/2376 from /Applications/Docker.app, but it's system plumbing.
-        if isInfrastructure(entry) { return .system }
-        if isMacApp(entry) { return .apps }
-        if entry.port <= 1023 { return .system }
-        if isDevProcess(entry) { return .devServers }
-        if entry.projectPath != nil { return .devServers }
-        if entry.port >= 10000 { return .highPorts }
-        return .devServers
-    }
-
-    /// Port-only categorize (backward compat for tests)
-    public static func categorize(_ port: UInt16) -> PortCategory {
-        if knownDatabases.contains(port) { return .databases }
-        if infrastructurePorts.contains(port) { return .system }
-        if port <= 1023 { return .system }
-        if port >= 10000 { return .highPorts }
-        return .devServers
-    }
-
-    private static func isDevProcess(_ entry: PortEntry) -> Bool {
-        if devRuntimes.contains(entry.processName) { return true }
-        let path = entry.executablePath
-        // Common dev tool paths
-        if path.contains("/node_modules/") { return true }
-        if path.contains("/.cargo/") { return true }
-        if path.contains("/go/bin/") { return true }
-        if path.contains("/.local/bin/") { return true }
-        return false
-    }
-
-    static func isMacApp(_ entry: PortEntry) -> Bool {
-        let path = entry.executablePath
-        if path.hasPrefix("/Applications/") || path.hasPrefix("/System/") { return true }
-        if path.contains("/usr/libexec/") || path.contains("/usr/sbin/") { return true }
-        // Framework builds embed their real binary in a helper bundle
-        // (Python.framework/…/Resources/Python.app/Contents/MacOS/Python), so a
-        // Flask/Django/uvicorn dev server would match ".app/" and vanish into
-        // the collapsed macOS Apps group. Exempt only known runtimes: Electron/
-        // Sparkle helpers also nest .app inside .framework (Chrome Framework
-        // .framework/…/Helpers/… Helper.app) and must stay classified as apps.
-        if path.contains(".app/") && !(path.contains(".framework/") && isDevProcess(entry)) {
-            return true
-        }
-        let knownApps: Set<String> = [
-            "Spotify", "LINE", "ControlCenter", "rapportd", "figma_agent",
-            "Slack", "Discord", "zoom.us", "Notion", "Safari",
-        ]
-        return knownApps.contains(entry.processName)
-    }
-
-    public var displayName: String {
-        switch self {
-        case .devServers: return "Dev Servers"
-        case .databases: return "Databases"
-        case .apps: return "macOS Apps"
-        case .system: return "System"
-        case .highPorts: return "High Ports"
-        }
-    }
-}
-
 // MARK: - PortStore
 
 @MainActor
@@ -129,6 +33,11 @@ public final class PortStore {
     public var isScanning = false
     public private(set) var scanError: PortScanError?
     public private(set) var lastScanSource: PortScanSource?
+    public private(set) var lastSuccessfulScan: Date?
+    public private(set) var lastScanDuration: TimeInterval?
+    private var preferences: ProcessPreferences
+    private let defaults: UserDefaults?
+    private var refreshTask: Task<Void, Never>?
 
     private let scanner: any PortScanning
     private let resolver: ProjectResolver
@@ -139,18 +48,21 @@ public final class PortStore {
 
     public init(
         scanner: any PortScanning = ResilientPortScanner(),
-        resolver: ProjectResolver = ProjectResolver()
+        resolver: ProjectResolver = ProjectResolver(),
+        defaults: UserDefaults? = nil
     ) {
         self.scanner = scanner
         self.resolver = resolver
+        self.defaults = defaults
+        self.preferences = ProcessPreferences.load(from: defaults)
     }
 
     // MARK: - Computed properties
 
     public var filteredEntries: [PortEntry] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return entries }
-        return entries.filter { entry in
+        guard !query.isEmpty else { return displayEntries }
+        return displayEntries.filter { entry in
             String(entry.port).contains(query)
                 || entry.processName.lowercased().contains(query)
                 || (entry.projectPath?.lowercased().contains(query) ?? false)
@@ -168,26 +80,85 @@ public final class PortStore {
     }
 
     public var listeningCount: Int {
-        entries.filter { $0.state == .listen }.count
+        displayEntries.filter { $0.state == .listen }.count
     }
 
-    /// Projects with 2+ listening ports — potential dupes worth flagging
+    /// Full bindings remain in entries. Only presentation combines address families.
+    public var displayEntries: [PortEntry] {
+        var rows: [String: PortEntry] = [:]
+        for entry in entries {
+            if let existing = rows[entry.rowID], existing.family == .ipv4 { continue }
+            rows[entry.rowID] = entry
+        }
+        return rows.values.sorted { ($0.port, $0.pid, $0.id) < ($1.port, $1.pid, $1.id) }
+    }
+
+    public func classification(for entry: PortEntry) -> ProcessClassification {
+        let override = ProcessClassifier.overrideKey(for: entry).flatMap { preferences.categories[$0] }
+        return ProcessClassifier.classify(entry, override: override)
+    }
+
+    public func setCategory(_ category: PortCategory?, for entry: PortEntry) {
+        guard let key = ProcessClassifier.overrideKey(for: entry) else { return }
+        preferences.categories[key] = category
+        preferences.save(to: defaults)
+    }
+
+    public func bindingSummary(for entry: PortEntry) -> String {
+        let bindings = entries.filter { $0.rowID == entry.rowID }
+        return Set(bindings.map { "\($0.family.rawValue) \($0.localAddress) · \($0.exposure)" }).sorted().joined(separator: "\n")
+    }
+
+    public func projectOwner(for entry: PortEntry) -> String? {
+        classification(for: entry).resolvesProject ? entry.projectPath : nil
+    }
+
+    private func projectServices(_ root: String) -> [PortEntry] {
+        displayEntries.filter { $0.state == .listen && projectOwner(for: $0) == root }
+    }
+
+    public func rememberExpectedServices(for root: String) {
+        let services = projectServices(root)
+        guard !services.isEmpty else { return }
+        preferences.expectedServices[root] = Set(services.map(ProcessClassifier.serviceKey))
+        preferences.save(to: defaults)
+    }
+
+    public func clearExpectedServices(for root: String) {
+        preferences.expectedServices.removeValue(forKey: root)
+        preferences.save(to: defaults)
+    }
+
+    public func hasExpectedServices(for root: String) -> Bool {
+        preferences.expectedServices[root] != nil
+    }
+
+    /// Unconfigured multi-service projects warrant review, not a duplicate claim.
+    /// A remembered baseline tolerates normal restarts and absent services, but
+    /// still flags new identities/endpoints and concurrent duplicate services.
     public var multiPortProjects: Set<String> {
-        let listeningProjectPaths = entries
-            .filter { $0.state == .listen }
-            .filter { !PortCategory.isInfrastructure($0) }
-            .compactMap(\.projectPath)
-        let counts = Dictionary(grouping: listeningProjectPaths, by: { $0 })
-            .filter { $0.value.count >= 2 }
-        return Set(counts.keys)
+        var byProject: [String: [PortEntry]] = [:]
+        for entry in displayEntries where entry.state == .listen {
+            if let root = projectOwner(for: entry) { byProject[root, default: []].append(entry) }
+        }
+        return Set(byProject.keys.filter { root in
+            let services = byProject[root, default: []]
+            guard let expected = preferences.expectedServices[root] else { return services.count >= 2 }
+            let keys = services.map(ProcessClassifier.serviceKey)
+            return keys.contains { !expected.contains($0) } || Set(keys).count < keys.count
+        })
     }
 
-    /// True when any dev project has multiple ports (triggers lighthouse glow)
+    public var conflictingRowIDs: Set<String> {
+        Set(conflicts.flatMap(\.entries).map(\.rowID))
+    }
+
+    /// True when project services need review (triggers the amber lighthouse).
     public var hasMultiPortProjects: Bool {
         !multiPortProjects.isEmpty
     }
 
-    /// Ports claimed by 2+ different PIDs — hard conflicts
+    /// Observed overlapping bindings, not evidence of a failed bind attempt.
     public var conflicts: [PortConflict] {
         ConflictDetector.detect(in: entries)
     }
@@ -239,15 +210,19 @@ public final class PortStore {
         stopPolling()
         scanTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                await self.refresh()
+                guard let interval = await self?.pollOnce() else { return }
                 do {
-                    try await Task.sleep(nanoseconds: self.nextInterval())
+                    try await Task.sleep(nanoseconds: interval)
                 } catch {
                     break
                 }
             }
         }
+    }
+
+    private func pollOnce() async -> UInt64 {
+        await refresh()
+        return nextInterval()
     }
 
     public func stopPolling() {
@@ -257,117 +232,85 @@ public final class PortStore {
 
     // MARK: - Refresh
 
+    /// Concurrent callers share one scan, enrichment pass and publication.
+    /// Cancelling a polling waiter does not cancel another caller's refresh.
     public func refresh() async {
+        guard !Task.isCancelled else { return }
+        if let refreshTask {
+            await refreshTask.value
+            return
+        }
         refreshGeneration &+= 1
         let generation = refreshGeneration
         isScanning = true
-        let scanResult = await scanner.scan()
-
-        // Scans may overlap when polling and manual refreshes interleave. Only the
-        // newest request may publish; an obsolete request must not clear the
-        // scanning indicator while newer work is still in flight.
-        guard generation == refreshGeneration else { return }
-
-        // A menu-open restart cancels the prior polling task. If the cancelled task
-        // is still the newest request, clear its indicator without publishing.
-        guard !Task.isCancelled else {
-            isScanning = false
-            return
+        let task = Task<Void, Never> { [weak self] in
+            await self?.performRefresh(generation: generation)
         }
+        refreshTask = task
+        await task.value
+        if generation == refreshGeneration { refreshTask = nil }
+    }
 
-        guard case .success(var scanned, let source) = scanResult else {
-            if case .failure(let error) = scanResult {
-                scanError = error
-            }
-            isScanning = false
-            return
-        }
-
-        scanError = nil
-        lastScanSource = source
-
-        // IPv6 dedup: merge entries with same (port, pid) but different address families
-        scanned = dedupIPv6(scanned)
-
-        // Resolve project paths — but never for editor/app helper processes.
-        // A VS Code "Code Helper (Plugin)" language server runs with its cwd set
-        // to the extension install dir (e.g. ~/.vscode/extensions/ms-python.
-        // vscode-pylance-2026.2.1), which contains a package.json and would
-        // otherwise resolve to a phantom "project" named after the extension.
-        // These belong in the macOS Apps group, not a dev-project group.
-        //
-        // Infrastructure ports (portless proxy, Docker daemon) are skipped for
-        // the same reason: a shared daemon inherits the cwd of whichever project
-        // first auto-started it, which would adopt it into that project's group
-        // and trip the multi-port warning as a false dupe.
-        for i in scanned.indices {
-            let entry = scanned[i]
-            guard !PortCategory.isMacApp(entry) else { continue }
-            guard !PortCategory.isInfrastructure(entry) else { continue }
-            if let project = resolver.resolve(pid: entry.pid, startTime: entry.processStartTime) {
-                scanned[i].projectPath = project
-            }
-        }
-
-        entries = scanned
-
-        let currentSnapshot = PortSnapshot(entries: scanned)
-        if let previous = previousSnapshot {
-            lastDiff = currentSnapshot.diff(from: previous)
-        } else {
-            lastDiff = nil
-        }
-        previousSnapshot = currentSnapshot
-
-        onRefreshComplete?(lastDiff, conflicts)
-
+    public func cancelRefresh() {
+        refreshGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
         isScanning = false
     }
 
-    // MARK: - Private helpers
-
-    private func dedupIPv6(_ entries: [PortEntry]) -> [PortEntry] {
-        struct DedupKey: Hashable {
-            let port: UInt16
-            let pid: pid_t
-            let `protocol`: PortEntry.PortProtocol
-        }
-
-        var seen: [DedupKey: Int] = [:]  // key -> index in result
-        var result: [PortEntry] = []
-
-        for entry in entries {
-            let key = DedupKey(port: entry.port, pid: entry.pid, protocol: entry.protocol)
-            if let existingIdx = seen[key] {
-                // Prefer IPv4 entry
-                if entry.family == .ipv4 {
-                    result[existingIdx] = entry
+    private func performRefresh(generation: UInt64) async {
+        let scanner = scanner
+        let resolver = resolver
+        let started = Date()
+        let worker = Task.detached(priority: .utility) {
+            let result = await scanner.scan()
+            guard case .success(var scanned, let source) = result else { return result }
+            var projects: [String: String] = [:]
+            var resolved: Set<String> = []
+            for i in scanned.indices {
+                guard !Task.isCancelled else { return PortScanResult.failure(.cancelled) }
+                let entry = scanned[i]
+                guard ProcessClassifier.classify(entry).resolvesProject else { continue }
+                if resolved.insert(entry.processIdentity).inserted {
+                    projects[entry.processIdentity] = resolver.resolve(pid: entry.pid, startTime: entry.processStartTime)
                 }
-                // Otherwise keep the existing one
-            } else {
-                seen[key] = result.count
-                result.append(entry)
+                if let root = projects[entry.processIdentity] { scanned[i].projectPath = root }
             }
+            // Remove identical duplicate file-descriptor records, never bindings.
+            var seen: Set<String> = []
+            scanned = scanned.filter { seen.insert($0.id).inserted }
+            return PortScanResult.success(entries: scanned, source: source)
         }
-
-        return result
+        let result = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+        guard generation == refreshGeneration else { return }
+        defer { isScanning = false }
+        guard !Task.isCancelled else { return }
+        guard case .success(let scanned, let source) = result else {
+            if case .failure(let error) = result, error != .cancelled { scanError = error }
+            return
+        }
+        scanError = nil
+        lastScanSource = source
+        lastSuccessfulScan = Date()
+        lastScanDuration = Date().timeIntervalSince(started)
+        entries = scanned
+        let snapshot = PortSnapshot(entries: scanned)
+        lastDiff = previousSnapshot.map { snapshot.diff(from: $0) }
+        previousSnapshot = snapshot
+        onRefreshComplete?(lastDiff, conflicts)
     }
+
+    // MARK: - Grouping
 
     private func groupByProject(_ entries: [PortEntry]) -> [PortGroup] {
         var projectGroups: [String: [PortEntry]] = [:]
         var macApps: [PortEntry] = []
 
         for entry in entries {
-            // isMacApp wins over projectPath (consistent with categorize): an
-            // editor/app helper never belongs to a dev project, even if its cwd
-            // happened to resolve to one.
-            if PortCategory.isInfrastructure(entry) {
-                // A shared daemon (portless proxy, Docker) inherits the cwd of
-                // whichever project first started it — never a real member of
-                // that project's group. Wins over isMacApp so Docker Desktop's
-                // 2375/2376 land here too, not in the collapsed apps group.
+            let classification = classification(for: entry)
+            if classification.category == .infrastructure || classification.ownership == .system {
                 projectGroups["Other", default: []].append(entry)
-            } else if PortCategory.isMacApp(entry) {
+            } else if classification.ownership == .app {
                 macApps.append(entry)
             } else if let project = entry.projectPath {
                 projectGroups[project, default: []].append(entry)
@@ -404,17 +347,17 @@ public final class PortStore {
     private func groupByPortRange(_ entries: [PortEntry]) -> [PortGroup] {
         var groups: [PortCategory: [PortEntry]] = [:]
         for entry in entries {
-            let cat = PortCategory.categorize(entry)
+            let cat = classification(for: entry).category
             groups[cat, default: []].append(entry)
         }
-        let order: [PortCategory] = [.devServers, .databases, .system, .apps, .highPorts]
+        let order = PortCategory.allCases
         return order.compactMap { cat in
             guard let entries = groups[cat], !entries.isEmpty else { return nil }
             return PortGroup(
                 id: "range-\(cat.rawValue)",
                 name: cat.displayName,
                 entries: entries.sorted { $0.port < $1.port },
-                collapsedByDefault: cat == .highPorts || cat == .apps
+                collapsedByDefault: cat == .apps || cat == .editorServices || cat == .system
             )
         }
     }

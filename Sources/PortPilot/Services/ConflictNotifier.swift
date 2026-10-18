@@ -38,7 +38,7 @@ final class ConflictNotifier {
 
     private func send(_ conflict: PortConflict) {
         let content = UNMutableNotificationContent()
-        content.title = "Port Conflict"
+        content.title = "Overlapping Listeners"
         content.body = "Port \(conflict.port): \(conflict.conflictLabel)"
         content.sound = .default
 

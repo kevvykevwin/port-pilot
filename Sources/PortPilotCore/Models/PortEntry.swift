@@ -11,8 +11,20 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
     public let localAddress: String
     public let processStartTime: Date
     public var projectPath: String?
+    public var scriptPath: String?
 
-    public var id: String { "\(pid)-\(port)-\(`protocol`)" }
+    /// One process incarnation can own several distinct socket bindings.
+    public var processIdentity: String { "\(pid)-\(processStartTime.timeIntervalSince1970)" }
+    public var rowID: String { "\(processIdentity)-\(port)-\(`protocol`)" }
+    public var id: String { "\(rowID)-\(family)-\(localAddress)" }
+
+    public var exposure: String {
+        if localAddress == "0.0.0.0" || localAddress == "::" || localAddress == "*" {
+            return "All interfaces"
+        }
+        if localAddress.hasPrefix("127.") || localAddress == "::1" { return "Loopback" }
+        return "Interface \(localAddress)"
+    }
 
     /// Display labels for identifier values. Ports and PIDs are identifiers,
     /// not quantities — they must never render with locale grouping
@@ -31,7 +43,7 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
     public init(
         pid: pid_t, port: UInt16, processName: String, executablePath: String,
         protocol: PortProtocol, state: PortState, family: AddressFamily,
-        localAddress: String, processStartTime: Date, projectPath: String? = nil
+        localAddress: String, processStartTime: Date, projectPath: String? = nil, scriptPath: String? = nil
     ) {
         self.pid = pid
         self.port = port
@@ -43,6 +55,7 @@ public struct PortEntry: Identifiable, Hashable, Sendable {
         self.localAddress = localAddress
         self.processStartTime = processStartTime
         self.projectPath = projectPath
+        self.scriptPath = scriptPath
     }
 
     public var vsCodeExtensionDescription: String? {

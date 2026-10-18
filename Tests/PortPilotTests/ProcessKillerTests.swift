@@ -16,7 +16,7 @@ final class ProcessKillerTests: XCTestCase {
             signalSender: recorder.sender(returning: .success)
         )
 
-        XCTAssertEqual(result, .terminated)
+        XCTAssertEqual(result, .signalSent)
         XCTAssertEqual(recorder.signals, [SIGTERM])
     }
 
@@ -95,7 +95,7 @@ final class ProcessKillerTests: XCTestCase {
             signalSender: recorder.sender(returning: .success)
         )
 
-        XCTAssertEqual(result, .terminated)
+        XCTAssertEqual(result, .signalSent)
         XCTAssertEqual(recorder.signals, [SIGKILL])
     }
 
@@ -187,6 +187,8 @@ final class ProcessKillerTests: XCTestCase {
         case .forceKillNeeded:
             _ = ProcessKiller.forceKill(pid: childPid, expectedStartTime: expectedStartTime)
             XCTFail("Process did not exit after SIGTERM grace period")
+        case .signalSent:
+            XCTFail("Graceful termination must verify exit")
         case .permissionDenied:
             XCTFail("SIGTERM permission denied")
         case .staleProcess:
