@@ -170,6 +170,19 @@ final class ConflictDetectorTests: XCTestCase {
         XCTAssertEqual(conflict.conflictLabel, "postgres (pid 100) vs postgres (pid 200)")
     }
 
+    func testConflictLabelNamesEachDualStackProcessOnce() {
+        let entries = [100, 200].flatMap { pid in
+            [PortEntry.AddressFamily.ipv4, .ipv6].map { family in
+                makeConflictEntry(pid: pid_t(pid), port: 3000, name: "node", family: family)
+            }
+        }
+        let conflicts = ConflictDetector.detect(in: entries)
+
+        XCTAssertEqual(conflicts.count, 1)
+        XCTAssertEqual(conflicts.first?.entries.count, 4, "Detection must retain all bindings")
+        XCTAssertEqual(conflicts.first?.conflictLabel, "node (pid 100) vs node (pid 200)")
+    }
+
     func testConflictLabelDisambiguatesRepeatedLabelsInMixedConflict() {
         let node1 = makeConflictEntry(pid: 100, port: 3000, name: "node")
         let node2 = makeConflictEntry(pid: 200, port: 3000, name: "node")
@@ -416,7 +429,7 @@ private func makeConflictEntry(
         executablePath: "/usr/bin/\(name)", protocol: `protocol`,
         state: state, family: family,
         localAddress: address ?? (family == .ipv4 ? "127.0.0.1" : "::1"),
-        processStartTime: .now
+        processStartTime: Date(timeIntervalSince1970: 1000)
     )
 }
 

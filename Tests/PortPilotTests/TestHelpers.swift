@@ -6,14 +6,17 @@ func makeEntry(
     pid: pid_t, port: UInt16, name: String,
     family: PortEntry.AddressFamily = .ipv4,
     state: PortEntry.PortState = .listen,
-    executablePath: String? = nil
+    executablePath: String? = nil,
+    startTime: Date = Date(timeIntervalSince1970: 1000),
+    address: String? = nil,
+    scriptPath: String? = nil
 ) -> PortEntry {
     PortEntry(
         pid: pid, port: port, processName: name,
         executablePath: executablePath ?? "/usr/bin/\(name)", protocol: .tcp,
         state: state, family: family,
-        localAddress: family == .ipv4 ? "127.0.0.1" : "::1",
-        processStartTime: .now
+        localAddress: address ?? (family == .ipv4 ? "127.0.0.1" : "::1"),
+        processStartTime: startTime, scriptPath: scriptPath
     )
 }
 
@@ -26,6 +29,7 @@ struct MockScanner: PortScanning {
 
 actor ControlledScanner: PortScanning {
     private var nextRequestID = 0
+    var requestCount: Int { nextRequestID }
     private var continuations: [Int: CheckedContinuation<PortScanResult, Never>] = [:]
     private var requestCountWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 

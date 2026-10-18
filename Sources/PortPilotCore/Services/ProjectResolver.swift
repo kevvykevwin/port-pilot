@@ -56,7 +56,7 @@ public final class ProjectResolver: Sendable {
 
         // Store in cache
         withLock {
-            _cache.entries[key] = result
+            _cache.entries.updateValue(result, forKey: key)
             _cache.order.append(key)
 
             if _cache.order.count > Self.maxCacheSize {
@@ -80,25 +80,10 @@ public final class ProjectResolver: Sendable {
     // MARK: - Private
 
     private func resolveProjectRoot(pid: pid_t) -> String? {
-        guard let cwd = processCwd(pid: pid), !cwd.isEmpty else {
+        guard let cwd = LibProc.processCwd(pid: pid), !cwd.isEmpty else {
             return nil
         }
         return findProjectRoot(from: cwd)
-    }
-
-    /// Gets the current working directory of a process via proc_pidinfo.
-    private func processCwd(pid: pid_t) -> String? {
-        var vnodeInfo = proc_vnodepathinfo()
-        let size = MemoryLayout<proc_vnodepathinfo>.size
-        let result = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vnodeInfo, Int32(size))
-        guard result == size else { return nil }
-
-        let path = withUnsafePointer(to: vnodeInfo.pvi_cdir.vip_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { cStr in
-                String(cString: cStr)
-            }
-        }
-        return path.isEmpty ? nil : path
     }
 
     /// Walks up from `startPath` looking for project marker files/dirs.
@@ -129,7 +114,3 @@ public final class ProjectResolver: Sendable {
         return nil
     }
 }
-
-// MARK: - Darwin constant
-
-private let PROC_PIDVNODEPATHINFO: Int32 = 9

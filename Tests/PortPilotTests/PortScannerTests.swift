@@ -151,7 +151,8 @@ final class PortScannerTests: XCTestCase {
     }
 
     func testLsofScanReportsNonzeroExitStatus() async {
-        let result = await LsofScanner(executablePath: "/usr/bin/false").scan()
+        let result = await LsofScanner(executablePath: "/bin/sh",
+                                       arguments: ["-c", "echo denied >&2; exit 1"]).scan()
 
         XCTAssertEqual(result, .failure(.nonzeroExit(1)))
     }

@@ -15,10 +15,13 @@ public struct PortConflict: Identifiable, Sendable {
     /// names where available and falls back to process names. Appends PID when
     /// labels still collide.
     public var conflictLabel: String {
+        // A process may own several conflicting bindings; name it only once.
+        var seen = Set<String>()
+        let participants = entries.filter { seen.insert($0.processIdentity).inserted }
         let projectLabels = ProjectDisplayName.labels(
-            for: entries.compactMap(\.projectPath)
+            for: participants.compactMap(\.projectPath)
         )
-        let labels = entries.map { entry -> String in
+        let labels = participants.map { entry -> String in
             entry.projectPath.flatMap { projectLabels[$0] } ?? entry.processName
         }
         let counts = Dictionary(labels.map { ($0, 1) }, uniquingKeysWith: +)
@@ -27,7 +30,7 @@ public struct PortConflict: Identifiable, Sendable {
             return labels.sorted().joined(separator: " vs ")
         }
 
-        return entries.map { entry in
+        return participants.map { entry in
             let label = entry.projectPath.flatMap { projectLabels[$0] } ?? entry.processName
             return counts[label, default: 0] > 1 ? "\(label) (pid \(entry.pid))" : label
         }

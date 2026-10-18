@@ -4,7 +4,7 @@ import PortPilotCore
 
 @main
 struct PortPilotApp: App {
-    @State private var store = PortStore()
+    @State private var store = PortStore(defaults: .standard)
     private let notifier = ConflictNotifier()
 
     var body: some Scene {

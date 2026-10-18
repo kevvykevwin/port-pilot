@@ -57,17 +57,35 @@ struct MenuBarView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    PortListView(
-                        groups: store.grouped,
-                        multiPortProjects: store.multiPortProjects,
-                        conflictingPorts: store.conflictingPorts
-                    )
+                    PortListView(store: store)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
             }
 
             Divider()
+
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                VStack(alignment: .leading, spacing: 3) {
+                    if let date = store.lastSuccessfulScan {
+                        HStack(spacing: 4) {
+                            Text(store.scanError == nil ? "Updated" : "Last success")
+                            Text(date, style: .relative)
+                            Text("ago")
+                        }
+                    } else {
+                        Text(store.isScanning ? "Reading listeners…" : "No successful scan yet")
+                    }
+                    Text(store.lastScanSource == .libprocFallback
+                         ? "Fallback scan · accessible processes only"
+                         : "TCP listeners · visibility depends on permissions")
+                }
+                .font(.caption2)
+                .foregroundStyle(store.scanError == nil ? Color.secondary : Color.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+            }
 
             // MARK: - Status Bar
             HStack {
@@ -89,6 +107,7 @@ struct MenuBarView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Refresh now")
+                .disabled(store.isScanning)
 
                 Button {
                     NSApplication.shared.terminate(nil)
@@ -102,7 +121,7 @@ struct MenuBarView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .frame(width: 320, height: 500)
+        .frame(width: 360, height: 560)
         .preferredColorScheme(.dark)
         // The window's content view appears/disappears as the menu opens/closes.
         // Use that to run fast (2s) polling only while visible.

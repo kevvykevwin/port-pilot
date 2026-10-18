@@ -31,6 +31,7 @@ public final class PortScanner: PortScanning, Sendable {
         var entries: [PortEntry] = []
 
         for pid in pids {
+            guard !Task.isCancelled else { return .failure(.cancelled) }
             let fds = LibProc.listFileDescriptors(pid: pid)
             let socketFDs = fds.filter(LibProc.isSocket)
             guard !socketFDs.isEmpty else { continue }
@@ -39,6 +40,7 @@ public final class PortScanner: PortScanning, Sendable {
             var processName: String?
             var executablePath: String?
             var processStart: Date?
+            var scriptPath: String?
             var resolvedMeta = false
 
             for fd in socketFDs {
@@ -107,6 +109,7 @@ public final class PortScanner: PortScanning, Sendable {
                         processName = LibProc.processName(pid: pid)
                         executablePath = LibProc.processPath(pid: pid)
                         processStart = LibProc.processStartTime(pid: pid)
+                        scriptPath = LibProc.processScriptPath(pid: pid)
                         resolvedMeta = true
                     }
 
@@ -119,7 +122,7 @@ public final class PortScanner: PortScanning, Sendable {
                         state: portState,
                         family: addressFamily,
                         localAddress: address,
-                        processStartTime: processStart ?? .distantPast
+                        processStartTime: processStart ?? .distantPast, scriptPath: scriptPath
                     )
                 }
 

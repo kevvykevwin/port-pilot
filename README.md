@@ -11,14 +11,41 @@ Running 3-5 dev projects means port confusion — "what's on 3000?", "why is 800
 ## Features
 
 - **Project detection** — resolves process working directories to full project roots (`.git`, `package.json`, `pyproject.toml`) without merging equal directory names
-- **Smart categorization** — separates dev servers (node, python, bun) from macOS apps (Spotify, Figma) by process identity, not just port range
+- **Local process catalog** — identifies databases, proxies, tunnels, editor services, macOS apps, and dev runtimes from executable/script context; unfamiliar processes remain Unknown
 - **Safe two-click kill** — confirms process identity before SIGTERM, waits for exit, and offers a separately confirmed SIGKILL only when needed
 - **Resilient scanning** — uses `lsof` for broad visibility and falls back to `libproc` when the primary scanner fails, while retaining the last healthy result if both are unavailable
-- **Conflict detection** — red lighthouse + macOS notification when overlapping TCP listeners claim the same address and port (debounced per-port)
-- **Multi-port alerts** — amber highlights when a project has 2+ listening ports, lighthouse beacon glows
-- **Grouped views** — by Project or by Type (Dev Servers, Databases, System, macOS Apps)
+- **Overlapping listeners** — red lighthouse + debounced notification for overlapping TCP bindings; preserves every IPv4/IPv6 address for analysis
+- **Project service review** — amber highlights for unreviewed multi-service projects or unexpected services; save expected services per project
+- **Grouped views** — by Project or by Type, with explanations and saved category overrides
 - **Search** — filter by port number, process name, or project
-- **Adaptive polling** — refreshes every 2s while the menu is open, every 30s in the background, and every 60s in background Low Power Mode
+- **Bounded polling** — waits 2s while the menu is open, 30s in the background, or 60s in background Low Power Mode after each scan; overlapping refreshes share one scan, with a 5s lsof timeout and 4 MiB output cap
+
+### Categories, expected services, and freshness
+
+Right-click a process row to see why it was categorized and its address bindings.
+Choose **Category for This Process** to save a local override, or **Use Automatic
+Category** to remove it. Runtime overrides require a script or project context so
+labeling one Node service does not relabel every Node process. Rules describe a
+process; they never bypass termination identity checks.
+
+Right-click a project heading to **Remember Current Services as Expected**. This
+suppresses the amber review indicator for that project's normal service set,
+including process restarts. New executables/scripts/ports and duplicate instances
+still flag for review. **Clear Expected Services** removes the baseline. These
+choices persist locally in the app's preferences, keyed by full project root.
+
+The footer shows the last successful scan age and whether the fallback scanner
+was used. Both scanners are limited by process visibility. Scan failures retain
+the previous data and its timestamp. Overlapping listeners are observations, not
+proof that another server failed to bind. Port Pilot cannot see failed bind
+attempts or prove that a port is free for every possible address-family setup.
+A force-kill acknowledgment says **Sent**; only a verified graceful exit says
+**Stopped**. The next scan removes processes that have exited.
+
+No model or network service is used for categorization. Executable names and paths
+are descriptive evidence, not verified code signatures. Unsupported runtime launch
+forms (such as inline code or interpreter switches) can remain ambiguous; label
+those by project context or leave them Unknown.
 
 ## Install
 
@@ -104,9 +131,9 @@ swift test
 ```
 PortPilotCore (library)
 ├── ResilientPortScanner — lsof primary + libproc fallback
-├── ProjectResolver      — PID → cwd → full project-root identity (LRU cached)
+├── ProjectResolver      — PID → cwd → full project-root identity (bounded cache)
 ├── ConflictDetector     — address-aware TCP listener conflicts
-├── PortStore            — serialized publication, search, grouping, adaptive polling
+├── PortStore            — coalesced scans, binding-preserving snapshots, grouping, local preferences
 └── ProcessKiller        — PID-identity-safe graceful/forced termination
 
 PortPilot (app)

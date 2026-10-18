@@ -148,10 +148,10 @@ final class PortStoreTests: XCTestCase {
         store.groupMode = .type
 
         let groupNames = store.grouped.map(\.name)
-        XCTAssertTrue(groupNames.contains("System"), "got: \(groupNames)")
+        XCTAssertTrue(groupNames.contains("Proxies & Infrastructure"), "got: \(groupNames)")
         XCTAssertTrue(groupNames.contains("Databases"), "got: \(groupNames)")
         XCTAssertTrue(groupNames.contains("Dev Servers"), "got: \(groupNames)")
-        XCTAssertTrue(groupNames.contains("High Ports"), "got: \(groupNames)")
+        XCTAssertTrue(groupNames.contains("Unknown"), "got: \(groupNames)")
     }
 
     func testMultiPortProjectsCountsOnlyListeningEntries() {
@@ -169,7 +169,7 @@ final class PortStoreTests: XCTestCase {
         XCTAssertTrue(store.multiPortProjects.isEmpty)
     }
 
-    func testIPv6Dedup() async {
+    func testIPv6BindingsRemainAvailableButDisplayOnce() async {
         let mockScanner = MockScanner(entries: [
             makeEntry(pid: 10, port: 4000, name: "server", family: .ipv6),
             makeEntry(pid: 10, port: 4000, name: "server", family: .ipv4),
@@ -178,8 +178,9 @@ final class PortStoreTests: XCTestCase {
         let store = PortStore(scanner: mockScanner)
         await store.refresh()
 
-        XCTAssertEqual(store.entries.count, 2)
-        let port4000 = store.entries.first { $0.port == 4000 }
+        XCTAssertEqual(store.entries.count, 3)
+        XCTAssertEqual(store.displayEntries.count, 2)
+        let port4000 = store.displayEntries.first { $0.port == 4000 }
         XCTAssertEqual(port4000?.family, .ipv4, "IPv4 should be preferred in dedup")
     }
 
@@ -230,111 +231,54 @@ final class PortStoreTests: XCTestCase {
         XCTAssertEqual(store.lastScanSource, .lsof)
     }
 
-    func testStaleFailureCannotReplaceNewerSuccessfulState() async {
+    func testConcurrentRefreshesShareOneScanAndPublication() async {
         let scanner = ControlledScanner()
         let store = PortStore(scanner: scanner)
-
-        let firstRefresh = Task { await store.refresh() }
+        var callbacks = 0
+        store.onRefreshComplete = { _, _ in callbacks += 1 }
+        let first = Task { await store.refresh() }
         await scanner.waitForRequestCount(1)
-        let secondRefresh = Task { await store.refresh() }
+        let second = Task { await store.refresh() }
+        for _ in 0..<20 { await Task.yield() }
+        let count = await scanner.requestCount
+        XCTAssertEqual(count, 1)
+        await scanner.completeRequest(0, with: [makeEntry(pid: 1, port: 3000, name: "node")])
+        await first.value
+        await second.value
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertFalse(store.isScanning)
+        XCTAssertEqual(store.entries.map(\.port), [3000])
+    }
+
+    func testCancelledOlderRefreshCannotOverwriteNewerSuccess() async {
+        let scanner = ControlledScanner()
+        let store = PortStore(scanner: scanner)
+        let first = Task { await store.refresh() }
+        await scanner.waitForRequestCount(1)
+        store.cancelRefresh()
+        let second = Task { await store.refresh() }
         await scanner.waitForRequestCount(2)
-
-        await scanner.completeRequest(
-            1,
-            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
-        )
-        await secondRefresh.value
+        await scanner.completeRequest(1, with: [makeEntry(pid: 2, port: 4000, name: "node")])
+        await second.value
         await scanner.completeRequest(0, with: .failure(.allScannersFailed))
-        await firstRefresh.value
-
+        await first.value
         XCTAssertEqual(store.entries.map(\.port), [4000])
         XCTAssertNil(store.scanError)
-        XCTAssertEqual(store.lastScanSource, .lsof)
+        XCTAssertFalse(store.isScanning)
     }
 
-    func testStaleRefreshCompletingFirstCannotPublish() async {
+    func testCancellationDoesNotPublishOrClearHealthyState() async {
         let scanner = ControlledScanner()
         let store = PortStore(scanner: scanner)
-        var callbackPorts: [[UInt16]] = []
-        store.onRefreshComplete = { _, _ in
-            callbackPorts.append(store.entries.map(\.port))
-        }
-
-        let firstRefresh = Task { await store.refresh() }
+        store.entries = [makeEntry(pid: 1, port: 3000, name: "node")]
+        let refresh = Task { await store.refresh() }
         await scanner.waitForRequestCount(1)
-        let secondRefresh = Task { await store.refresh() }
-        await scanner.waitForRequestCount(2)
-
-        await scanner.completeRequest(
-            0,
-            with: [makeEntry(pid: 1, port: 3000, name: "stale")]
-        )
-        await firstRefresh.value
-
-        XCTAssertTrue(store.entries.isEmpty)
-        XCTAssertNil(store.lastDiff)
-        XCTAssertTrue(store.isScanning, "Newest refresh is still in flight")
-        XCTAssertTrue(callbackPorts.isEmpty)
-
-        await scanner.completeRequest(
-            1,
-            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
-        )
-        await secondRefresh.value
-
-        XCTAssertEqual(store.entries.map(\.port), [4000])
-        XCTAssertNil(store.lastDiff)
+        store.cancelRefresh()
+        await scanner.completeRequest(0, with: [])
+        await refresh.value
+        XCTAssertEqual(store.entries.map(\.port), [3000])
+        XCTAssertNil(store.scanError)
         XCTAssertFalse(store.isScanning)
-        XCTAssertEqual(callbackPorts, [[4000]])
-    }
-
-    func testNewestRefreshCompletingFirstRemainsPublished() async {
-        let scanner = ControlledScanner()
-        let store = PortStore(scanner: scanner)
-        var callbackPorts: [[UInt16]] = []
-        store.onRefreshComplete = { _, _ in
-            callbackPorts.append(store.entries.map(\.port))
-        }
-
-        let firstRefresh = Task { await store.refresh() }
-        await scanner.waitForRequestCount(1)
-        let secondRefresh = Task { await store.refresh() }
-        await scanner.waitForRequestCount(2)
-
-        await scanner.completeRequest(
-            1,
-            with: [makeEntry(pid: 2, port: 4000, name: "newest")]
-        )
-        await secondRefresh.value
-
-        XCTAssertEqual(store.entries.map(\.port), [4000])
-        XCTAssertNil(store.lastDiff)
-        XCTAssertFalse(store.isScanning)
-        XCTAssertEqual(callbackPorts, [[4000]])
-
-        await scanner.completeRequest(
-            0,
-            with: [makeEntry(pid: 1, port: 3000, name: "stale")]
-        )
-        await firstRefresh.value
-
-        XCTAssertEqual(store.entries.map(\.port), [4000])
-        XCTAssertNil(store.lastDiff)
-        XCTAssertFalse(store.isScanning)
-        XCTAssertEqual(callbackPorts, [[4000]])
-
-        let thirdRefresh = Task { await store.refresh() }
-        await scanner.waitForRequestCount(3)
-        await scanner.completeRequest(
-            2,
-            with: [makeEntry(pid: 3, port: 5000, name: "next")]
-        )
-        await thirdRefresh.value
-
-        XCTAssertEqual(store.entries.map(\.port), [5000])
-        XCTAssertEqual(store.lastDiff?.added.map(\.port), [5000])
-        XCTAssertEqual(store.lastDiff?.removed.map(\.port), [4000])
-        XCTAssertEqual(callbackPorts, [[4000], [5000]])
     }
 
     /// Regression: macOS framework builds of Python (python.org installer,
@@ -404,29 +348,16 @@ final class PortStoreTests: XCTestCase {
     /// whichever project first auto-started it. It must not be adopted into
     /// that project's group, and must not trip the multi-port warning as a
     /// false dupe alongside the project's real dev server.
-    func testInfrastructurePortIsNotAdoptedIntoProjectGroup() {
-        for infraPort in PortCategory.infrastructurePorts {
-            let store = PortStore()
-            var daemon = makeEntry(pid: 1, port: infraPort, name: "node")
-            daemon.projectPath = "/tmp/client-a/portal"  // cwd adoption the bug produced
-            var devServer = makeEntry(pid: 2, port: 4596, name: "node")
-            devServer.projectPath = "/tmp/client-a/portal"
-
-            store.entries = [daemon, devServer]
-            store.groupMode = .project
-
-            let groups = store.grouped
-            XCTAssertEqual(
-                groups.first { $0.name == "portal" }?.entries.map(\.port), [4596],
-                "port \(infraPort)"
-            )
-            XCTAssertEqual(
-                groups.first { $0.name == "Other" }?.entries.map(\.port), [infraPort],
-                "port \(infraPort)"
-            )
-            XCTAssertTrue(store.multiPortProjects.isEmpty, "port \(infraPort)")
-            XCTAssertFalse(store.hasMultiPortProjects, "port \(infraPort)")
-        }
+    func testKnownInfrastructureIsNotAdoptedIntoProjectGroup() {
+        let store = PortStore()
+        var daemon = makeEntry(pid: 1, port: 9911, name: "cloudflared")
+        daemon.projectPath = "/tmp/portal"
+        var dev = makeEntry(pid: 2, port: 1355, name: "node")
+        dev.projectPath = "/tmp/portal"
+        store.entries = [daemon, dev]
+        XCTAssertEqual(store.grouped.first { $0.name == "portal" }?.entries.map(\.port), [1355])
+        XCTAssertEqual(store.grouped.first { $0.name == "Other" }?.entries.map(\.port), [9911])
+        XCTAssertTrue(store.multiPortProjects.isEmpty)
     }
 
     /// Regression: interpolating raw integers into a Text literal selects the
@@ -452,7 +383,7 @@ final class PortStoreTests: XCTestCase {
             pid: 1, port: 2375, name: "com.docker.backend",
             executablePath: "/Applications/Docker.app/Contents/MacOS/com.docker.backend"
         )
-        XCTAssertEqual(PortCategory.categorize(dockerDaemon), .system)
+        XCTAssertEqual(PortCategory.categorize(dockerDaemon), .infrastructure)
 
         let store = PortStore()
         store.entries = [dockerDaemon]
@@ -470,7 +401,8 @@ final class PortStoreTests: XCTestCase {
     /// flips the nil assertion.
     func testRefreshSkipsProjectResolutionForInfrastructurePorts() async {
         let scanner = MockScanner(entries: [
-            makeEntry(pid: getpid(), port: 1355, name: "node"),
+            makeEntry(pid: getpid(), port: 1355, name: "node",
+                      scriptPath: "/opt/tools/node_modules/portless/dist/cli.js"),
             makeEntry(pid: getpid(), port: 4596, name: "node"),
         ])
         let store = PortStore(scanner: scanner)

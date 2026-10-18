@@ -6,6 +6,9 @@ struct PortRowView: View {
     var isMultiPort: Bool = false
     var isConflicting: Bool = false
     var projectLabel: String? = nil
+    let classification: ProcessClassification
+    let bindingSummary: String
+    var onCategoryChange: (PortCategory?) -> Void
 
     private enum KillState: Equatable {
         case idle
@@ -13,6 +16,7 @@ struct PortRowView: View {
         case terminating
         case forceKillNeeded
         case forceKilling
+        case signalSent
         case terminated
         case permissionDenied
         case staleProcess
@@ -33,7 +37,7 @@ struct PortRowView: View {
     }
 
     private var isInfrastructure: Bool {
-        PortCategory.isInfrastructure(entry)
+        classification.category == .infrastructure || classification.ownership == .system
     }
 
     private var killHelp: String {
@@ -48,8 +52,10 @@ struct PortRowView: View {
             return "Process ignored SIGTERM; click to send SIGKILL"
         case .forceKilling:
             return "Force killing process"
+        case .signalSent:
+            return "Signal sent; waiting for a scan to confirm exit"
         case .terminated:
-            return "Process terminated"
+            return "Process exit verified"
         case .permissionDenied:
             return "Permission denied"
         case .staleProcess:
@@ -113,6 +119,8 @@ struct PortRowView: View {
 
     private func apply(_ result: KillResult) {
         switch result {
+        case .signalSent:
+            killState = .signalSent
         case .terminated:
             killState = .terminated
         case .forceKillNeeded:
@@ -140,7 +148,7 @@ struct PortRowView: View {
             beginForceKill()
         case .terminating, .forceKilling:
             break
-        case .terminated, .permissionDenied, .staleProcess, .processGone,
+        case .signalSent, .terminated, .permissionDenied, .staleProcess, .processGone,
              .identityUnavailable, .failed:
             killState = .idle
         }
@@ -165,6 +173,8 @@ struct PortRowView: View {
             ProgressView()
                 .controlSize(.mini)
                 .frame(width: 42)
+        case .signalSent:
+            statusLabel("Sent", color: .secondary)
         case .terminated:
             statusLabel("Stopped", color: .green)
         case .permissionDenied:
@@ -210,13 +220,18 @@ struct PortRowView: View {
                 Image(systemName: "exclamationmark.2")
                     .font(.caption2)
                     .foregroundStyle(.red)
-                    .help("Port conflict — multiple processes on this port")
+                    .help("Overlapping TCP listeners. This does not detect failed bind attempts.")
             }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(entry.processName)
                     .font(.caption)
                     .lineLimit(1)
+
+                Text(classification.category.displayName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help(classification.reason + "\n" + bindingSummary)
 
                 if let desc = entry.vsCodeExtensionDescription {
                     Text(desc)
@@ -272,17 +287,34 @@ struct PortRowView: View {
                     .padding(.vertical, 2)
             }
         }
+        .help(isMultiPort ? "Project services need review. Right-click the project heading to remember expected services." : classification.reason)
         .contentShape(Rectangle())
         .contextMenu {
             Button("Copy Port")         { copy(String(entry.port)) }
             Button("Copy PID")          { copy(String(entry.pid)) }
-            Button("Copy Kill Command") { copy("kill -9 \(entry.pid)") }
+            Button("Copy Terminate Command") { copy("kill -TERM \(entry.pid)") }
+            Divider()
+            Text(classification.reason)
+            Text(bindingSummary)
+            Menu("Category for This Process") {
+                ForEach(PortCategory.allCases, id: \.self) { category in
+                    Button(category.displayName) { onCategoryChange(category) }
+                }
+                Divider()
+                Button("Use Automatic Category") { onCategoryChange(nil) }
+            }
+            .disabled(ProcessClassifier.overrideKey(for: entry) == nil)
+            if ProcessClassifier.overrideKey(for: entry) == nil {
+                Text("A script or project is needed to save a runtime category.")
+            }
         }
         .onDisappear {
             killConfirmResetTask?.cancel()
             killConfirmResetTask = nil
             killTask?.cancel()
             killTask = nil
+            if killState == .confirming { killState = .idle }
+            if killState == .terminating || killState == .forceKilling { killState = .signalSent }
         }
     }
 }
