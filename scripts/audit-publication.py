@@ -22,6 +22,7 @@ import argparse
 import bz2
 import ctypes
 import datetime
+import errno
 import fnmatch
 import hashlib
 import io
@@ -29,6 +30,7 @@ import json
 import lzma
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -112,9 +114,28 @@ def is_inside(path, root):
 def git_env():
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(
-        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0"
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_TERMINAL_PROMPT="0",
+        # refs/replace/* would make git hand back different bytes than a push sends.
+        GIT_NO_REPLACE_OBJECTS="1",
     )
     return env
+
+
+def check_history_integrity(repo, findings):
+    """Shallow clones and grafts mean the audited history is not what a push sends."""
+    try:
+        shallow = git(repo, "rev-parse", "--is-shallow-repository").decode().strip()
+        grafts = git(repo, "rev-parse", "--git-path", "info/grafts").decode().strip()
+    except GitError:
+        findings.add("history_unverifiable", "repo")
+        return
+    if shallow != "false":
+        findings.add("shallow_repo", "repo")
+    grafts_path = grafts if os.path.isabs(grafts) else os.path.join(repo, grafts)
+    if os.path.lexists(grafts_path):
+        findings.add("grafts_present", "repo")
 
 
 def git(repo, *args):
@@ -153,19 +174,26 @@ class CatFile:
 
     def get(self, sha):
         """Return (type, size, data); data is None when over the size cap."""
-        self.proc.stdin.write(sha.encode() + b"\n")
-        self.proc.stdin.flush()
-        header = self.proc.stdout.readline().split()
-        if len(header) != 3:
-            raise GitError("object missing")
-        otype, size = header[1].decode(), int(header[2])
-        if size > MAX_FILE_BYTES:
-            remaining = size + 1
-            while remaining:
-                remaining -= len(self.proc.stdout.read(min(remaining, 1 << 20)))
-            return otype, size, None
-        data = self.proc.stdout.read(size)
-        self.proc.stdout.read(1)
+        try:
+            self.proc.stdin.write(sha.encode() + b"\n")
+            self.proc.stdin.flush()
+            header = self.proc.stdout.readline().split()
+            if len(header) != 3:
+                raise GitError("object missing")
+            otype, size = header[1].decode(), int(header[2])
+            if size > MAX_FILE_BYTES:
+                remaining = size + 1
+                while remaining:
+                    chunk = self.proc.stdout.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        raise GitError("cat-file ended early")
+                    remaining -= len(chunk)
+                return otype, size, None
+            data = self.proc.stdout.read(size)
+            if len(data) != size or self.proc.stdout.read(1) != b"\n":
+                raise GitError("cat-file short read")
+        except (OSError, ValueError):
+            raise GitError("cat-file stream failed")
         return otype, size, data
 
     def close(self):
@@ -185,11 +213,14 @@ class Findings:
     def __init__(self, extra_rx):
         self._seen = set()
         self.items = []
-        self._redact = [rx for _, rx in SECRET_PATTERNS[:1]] + [r for r in extra_rx]
+        self._redact = [rx for _, rx in SECRET_PATTERNS] + [r for r in extra_rx]
 
     def location(self, loc):
+        """Locations can embed file names, so they get every content pattern."""
         raw = loc.encode("utf-8", "replace")
         if any(rx.search(raw) for rx in self._redact):
+            return "<redacted-location>"
+        if any(m.group(1) not in HOME_ALLOW for m in HOME_RX.finditer(raw)):
             return "<redacted-location>"
         return loc
 
@@ -225,8 +256,11 @@ class Scanner:
             if rx.search(data):
                 self.f.add("private_pattern", loc)
         if data.startswith(PNG_SIG):
-            for inflated in png_inflated_metadata(data):
-                self.scan_bytes(inflated, loc + "#png-metadata")
+            for status, inflated in png_inflated_metadata(data):
+                if status == "ok":
+                    self.scan_bytes(inflated, loc + "#png-metadata")
+                else:
+                    self.f.add(status, loc + "#png-metadata")
 
     def scan_blob(self, data, name, loc, depth=0):
         """Scan one file's bytes: name policy, raw content, archive members."""
@@ -282,6 +316,8 @@ class Scanner:
         if not self._take_budget(len(out), loc):
             return
         if out[257:262] == b"ustar":
+            # Raw bytes too: tar readers can skip data a push still carries.
+            self.scan_bytes(out, loc + "#decompressed")
             self._scan_tar(out, loc, depth)
             return
         inner = name
@@ -292,6 +328,7 @@ class Scanner:
         self.scan_blob(out, inner, loc + "#decompressed", depth + 1)
 
     def _member_ok(self, name, mloc):
+        self.scan_bytes(name.encode("utf-8", "replace"), mloc)
         norm = name.replace("\\", "/")
         parts = [p for p in norm.split("/") if p not in ("", ".")]
         if norm.startswith("/") or ".." in parts or re.match(r"^[A-Za-z]:", norm):
@@ -331,7 +368,7 @@ class Scanner:
                 self.scan_blob(body, info.filename, mloc, depth + 1)
 
     def _scan_tar(self, data, loc, depth):
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:", ignore_zeros=True) as tf:
             count = 0
             for member in tf:
                 count += 1
@@ -401,8 +438,9 @@ def archive_kind(data):
 
 
 def png_inflated_metadata(data):
-    """Yield decompressed zTXt/iTXt payloads (bounded). Raw bytes are scanned
-    separately, so uncompressed tEXt/eXIf are already covered."""
+    """Yield (status, bytes) for zTXt/iTXt payloads: ("ok", inflated), or
+    ("too_large" | "unreadable", b"") when it cannot be fully inflated within the
+    cap. Raw bytes are scanned separately, so tEXt/eXIf are already covered."""
     pos = len(PNG_SIG)
     while pos + 8 <= len(data):
         length = int.from_bytes(data[pos : pos + 4], "big")
@@ -424,89 +462,133 @@ def png_inflated_metadata(data):
                 compressed = rest
         if compressed:
             try:
-                out = zlib.decompressobj().decompress(compressed, MAX_FILE_BYTES)
+                d = zlib.decompressobj()
+                out = d.decompress(compressed, MAX_FILE_BYTES + 1)
             except zlib.error:
+                yield "unreadable", b""
                 continue
-            yield out
+            if len(out) > MAX_FILE_BYTES:
+                yield "too_large", b""
+            elif not d.eof:
+                yield "unreadable", b""  # truncated stream
+            else:
+                yield "ok", out
 
 
 # ------------------------------------------------------------ extended attrs
 def read_xattrs(path):
-    """Return [(name, value_bytes_or_None)] for `path`; [] when unsupported.
-    None marks a value over MAX_XATTR_BYTES. os.*xattr is Linux-only, so macOS
-    goes through libc via ctypes."""
+    """Return ([(name, value_bytes_or_None)], problems) for `path`. None marks a
+    value over MAX_XATTR_BYTES. `problems` holds "too_large" (more than
+    MAX_XATTRS attributes) and/or "unreadable" (any listing/read error); a
+    platform without xattr support is simply empty. os.*xattr is Linux-only, so
+    macOS goes through libc via ctypes."""
+    out, problems = [], set()
     try:
         if hasattr(os, "listxattr"):
-            out = []
-            for n in os.listxattr(path, follow_symlinks=False)[:MAX_XATTRS]:
+            names = os.listxattr(path, follow_symlinks=False)
+            if len(names) > MAX_XATTRS:
+                problems.add("too_large")
+            for n in names[:MAX_XATTRS]:
                 try:
                     v = os.getxattr(path, n, follow_symlinks=False)
                 except OSError:
+                    problems.add("unreadable")
                     continue
                 out.append((n, v if len(v) <= MAX_XATTR_BYTES else None))
-            return out
+            return out, problems
         if sys.platform != "darwin":
-            return []
+            return out, problems
         libc = ctypes.CDLL(None, use_errno=True)
         bpath = os.fsencode(path)
         nofollow = 1  # XATTR_NOFOLLOW
         size = libc.listxattr(bpath, None, 0, nofollow)
-        if size <= 0:
-            return []
+        if size < 0:
+            if ctypes.get_errno() not in (errno.ENOTSUP, errno.EPERM):
+                problems.add("unreadable")
+            return out, problems
+        if size == 0:
+            return out, problems
         buf = ctypes.create_string_buffer(size)
         size = libc.listxattr(bpath, buf, size, nofollow)
-        if size <= 0:
-            return []
-        out = []
-        for raw in buf.raw[:size].split(b"\0")[:MAX_XATTRS]:
-            if not raw:
-                continue
+        if size < 0:
+            problems.add("unreadable")
+            return out, problems
+        names = [r for r in buf.raw[:size].split(b"\0") if r]
+        if len(names) > MAX_XATTRS:
+            problems.add("too_large")
+        for raw in names[:MAX_XATTRS]:
             vsize = libc.getxattr(bpath, raw, None, 0, 0, nofollow)
             if vsize < 0:
+                problems.add("unreadable")
                 continue
             if vsize > MAX_XATTR_BYTES:
                 out.append((raw.decode("utf-8", "replace"), None))
                 continue
             vbuf = ctypes.create_string_buffer(max(vsize, 1))
             got = libc.getxattr(bpath, raw, vbuf, vsize, 0, nofollow)
-            if got >= 0:
-                out.append((raw.decode("utf-8", "replace"), vbuf.raw[:got]))
-        return out
+            if got < 0:
+                problems.add("unreadable")
+                continue
+            out.append((raw.decode("utf-8", "replace"), vbuf.raw[:got]))
     except (OSError, AttributeError, ValueError, TypeError):
-        return []
+        problems.add("unreadable")
+    return out, problems
 
 
 # ---------------------------------------------------------- filesystem hashing
 def hash_and_scan_path(path, loc, scanner, root_for_links=None):
     """Hash `path` (file, or directory via deterministic tree hash) and scan it.
-    Symlinks are never followed; links leaving the directory are findings."""
+    Symlinks are never followed; links leaving the directory are findings.
+    Anything unreadable, or neither file/dir/symlink, is a finding."""
     f = scanner.f
-    if os.path.islink(path):
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        f.add("missing_path", loc)
+        return None
+    if stat.S_ISLNK(mode):
         f.add("symlink_escape", loc)
         return sha256_bytes(b"L\0" + os.readlink(path).encode("utf-8", "replace"))
-    if os.path.isfile(path):
+    if stat.S_ISREG(mode):
         return _hash_scan_file(path, loc, scanner)
-    if not os.path.isdir(path):
-        f.add("missing_path", loc)
+    if not stat.S_ISDIR(mode):
+        f.add("special_file", loc)
         return None
     root = os.path.realpath(path)
     entries = []
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+
+    def walk_error(exc):
+        name = getattr(exc, "filename", None) or path
+        rel = os.path.relpath(name, path).replace(os.sep, "/")
+        f.add("unreadable", loc if rel == "." else f"{loc}/{rel}")
+
+    for dirpath, dirnames, filenames in os.walk(
+        path, followlinks=False, onerror=walk_error
+    ):
         dirnames.sort()
         for name in dirnames + sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, path).replace(os.sep, "/")
-            if os.path.islink(full):
+            scanner.scan_bytes(rel.encode("utf-8", "surrogateescape"), f"{loc}/{rel}")
+            try:
+                fmode = os.lstat(full).st_mode
+            except OSError:
+                f.add("unreadable", f"{loc}/{rel}")
+                continue
+            if stat.S_ISLNK(fmode):
                 target = os.readlink(full)
                 if not is_inside(os.path.join(os.path.dirname(full), target), root):
                     f.add("symlink_escape", f"{loc}/{rel}")
                 entries.append((rel, "L", target))
-            elif os.path.isdir(full):
+            elif stat.S_ISDIR(fmode):
                 entries.append((rel, "D", ""))
-            else:
+            elif stat.S_ISREG(fmode):
                 entries.append(
                     (rel, "F", _hash_scan_file(full, f"{loc}/{rel}", scanner))
                 )
+            else:
+                f.add("special_file", f"{loc}/{rel}")
+                entries.append((rel, "S", ""))
             if name == ".git":
                 f.add("nested_repo", f"{loc}/{rel}")
     entries.sort()
@@ -525,8 +607,11 @@ def _hash_scan_file(path, loc, scanner):
     with open(path, "rb") as fh:
         data = fh.read()
     scanner.scan_blob(data, path, loc)
-    for xname, xval in read_xattrs(path):
-        xloc = loc + "#xattr"
+    xattrs, problems = read_xattrs(path)
+    xloc = loc + "#xattr"
+    for problem in sorted(problems):
+        scanner.f.add(problem, xloc)
+    for xname, xval in xattrs:
         if xval is None:
             scanner.f.add("too_large", xloc)
             continue
@@ -593,7 +678,9 @@ def validate_manifest(m):
         isinstance(m.get("privatePatternsSha256"), str)
         and re.fullmatch(r"[0-9a-f]{64}", m["privatePatternsSha256"])
     ):
-        raise UsageError("manifest privatePatternsSha256 required with privatePatternsFile")
+        raise UsageError(
+            "manifest privatePatternsSha256 required with privatePatternsFile"
+        )
     if not m.get("refs"):
         raise UsageError("manifest must pin at least one published ref")
 
@@ -736,6 +823,11 @@ def scan_git_object(reader, sha, path, loc, scanner):
         scanner.f.add("object_unreadable", loc)
         return
     if otype == "tree":
+        # Entry names live in tree bytes; scan them but not as a named file.
+        if data is None:
+            scanner.f.add("too_large", loc)
+        else:
+            scanner.scan_bytes(data, loc)
         return
     if data is None:
         scanner.f.add("too_large", loc)
@@ -763,7 +855,15 @@ def audit_ref(repo, ref, reader, scanned, scanner):
     # every commit, independent of blob dedup.
     try:
         touched = git(
-            repo, "log", "--name-only", "-z", "--format=", "--no-renames", "-m", "--root", actual
+            repo,
+            "log",
+            "--name-only",
+            "-z",
+            "--format=",
+            "--no-renames",
+            "-m",
+            "--root",
+            actual,
         )
     except GitError:
         f.add("ref_unreadable", f"ref:{name}")
@@ -893,6 +993,7 @@ def run_audit(args, write_receipt):
 
     published = load_published_base(toplevel, manifest, findings)
     scanner = Scanner(findings, private_rx, published)
+    check_history_integrity(toplevel, findings)
     audit_candidate(toplevel, manifest, scanner)
     audit_dirty(toplevel, manifest, findings)
     audit_included(toplevel, manifest, scanner)
