@@ -31,6 +31,7 @@ import lzma
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -217,12 +218,17 @@ class Findings:
 
     def location(self, loc):
         """Locations can embed file names, so they get every content pattern."""
-        raw = loc.encode("utf-8", "replace")
-        if any(rx.search(raw) for rx in self._redact):
-            return "<redacted-location>"
-        if any(m.group(1) not in HOME_ALLOW for m in HOME_RX.finditer(raw)):
-            return "<redacted-location>"
-        return loc
+        raw = loc.encode("utf-8", "surrogateescape")
+        # Replace only the matched segment so the rest of the path stays useful.
+        for rx in self._redact:
+            raw = rx.sub(b"<redacted>", raw)
+        raw = HOME_RX.sub(
+            lambda m: m.group(0)
+            if m.group(1) in HOME_ALLOW
+            else b"/Users/<redacted>",
+            raw,
+        )
+        return raw.decode("utf-8", "replace")
 
     def add(self, code, loc):
         key = (code, loc)
@@ -328,6 +334,9 @@ class Scanner:
         self.scan_blob(out, inner, loc + "#decompressed", depth + 1)
 
     def _member_ok(self, name, mloc):
+        # Defense in depth: member names are also present in the raw archive
+        # bytes (scanned by scan_blob), so this catches them only if a future
+        # container stores names in a transformed form.
         self.scan_bytes(name.encode("utf-8", "replace"), mloc)
         norm = name.replace("\\", "/")
         parts = [p for p in norm.split("/") if p not in ("", ".")]
@@ -351,6 +360,10 @@ class Scanner:
             if len(infos) > MAX_ARCHIVE_MEMBERS:
                 self.f.add("archive_limit", loc)
                 return
+            if _has_unlisted_entries(data, infos):
+                # zipfile trusts only the last central directory; a stream
+                # extractor (bsdtar -xOf -) also reads entries it never lists.
+                self.f.add("archive_unreadable", loc)
             for info in infos:
                 mloc = f"{loc}!{info.filename}"
                 if not self._member_ok(info.filename, mloc) or info.is_dir():
@@ -392,6 +405,28 @@ class Scanner:
                     return
                 body = tf.extractfile(member).read()
                 self.scan_blob(body, member.name, mloc, depth + 1)
+
+
+ZIP_LOCAL_SIG = b"PK\x03\x04"
+
+
+def _has_unlisted_entries(data, infos):
+    """True when the bytes hold anything but the entries the central directory
+    lists, back to back: a prefix, concatenated zips, or a stray local header.
+    Local-header signatures inside a listed entry's data (stored nested zips)
+    are skipped by walking entry spans."""
+    cursor = 0
+    for info in sorted(infos, key=lambda i: i.header_offset):
+        off = info.header_offset
+        if data.find(ZIP_LOCAL_SIG, cursor, off) != -1:
+            return True
+        if cursor == 0 and off != 0:
+            return True
+        if data[off : off + 4] != ZIP_LOCAL_SIG or len(data) < off + 30:
+            return True
+        name_len, extra_len = struct.unpack("<HH", data[off + 26 : off + 30])
+        cursor = max(cursor, off + 30 + name_len + extra_len + info.compress_size)
+    return data.find(ZIP_LOCAL_SIG, cursor) != -1
 
 
 class _TooLarge(Exception):
@@ -548,7 +583,13 @@ def hash_and_scan_path(path, loc, scanner, root_for_links=None):
         return None
     if stat.S_ISLNK(mode):
         f.add("symlink_escape", loc)
-        return sha256_bytes(b"L\0" + os.readlink(path).encode("utf-8", "replace"))
+        try:
+            target = os.readlink(path)
+        except OSError:
+            f.add("unreadable", loc)
+            return None
+        scanner.scan_bytes(os.fsencode(target), loc)
+        return sha256_bytes(b"L\0" + target.encode("utf-8", "replace"))
     if stat.S_ISREG(mode):
         return _hash_scan_file(path, loc, scanner)
     if not stat.S_ISDIR(mode):
@@ -576,7 +617,13 @@ def hash_and_scan_path(path, loc, scanner, root_for_links=None):
                 f.add("unreadable", f"{loc}/{rel}")
                 continue
             if stat.S_ISLNK(fmode):
-                target = os.readlink(full)
+                try:
+                    target = os.readlink(full)
+                except OSError:
+                    f.add("unreadable", f"{loc}/{rel}")
+                    entries.append((rel, "L", ""))
+                    continue
+                scanner.scan_bytes(os.fsencode(target), f"{loc}/{rel}")
                 if not is_inside(os.path.join(os.path.dirname(full), target), root):
                     f.add("symlink_escape", f"{loc}/{rel}")
                 entries.append((rel, "L", target))
@@ -599,13 +646,17 @@ def hash_and_scan_path(path, loc, scanner, root_for_links=None):
 
 
 def _hash_scan_file(path, loc, scanner):
-    size = os.path.getsize(path)
-    digest = sha256_file(path)
-    if size > MAX_FILE_BYTES:
-        scanner.f.add("too_large", loc)
-        return digest
-    with open(path, "rb") as fh:
-        data = fh.read()
+    try:
+        size = os.path.getsize(path)
+        digest = sha256_file(path)
+        if size > MAX_FILE_BYTES:
+            scanner.f.add("too_large", loc)
+            return digest
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        scanner.f.add("unreadable", loc)
+        return None
     scanner.scan_blob(data, path, loc)
     xattrs, problems = read_xattrs(path)
     xloc = loc + "#xattr"
@@ -817,6 +868,10 @@ def scan_git_object(reader, sha, path, loc, scanner):
         if path and forbidden_name(os.path.basename(path)):
             scanner.f.add("forbidden_file", loc)
         return
+    if path:
+        # Tree objects store one component at a time, so a home path split
+        # across directories only exists in the full path string.
+        scanner.scan_bytes(path.encode("utf-8", "surrogateescape"), loc)
     try:
         otype, size, data = reader.get(sha)
     except GitError:
