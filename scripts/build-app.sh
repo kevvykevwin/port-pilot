@@ -18,7 +18,12 @@ BUILD="$(read_version_field BUILD)"
 
 echo "Building Port Pilot $VERSION (build $BUILD)..."
 cd "$PROJECT_DIR"
-swift build -c release
+# Shipped binaries must not embed the builder's home directory. Remap the
+# checkout path in #file/#filePath strings and debug info, then strip the
+# debug-symbol stab entries (which record the build directory) before signing.
+swift build -c release \
+    -Xswiftc -debug-prefix-map -Xswiftc "$PROJECT_DIR=/portpilot" \
+    -Xswiftc -file-prefix-map -Xswiftc "$PROJECT_DIR=/portpilot"
 
 echo "Creating .app bundle..."
 rm -rf "$APP_DIR"
@@ -32,6 +37,9 @@ cp .build/release/PortPilotCLI "$APP_DIR/Contents/Resources/bin/portpilot"
 cp "$VERSION_FILE" "$APP_DIR/Contents/Resources/VERSION"
 cp scripts/managed-helper.py "$APP_DIR/Contents/Resources/bin/managed-helper.py"
 cp Assets/icon.svg "$APP_DIR/Contents/Resources/"
+for binary in "$APP_DIR/Contents/MacOS/PortPilot" "$APP_DIR/Contents/Helpers/PortPilotHelper" "$APP_DIR/Contents/Resources/bin/portpilot"; do
+    strip -S "$binary"
+done
 
 cat > "$APP_DIR/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
