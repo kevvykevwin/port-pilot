@@ -4,5 +4,5 @@
 #
 # VERSION — marketing version, CFBundleShortVersionString, and the git tag (v$VERSION).
 # BUILD   — CFBundleVersion. Must increase monotonically; bump on every released build.
-VERSION=0.4.0
-BUILD=3
+VERSION=0.5.0
+BUILD=4

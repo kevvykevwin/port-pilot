@@ -46,7 +46,7 @@
 
 ## Current State
 
-**Version**: v0.4.0 (build 3), unchanged in `VERSION`; no release or install performed.
+**Version**: v0.5.0 (build 4) in `VERSION`, bumped 2026-11-06 for the managed-servers helper, CLI and notification export. Installed locally; not tagged or released.
 **Tests**: `swift test` — 147 tests, zero failures (12.118 s), verified 2026-11-03; `/tmp/portpilot-20261103-tests.log`. Two identity regressions failed before the fix and pass now. T3 source-policy audit: nine checks passed. Updater/packaging shell evidence remains from 2026-11-02.
 **Build**: `swift build -c release` succeeded on 2026-11-03 (20.19 s); `/tmp/portpilot-20261103-release.log`. The app bundle/signature checks are from November 2 and were not regenerated for the newer source. Nothing installed or deployed.
 **Managed-server status**: In progress; P1/P2 are not accepted. The new ownership panel has build evidence only, without fresh screen, keyboard or VoiceOver acceptance.
@@ -230,6 +230,35 @@ Run the complete XCTest suite with `swift test`. Coverage includes:
 - Commits ahead of origin/main (2):
   - docs: record serve-route findings and the no-kill rule
   - feat: flag broken Tailscale links and stop offering kills that cannot work
+
+### 2026-11-06 23:20 — main (hotfix)
+<!-- deploy:d9068df-1793974790-V1w5mc -->
+- Files: 50 changed (`Sources/ (23), Tests/ (19), (root) (4), scripts/ (4)`)
+  - `.gitignore`
+  - `CLAUDE.md`
+  - `Package.swift`
+  - `Sources/PortPilot/Views/ManagedExportView.swift`
+  - `Sources/PortPilot/Views/ManagedServicesView.swift`
+  - `Sources/PortPilot/Views/MenuBarView.swift`
+  - `Sources/PortPilot/Views/PortListView.swift`
+  - `Sources/PortPilot/Views/PortRowView.swift`
+  - `Sources/PortPilotCLI/main.swift`
+  - `Sources/PortPilotCore/Managed/ManagedAncestry.swift`
+  - `Sources/PortPilotCore/Managed/ManagedClient.swift`
+  - `Sources/PortPilotCore/Managed/ManagedExport.swift`
+  - `Sources/PortPilotCore/Managed/ManagedForwarder.swift`
+  - `Sources/PortPilotCore/Managed/ManagedIPC.swift`
+  - `Sources/PortPilotCore/Managed/ManagedLaunch.swift`
+  - +35 more
+- Commits ahead of origin/main (8):
+  - chore: bump version to 0.5.0 (build 4)
+  - fix: keep the builder's home path out of shipped binaries
+  - fix: stop export responses revealing activity on unselected services
+  - feat: let the publication audit skip already-public history
+  - feat: add managed servers helper and private notification contract
+  - feat: add publication audit for release candidates
+  - docs: point CLAUDE.md learnings at the central dev-journal log
+  - chore: keep personal planning notes and bridge evidence out of git
 
 ### 2026-10-18 12:01 — feat/process-classification (full)
 <!-- deploy:72f6dfd-1792292445-azZfiu -->
