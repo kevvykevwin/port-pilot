@@ -172,7 +172,11 @@ public actor ManagedRegistry {
                 approvalDeadlines.removeAll()
             }
             lastWallTime = now()
-            if let exportActor { return try handleExport(request, actor: exportActor, peer: peer) }
+            if let exportActor {
+                // Export actors never see the global registry revision, on success or on error.
+                do { return try handleExport(request, actor: exportActor, peer: peer) }
+                catch { return ManagedResponse(requestId: request.requestId, revision: 0, error: error as? ManagedError ?? .recoveryRequired) }
+            }
             if ManagedExportOperation.isExport(request.operation) { return try handleExportAdmin(request, actor: legacy) }
             guard let actor = legacy else { throw ManagedError.unauthorized }
             guard !recoveryRequired else { throw ManagedError.recoveryRequired }

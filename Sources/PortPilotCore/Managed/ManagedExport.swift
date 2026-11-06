@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 // Optional private-notification export (spec-portpilot-private-coordination, PC05-PC18).
 //
@@ -54,7 +55,9 @@ public struct ManagedNotificationPage: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var enrollmentEpoch: Int
     public var snapshotId: String
-    public var highWaterMark: Int
+    /// Opaque, sealed, enrollment-bound position in the change stream. Pass it back as `after`. It is a
+    /// different string on every call, so neither its value nor its growth reveals activity on other services.
+    public var changeCursor: String
     /// Envelope field (not a record field). Enrollment-scoped identifier of the helper process that served
     /// this page. A change between two responses means the helper restarted: an incremental reader MUST
     /// discard its cursor and take a fresh snapshot (an `after` cursor from a previous instance is not
@@ -63,18 +66,18 @@ public struct ManagedNotificationPage: Codable, Sendable, Equatable {
     public var records: [ManagedNotificationRecord]
     public var nextPageToken: String?
     enum CodingKeys: String, CodingKey {
-        case schemaVersion, enrollmentEpoch, snapshotId, highWaterMark, helperInstance, records, nextPageToken
+        case schemaVersion, enrollmentEpoch, snapshotId, changeCursor, helperInstance, records, nextPageToken
     }
-    public init(schemaVersion: Int = 1, enrollmentEpoch: Int, snapshotId: String, highWaterMark: Int, helperInstance: String,
+    public init(schemaVersion: Int = ManagedNotificationContract.pageSchema, enrollmentEpoch: Int, snapshotId: String, changeCursor: String, helperInstance: String,
                 records: [ManagedNotificationRecord], nextPageToken: String?) {
         self.schemaVersion = schemaVersion; self.enrollmentEpoch = enrollmentEpoch; self.snapshotId = snapshotId
-        self.highWaterMark = highWaterMark; self.helperInstance = helperInstance
+        self.changeCursor = changeCursor; self.helperInstance = helperInstance
         self.records = records; self.nextPageToken = nextPageToken
     }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(schemaVersion, forKey: .schemaVersion); try c.encode(enrollmentEpoch, forKey: .enrollmentEpoch)
-        try c.encode(snapshotId, forKey: .snapshotId); try c.encode(highWaterMark, forKey: .highWaterMark)
+        try c.encode(snapshotId, forKey: .snapshotId); try c.encode(changeCursor, forKey: .changeCursor)
         try c.encode(helperInstance, forKey: .helperInstance)
         try c.encode(records, forKey: .records)
         try c.encode(nextPageToken, forKey: .nextPageToken)   // explicit null, never an omitted key
@@ -99,11 +102,15 @@ public enum ManagedNotificationContract {
         "schemaVersion", "serviceRef", "decisionRef", "serviceRevision", "action", "status", "outcome",
         "routeGeneration", "ownerCount", "observedAt", "expiresAt",
     ]
-    static let pageFields: Set<String> = ["schemaVersion", "enrollmentEpoch", "snapshotId", "highWaterMark", "helperInstance", "records", "nextPageToken"]
+    static let pageFields: Set<String> = ["schemaVersion", "enrollmentEpoch", "snapshotId", "changeCursor", "helperInstance", "records", "nextPageToken"]
     public static let maxRecordBytes = 8192
     public static let maxPageRecords = 200
     public static let maxPageBytes = 1_048_576
+    /// Record schema is unchanged (1). The page envelope is schema 2: `highWaterMark` (an integer that
+    /// counted events on every service) became the opaque `changeCursor`.
     public static let supportedSchema = 1
+    public static let pageSchema = 2
+    public static let maxCursorBytes = 512
 
     private static func object(_ data: Data) throws -> [String: Any] {
         try ManagedWire.requireUniqueKeys(data)   // invalid UTF-8, malformed JSON, duplicate keys
@@ -122,9 +129,9 @@ public enum ManagedNotificationContract {
     }
     private static let recordIntegerFields = ["schemaVersion", "serviceRevision", "routeGeneration", "ownerCount", "observedAt", "expiresAt"]
 
-    private static func requireSupportedSchema(_ dictionary: [String: Any]) throws {
+    private static func requireSupportedSchema(_ dictionary: [String: Any], expected: Int = supportedSchema) throws {
         // Checked before field names: a future schema may legitimately differ in shape.
-        if let version = strictInt(dictionary["schemaVersion"]), version != supportedSchema { throw ManagedError.protocolMismatch }
+        if let version = strictInt(dictionary["schemaVersion"]), version != expected { throw ManagedError.protocolMismatch }
     }
     private static func isRef(_ value: String, prefix: String) -> Bool {
         value.hasPrefix(prefix) && value.utf8.count == prefix.utf8.count + 32 &&
@@ -153,7 +160,7 @@ public enum ManagedNotificationContract {
         return try validatePage(dictionary: try object(data))
     }
     static func validatePage(dictionary: [String: Any]) throws -> ManagedNotificationPage {
-        try requireSupportedSchema(dictionary)
+        try requireSupportedSchema(dictionary, expected: pageSchema)
         guard Set(dictionary.keys) == pageFields, let raw = dictionary["records"] as? [Any] else { throw ManagedError.invalidInput }
         guard raw.count <= maxPageRecords else { throw ManagedError.recordTooLarge }
         var records: [ManagedNotificationRecord] = []
@@ -163,16 +170,16 @@ public enum ManagedNotificationContract {
             guard bytes.count <= maxRecordBytes else { throw ManagedError.recordTooLarge }
             records.append(try validateRecord(dictionary: item, bytes: bytes))
         }
-        guard let epoch = strictInt(dictionary["enrollmentEpoch"]), let mark = strictInt(dictionary["highWaterMark"]),
-              let snapshot = dictionary["snapshotId"] as? String, strictInt(dictionary["schemaVersion"]) == supportedSchema,
+        guard let epoch = strictInt(dictionary["enrollmentEpoch"]), let cursor = dictionary["changeCursor"] as? String,
+              let snapshot = dictionary["snapshotId"] as? String, strictInt(dictionary["schemaVersion"]) == pageSchema,
               let instance = dictionary["helperInstance"] as? String,
-              epoch > 0, mark >= 0, !snapshot.isEmpty, snapshot.utf8.count <= 64,
+              epoch > 0, !cursor.isEmpty, cursor.utf8.count <= maxCursorBytes, !snapshot.isEmpty, snapshot.utf8.count <= 64,
               !instance.isEmpty, instance.utf8.count <= 64 else { throw ManagedError.invalidInput }
         let token: String?
         if dictionary["nextPageToken"] is NSNull { token = nil }
         else if let string = dictionary["nextPageToken"] as? String, !string.isEmpty, string.utf8.count <= 2048 { token = string }
         else { throw ManagedError.invalidInput }
-        return ManagedNotificationPage(enrollmentEpoch: epoch, snapshotId: snapshot, highWaterMark: mark, helperInstance: instance,
+        return ManagedNotificationPage(enrollmentEpoch: epoch, snapshotId: snapshot, changeCursor: cursor, helperInstance: instance,
                                        records: records, nextPageToken: token)
     }
 }
@@ -196,12 +203,12 @@ public final class ManagedNotificationClient: @unchecked Sendable {
         self.transport = transport
         self.rawTransport = rawTransport ?? { try ManagedSocket.requestRaw($0, path: socket) }
     }
-    public func list(pageToken: String? = nil, after: Int? = nil, limit: Int? = nil) throws -> ManagedNotificationPage {
+    public func list(pageToken: String? = nil, after: String? = nil, limit: Int? = nil) throws -> ManagedNotificationPage {
         guard !deliveryDisabled else { throw ManagedError.protocolMismatch }
         let file = try JSONDecoder().decode(ManagedExportCredentialFile.self, from: ManagedClient.readPrivateFile(credentialFile))
         var payload: [String: ManagedJSON] = [:]
         if let pageToken { payload["pageToken"] = .string(pageToken) }
-        if let after { payload["after"] = .integer(after) }
+        if let after { payload["after"] = .string(after) }
         if let limit { payload["limit"] = .integer(limit) }
         let request = ManagedRequest(operation: "notifications.list", actor: file.notification.actor,
                                      credential: file.notification.credential, payload: payload)
@@ -350,7 +357,61 @@ enum ManagedExportStore {
     }
 }
 
+/// AES-GCM sealing with a key derived (HKDF-SHA256) from the enrollment `refKey`. Each purpose has its own
+/// info label, so a cursor can never open as a page token or the reverse. Wire form: base64url(nonce || ciphertext || tag).
+/// Failure modes: not base64url or too short to be a sealed box -> `invalidInput`; fails to open
+/// (tampered, other enrollment, other epoch, other key) -> `unauthorized`.
+enum ManagedSealed {
+    static let overhead = 12 + 16
+    static func key(_ refKey: Data, label: String) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: refKey), salt: Data(), info: Data(label.utf8), outputByteCount: 32)
+    }
+    static func seal(_ plaintext: Data, refKey: Data, label: String, aad: Data) throws -> String {
+        let box = try AES.GCM.seal(plaintext, using: key(refKey, label: label), nonce: AES.GCM.Nonce(), authenticating: aad)
+        guard let combined = box.combined else { throw ManagedError.recoveryRequired }
+        return encode(combined)
+    }
+    static func open(_ text: String, refKey: Data, label: String, aad: Data) throws -> Data {
+        guard let combined = decode(text), combined.count > overhead else { throw ManagedError.invalidInput }
+        do {
+            return try AES.GCM.open(AES.GCM.SealedBox(combined: combined), using: key(refKey, label: label), authenticating: aad)
+        } catch { throw ManagedError.unauthorized }
+    }
+    static func encode(_ data: Data) -> String {
+        data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    static func decode(_ string: String) -> Data? {
+        guard string.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }) else { return nil }
+        var s = string.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while s.count % 4 != 0 { s += "=" }
+        return Data(base64Encoded: s)
+    }
+}
+
+/// Position in the change stream, readable only by the helper. Replaces the plain integer high-water mark.
+struct ManagedChangeCursor: Codable, Equatable {
+    static let label = "portpilot-export-cursor-v1"
+    var v = 1
+    var enrollmentId: UUID
+    var epoch: Int
+    var seq: Int
+    init(enrollmentId: UUID, epoch: Int, seq: Int) { self.enrollmentId = enrollmentId; self.epoch = epoch; self.seq = seq }
+    private static func aad(_ id: UUID, _ epoch: Int) -> Data { Data("\(label)|\(id.uuidString)|\(epoch)".utf8) }
+    func seal(refKey: Data) throws -> String {
+        try ManagedSealed.seal(ManagedDigest.canonical(self), refKey: refKey, label: Self.label, aad: Self.aad(enrollmentId, epoch))
+    }
+    static func open(_ text: String, refKey: Data, enrollmentId: UUID, epoch: Int) throws -> ManagedChangeCursor {
+        guard !text.isEmpty, text.utf8.count <= ManagedNotificationContract.maxCursorBytes else { throw ManagedError.invalidInput }
+        let body = try ManagedSealed.open(text, refKey: refKey, label: label, aad: aad(enrollmentId, epoch))
+        guard let cursor = try? JSONDecoder().decode(ManagedChangeCursor.self, from: body), cursor.v == 1,
+              cursor.enrollmentId == enrollmentId, cursor.epoch == epoch, cursor.seq >= 0 else { throw ManagedError.unauthorized }
+        return cursor
+    }
+}
+
 private struct ManagedPageToken: Codable {
+    static let label = "portpilot-export-page-v1"
+    static func aad(_ actor: String, _ id: UUID, _ epoch: Int) -> Data { Data("\(label)|\(actor)|\(id.uuidString)|\(epoch)".utf8) }
     var v = 1
     var actor: String
     var enrollmentId: UUID
@@ -639,10 +700,10 @@ extension ManagedRegistry {
             e = book.enrollments[i]
         }
         var data: [String: ManagedJSON] = [
-            "protocolVersion": .integer(1), "notificationSchema": .integer(1), "enrollmentId": .string(e.id.uuidString),
+            "protocolVersion": .integer(1), "notificationSchema": .integer(ManagedNotificationContract.pageSchema), "enrollmentId": .string(e.id.uuidString),
             "epoch": .integer(e.epoch), "state": .string(e.state.rawValue), "acknowledged": .bool(e.state == .acknowledged)]
         if e.state == .revoked || e.state == .acknowledged, let challenge = e.shutdownChallenge { data["challenge"] = .string(challenge) }
-        return ManagedResponse(requestId: request.requestId, revision: state.revision, data: .object(data))
+        return ManagedResponse(requestId: request.requestId, revision: 0, data: .object(data))
     }
 
     private func controlAck(_ request: ManagedRequest, actor: ManagedExportActor) throws -> ManagedResponse {
@@ -659,7 +720,7 @@ extension ManagedRegistry {
             book.enrollments[i].acknowledgedAt = now()
             try persistExport(book)   // durable before the agent is told shutdown is confirmed
         }
-        return ManagedResponse(requestId: request.requestId, revision: state.revision, data: .object(["acknowledged": .bool(true)]))
+        return ManagedResponse(requestId: request.requestId, revision: 0, data: .object(["acknowledged": .bool(true)]))
     }
 
     // MARK: notifications.list
@@ -735,15 +796,6 @@ extension ManagedRegistry {
         return ManagedDigest.keyed(try ManagedDigest.canonical(stable), key: key)
     }
 
-    private func b64url(_ data: Data) -> String {
-        data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-    }
-    private func unb64url(_ string: String) -> Data? {
-        var s = string.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        while s.count % 4 != 0 { s += "=" }
-        return Data(base64Encoded: s)
-    }
-
     private func listNotifications(_ request: ManagedRequest, actor: ManagedExportActor) throws -> ManagedResponse {
         guard let e = enrollment(for: actor), e.state == .active, let key = Data(base64Encoded: e.refKey) else { throw ManagedError.unauthorized }
         guard !recoveryRequired else { throw ManagedError.recoveryRequired }
@@ -760,18 +812,19 @@ extension ManagedRegistry {
         var mode = Mode.snapshot, after = 0, hwm = state.lastEventSequence, offset = 0
         var tokenDigest: String?
         if let raw = request.payload["pageToken"] {
-            guard let text = raw.string, let dot = text.lastIndex(of: "."), text.utf8.count <= 2048,
-                  let body = unb64url(String(text[..<dot])),
-                  let token = try? JSONDecoder().decode(ManagedPageToken.self, from: body), token.v == 1,
+            guard let text = raw.string, text.utf8.count <= 2048 else { throw ManagedError.invalidInput }
+            // Sealed (AES-GCM), not just signed: the agent cannot read after/hwm/offset. Opening fails for
+            // tampering, another actor, enrollment, epoch or key.
+            let body = try ManagedSealed.open(text, refKey: key, label: ManagedPageToken.label, aad: ManagedPageToken.aad(actor.id, e.id, e.epoch))
+            guard let token = try? JSONDecoder().decode(ManagedPageToken.self, from: body), token.v == 1,
                   let parsedMode = Mode(rawValue: token.mode), token.offset >= 0, token.after >= 0 else { throw ManagedError.invalidInput }
-            let mac = ManagedDigest.keyed(Data(text[..<dot].utf8), key: key)
-            guard ManagedExportStore.equal(mac, String(text[text.index(after: dot)...])), token.actor == actor.id,
-                  token.enrollmentId == e.id, token.epoch == e.epoch, token.selectionDigest == selection else { throw ManagedError.unauthorized }
+            guard token.actor == actor.id, token.enrollmentId == e.id, token.epoch == e.epoch, token.selectionDigest == selection else { throw ManagedError.unauthorized }
             guard token.bootNonce == exportBootNonce else { throw ManagedError.resyncRequired }   // helper restarted
             mode = parsedMode; after = token.after; hwm = token.hwm; offset = token.offset; tokenDigest = token.snapshotDigest
         } else if let value = request.payload["after"] {
-            guard let n = value.integer, n >= 0 else { throw ManagedError.invalidInput }
-            mode = .changes; after = n
+            guard let text = value.string else { throw ManagedError.invalidInput }
+            mode = .changes
+            after = try ManagedChangeCursor.open(text, refKey: key, enrollmentId: e.id, epoch: e.epoch).seq
         }
         if mode == .changes, after < firstRetained - 1 || after > state.lastEventSequence { throw ManagedError.resyncRequired }
         let all = records(mode: mode, after: after, hwm: hwm, enrollment: e, key: key)
@@ -792,12 +845,15 @@ extension ManagedRegistry {
         if offset + page.count < all.count {
             let token = ManagedPageToken(actor: actor.id, enrollmentId: e.id, epoch: e.epoch, selectionDigest: selection,
                 snapshotDigest: snapshotDigest, mode: mode.rawValue, after: after, hwm: hwm, offset: offset + page.count, bootNonce: exportBootNonce)
-            let body = b64url(try ManagedDigest.canonical(token))
-            next = .string(body + "." + ManagedDigest.keyed(Data(body.utf8), key: key))
+            next = .string(try ManagedSealed.seal(try ManagedDigest.canonical(token), refKey: key, label: ManagedPageToken.label,
+                                                  aad: ManagedPageToken.aad(actor.id, e.id, e.epoch)))
         }
-        return ManagedResponse(requestId: request.requestId, revision: state.revision, data: .object([
-            "schemaVersion": .integer(1), "enrollmentEpoch": .integer(e.epoch), "snapshotId": .string(String(snapshotDigest.prefix(16))),
-            "highWaterMark": .integer(hwm),
+        let changeCursor = try ManagedChangeCursor(enrollmentId: e.id, epoch: e.epoch, seq: hwm).seal(refKey: key)
+        // revision 0: the registry revision counts changes to every service, selected or not.
+        return ManagedResponse(requestId: request.requestId, revision: 0, data: .object([
+            "schemaVersion": .integer(ManagedNotificationContract.pageSchema), "enrollmentEpoch": .integer(e.epoch),
+            "snapshotId": .string(String(snapshotDigest.prefix(16))),
+            "changeCursor": .string(changeCursor),
             "helperInstance": .string(String(ManagedDigest.keyed(Data("helper|\(exportBootNonce)".utf8), key: key).prefix(16))),
             "records": .array(try page.map { try .value($0) }), "nextPageToken": next]))
     }
