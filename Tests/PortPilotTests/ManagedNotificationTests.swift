@@ -599,6 +599,88 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         await aEqual(await list(e, c).revision, 0, "revoked reads fail with revision 0")
     }
 
+    /// Asserts a dead export credential gets `.unauthorized` and revision 0 on both export surfaces.
+    private func assertDeadCredentialSeesNoRevision(_ e: Env, _ c: Creds, _ why: String, file: StaticString = #filePath, line: UInt = #line) async {
+        let p = await poll(e, c), l = await list(e, c)
+        XCTAssertEqual(p.error, .unauthorized, "poll \(why)", file: file, line: line)
+        XCTAssertEqual(p.revision, 0, "poll \(why) leaked the global revision", file: file, line: line)
+        XCTAssertEqual(l.error, .unauthorized, "list \(why)", file: file, line: line)
+        XCTAssertEqual(l.revision, 0, "list \(why) leaked the global revision", file: file, line: line)
+    }
+
+    func testAbandonedAgentUnauthorizedErrorsCarryNoGlobalRevision() async throws {
+        // Bug caught: the pre-export credential guard replying with the live registry revision to a retired agent after export.abandon.
+        let e = try env()
+        let c = try await enroll(e, [e.services[0]])
+        await aNil(await disable(e, c).error)
+        await aNil(await call(e, "export.abandon", ["enrollmentId": .string(c.enrollmentId.uuidString), "acknowledgeUnconfirmed": .bool(true)]).error)
+        _ = try await propose(e, e.services[1])   // activity on another service moves the global revision
+        await assertDeadCredentialSeesNoRevision(e, c, "after abandon")
+    }
+
+    func testAuthenticatedUserErrorResponseKeepsLiveGlobalRevision() async throws {
+        // Bug caught: an authenticated user's error response must keep carrying the live revision so the GUI can resync; zeroing it on every error would leave it stuck on a stale view.
+        let e = try env()
+        _ = try await propose(e, e.services[1])   // activity raises the global revision
+        let stale = await call(e, "operation.propose", revision: 999,
+                               ["serviceId": .string(e.services[0].id.uuidString), "action": .string("stop")])
+        XCTAssertEqual(stale.error, .staleRevision)   // fails after authentication
+        let live = await call(e, "status").revision
+        XCTAssertGreaterThan(live, 0)
+        XCTAssertEqual(stale.revision, live, "authenticated error lost the live global revision")
+    }
+
+    func testRemovedAgentUnauthorizedErrorsCarryNoGlobalRevision() async throws {
+        // Bug caught: the pre-export credential guard replying with the live registry revision to a retired agent after export.remove_agent.
+        let e = try env()
+        let c = try await enroll(e, [e.services[0]])
+        try await shutDown(e, c)
+        await aNil(await call(e, "export.remove_agent", ["enrollmentId": .string(c.enrollmentId.uuidString)]).error)
+        _ = try await propose(e, e.services[1])
+        await assertDeadCredentialSeesNoRevision(e, c, "after remove_agent")
+    }
+
+    func testReplacedEnrollmentCredentialUnauthorizedErrorsCarryNoGlobalRevision() async throws {
+        // Bug caught: credentials superseded by a newer enrollment getting the live registry revision on their unauthorized error.
+        let e = try env()
+        let old = try await enroll(e, [e.services[0]])
+        try await shutDown(e, old)
+        _ = try await enroll(e, [e.services[1]])
+        _ = try await propose(e, e.services[1])
+        await assertDeadCredentialSeesNoRevision(e, old, "after replacement")
+    }
+
+    func testExportFaultUnauthorizedErrorsCarryNoGlobalRevision() async throws {
+        // Bug caught: while the sidecar is faulted every export credential fails auth, and that error echoed the live revision.
+        let root = try directory(); let disk = try ManagedPersistence(root: root)
+        try disk.write("export-state.json", data: Data("not json".utf8))
+        var state = ManagedState(); state.services = [seededService(name: "alpha")]; try disk.commit(state)
+        let registry = ManagedRegistry(persistence: disk, actors: actors, identity: { _ in nil })
+        let e = Env(registry: registry, disk: disk, root: root, clock: Clock(), services: state.services)
+        _ = try await propose(e, state.services[0])
+        for (op, actor) in [("notifications.list", "export-notify-x"), ("export.control.poll", "export-control-x")] {
+            let r = await call(e, op, actor: actor, token: "t")
+            XCTAssertEqual(r.error, .unauthorized, op)
+            XCTAssertEqual(r.revision, 0, "\(op) under export fault leaked the global revision")
+        }
+    }
+
+    func testBadProtocolVersionResponseCarriesNoGlobalRevision() async throws {
+        // Bug caught: the protocol check runs before authentication, so its error must not reveal the live revision to anyone.
+        let e = try env()
+        let c = try await enroll(e, [e.services[0]])
+        _ = try await propose(e, e.services[1])
+        var request = ManagedRequest(operation: "notifications.list", actor: c.notify.actor, credential: c.notify.token)
+        request.protocolVersion = 2
+        let exportCaller = await e.registry.handle(request)
+        XCTAssertEqual(exportCaller.error, .protocolMismatch)
+        XCTAssertEqual(exportCaller.revision, 0)
+        var unknown = ManagedRequest(operation: "services.list", actor: "nobody", credential: "bad")
+        unknown.protocolVersion = 2
+        await aEqual(await e.registry.handle(unknown).revision, 0)
+        await aEqual(await call(e, "services.list", actor: "nobody", token: "bad").revision, 0, "unknown actor")
+    }
+
     func testControlPollSchemaAnnouncesNotificationSchema2() async throws {
         // Bug caught: control channel still announcing schema 1 so an agent trusts the wrong page shape.
         let e = try env()

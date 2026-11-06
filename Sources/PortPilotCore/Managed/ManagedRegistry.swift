@@ -159,6 +159,10 @@ public actor ManagedRegistry {
         try commit(candidate)
     }
     public func handle(_ request: ManagedRequest, peer: ManagedIncarnation? = nil) -> ManagedResponse {
+        // The global revision moves with activity on every service, so it is only ever shown to an
+        // authenticated legacy caller. Any failure before that point (bad protocol version, unknown,
+        // retired, replaced or faulted credential) reports 0.
+        var authenticatedLegacy = false
         do {
             guard request.protocolVersion == 1 else { throw ManagedError.protocolMismatch }
             // Separate authority tables, no fallback: a legacy credential is tried first;
@@ -167,6 +171,7 @@ public actor ManagedRegistry {
                 ManagedDigest.hash(Data(request.credential.utf8)) == $0.credentialHash })
             let exportActor = legacy == nil ? authenticateExport(request) : nil
             guard legacy != nil || exportActor != nil else { throw ManagedError.unauthorized }
+            authenticatedLegacy = legacy != nil
             if now() < lastWallTime {
                 for i in state.operations.indices { state.operations[i].approved = false }
                 approvalDeadlines.removeAll()
@@ -234,7 +239,10 @@ public actor ManagedRegistry {
                 if !(error is ManagedError) || error as? ManagedError == .recoveryRequired { recoveryRequired = true }
                 throw error
             }
-        } catch { return ManagedResponse(requestId: request.requestId, revision: state.revision, error: error as? ManagedError ?? .recoveryRequired) }
+        } catch {
+            return ManagedResponse(requestId: request.requestId, revision: authenticatedLegacy ? state.revision : 0,
+                                   error: error as? ManagedError ?? .recoveryRequired)
+        }
     }
     private func uuid(_ request: ManagedRequest, _ key: String) throws -> UUID {
         guard let value = request.payload[key]?.string, let id = UUID(uuidString: value) else { throw ManagedError.invalidInput }; return id
