@@ -47,8 +47,17 @@ new_case() {
 }
 
 # make_manifest [template args...]: writes $MANIFEST for HEAD of main.
+# timed: run a command with a hard 120 s limit (a hang is a failure, not a stuck suite).
+timed() {
+    python3 -I -c 'import subprocess,sys
+try:
+    p = subprocess.run(sys.argv[1:], stdout=subprocess.PIPE, timeout=120)
+except subprocess.TimeoutExpired:
+    print("TIMEOUT"); sys.exit(124)
+sys.stdout.buffer.write(p.stdout); sys.exit(p.returncode)' "$@"
+}
 make_manifest() {
-    python3 -I "$AUDIT" --print-manifest-template --repo "$REPO" --rev HEAD --ref main "$@" > "$MANIFEST"
+    timed python3 -I "$AUDIT" --print-manifest-template --repo "$REPO" --rev HEAD --ref main "$@" > "$MANIFEST"
 }
 # make_review [decision]: binds a review to the current manifest.
 make_review() {
@@ -57,7 +66,7 @@ make_review() {
 }
 # run_audit: sets OUT and RC (stdout+stderr combined).
 run_audit() {
-    OUT=$(python3 -I "$AUDIT" --manifest "$MANIFEST" --manual-review "$REVIEW" --receipt "$RECEIPT" 2>&1)
+    OUT=$(timed python3 -I "$AUDIT" --manifest "$MANIFEST" --manual-review "$REVIEW" --receipt "$RECEIPT" 2>&1)
     RC=$?
 }
 prepare() { make_manifest "$@"; make_review; }
@@ -463,6 +472,176 @@ if command -v xattr >/dev/null 2>&1; then
 else
     echo "   SKIP xattr not available"
 fi
+
+
+# ---- fail-open regressions (each case names the bug it catches)
+N_LOC="loc""person"
+TOK="gh""p_abcdefghijklmnopqrstuvwxyz0123456789"
+
+start "git replace ref hiding a dirty blob behind a clean one still fails (replace refs must not rewrite audited content)"
+new_case; printf 'note %s\n' "$SENT" > "$REPO/docs/d.md"; printf 'clean\n' > "$REPO/docs/clean.md"; commit_all "pair"
+DIRTY=$(git -C "$REPO" rev-parse HEAD:docs/d.md); CLEAN=$(git -C "$REPO" rev-parse HEAD:docs/clean.md)
+git -C "$REPO" replace "$DIRTY" "$CLEAN"; prepare
+expect_fail "replace ref" "sentinel"
+
+start "shallow repository fails closed (missing history cannot be audited)"
+new_case; git -C "$REPO" commit -q --allow-empty -m second; git -C "$REPO" rev-parse HEAD > "$REPO/.git/shallow"; prepare
+expect_fail "shallow" "shallow_repo"
+
+start "repository with info/grafts fails closed (grafts rewrite history the push does not see)"
+new_case; git -C "$REPO" commit -q --allow-empty -m second; mkdir -p "$REPO/.git/info"
+git -C "$REPO" rev-parse HEAD > "$REPO/.git/info/grafts"; prepare
+expect_fail "grafts" "grafts_present"
+
+start "unreadable subdirectory in an artifact dir is a finding (silently dropped from scan and hash otherwise)"
+new_case; mkdir -p "$ART/Dir.app/locked"; printf '%s\n' "$SENT" > "$ART/Dir.app/locked/s.txt"
+chmod 000 "$ART/Dir.app/locked"; prepare --artifact "$ART/Dir.app"
+run_audit; chmod 755 "$ART/Dir.app/locked"
+assert_eq "unreadable dir: exit 1" "$RC" 1
+assert_contains "unreadable dir: reports unreadable" "$OUT" "FINDING unreadable"
+assert_contains "unreadable dir: location names it" "$OUT" "locked"
+assert_absent "unreadable dir: no receipt" "$RECEIPT"
+
+start "tar.gz of two concatenated tars: second tar's contents are scanned (tarfile stops at first end-of-archive)"
+new_case
+python3 -I - "$ART/two.tar.gz" "$SENT" <<'PY'
+import gzip, io, sys, tarfile
+def mk(name, data):
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:") as t:
+        i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))
+    return b.getvalue()
+open(sys.argv[1], "wb").write(gzip.compress(mk("a.txt", b"clean\n") + mk("b.txt", sys.argv[2].encode())))
+PY
+prepare --artifact "$ART/two.tar.gz"
+expect_fail "concatenated tars in gzip" "sentinel"
+
+start "plain .tar of two concatenated tars: gzip nested inside the second tar is still opened"
+new_case
+python3 -I - "$ART/two.tar" "$SENT" <<'PY'
+import gzip, io, sys, tarfile
+def mk(name, data):
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:") as t:
+        i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))
+    return b.getvalue()
+hidden = gzip.compress(sys.argv[2].encode())
+open(sys.argv[1], "wb").write(mk("a.txt", b"clean\n") + mk("n.txt.gz", hidden))
+PY
+prepare --artifact "$ART/two.tar"
+expect_fail "concatenated plain tars" "sentinel"
+
+start "sentinel in a tracked directory name or file name fails (tree objects were skipped)"
+new_case; mkdir "$REPO/dir_$SENT"; printf 'ok\n' > "$REPO/dir_$SENT/x.txt"; commit_all "dirname"; prepare
+expect_fail "directory name" "sentinel"
+new_case; printf 'ok\n' > "$REPO/docs/$SENT.txt"; commit_all "filename"; prepare
+expect_fail "file name" "sentinel"
+
+start "tree with a sentinel name reachable from the published base is still not re-audited"
+new_case; mkdir "$REPO/dir_$SENT"; printf 'ok\n' > "$REPO/dir_$SENT/x.txt"; commit_all "dirname"; mk_pub_ref
+git -C "$REPO" commit -q --allow-empty -m next; prepare --published-base origin/main
+run_audit
+assert_eq "published tree: exit 0" "$RC" 0
+
+start "sentinel in an artifact directory entry name or subdirectory name fails (names only hit the filename list)"
+new_case; mkdir "$ART/Dir.app"; printf 'clean\n' > "$ART/Dir.app/$SENT.txt"; prepare --artifact "$ART/Dir.app"
+expect_fail "artifact file name" "sentinel"
+new_case; mkdir -p "$ART/Dir.app/${SENT}_d"; printf 'clean\n' > "$ART/Dir.app/${SENT}_d/x.txt"; prepare --artifact "$ART/Dir.app"
+expect_fail "artifact subdirectory name" "sentinel"
+
+start "sentinel in an archive member name fails (zip and tar.gz)"
+new_case
+python3 -I - "$ART" "$SENT" <<'PY'
+import gzip, io, os, sys, tarfile, zipfile
+d, s = sys.argv[1], sys.argv[2]
+z = zipfile.ZipFile(os.path.join(d, "n.zip"), "w"); z.writestr(s + ".txt", "x"); z.close()
+b = io.BytesIO()
+with tarfile.open(fileobj=b, mode="w:") as t:
+    i = tarfile.TarInfo(s + ".txt"); i.size = 1; t.addfile(i, io.BytesIO(b"x"))
+open(os.path.join(d, "n.tar.gz"), "wb").write(gzip.compress(b.getvalue()))
+PY
+prepare --artifact "$ART/n.zip"
+expect_fail "zip member name" "sentinel"
+make_manifest --artifact "$ART/n.tar.gz"; make_review
+expect_fail "tar.gz member name" "sentinel"
+
+start "git cat-file stream cut short is object_unreadable, not scanned as complete (short read / EOF in skip loop)"
+mk_fake_git() { # $1 = shell snippet run in place of `git ... cat-file ...`
+    FAKEBIN="$CASE/fakebin"; mkdir -p "$FAKEBIN"
+    printf '#!/bin/sh\ncase " $* " in *" cat-file "*) %s ;; esac\nexec "%s" "$@"\n' "$1" "$(command -v git)" > "$FAKEBIN/git"
+    chmod +x "$FAKEBIN/git"
+}
+run_audit_fake() { OLDPATH=$PATH; PATH="$FAKEBIN:$PATH"; run_audit; PATH=$OLDPATH; }
+new_case; prepare
+mk_fake_git 'read line; printf "%s blob 100\n" "$line"; printf short; exit 0'
+run_audit_fake
+assert_eq "short read: exit 1" "$RC" 1
+assert_contains "short read: object_unreadable" "$OUT" "object_unreadable"
+assert_absent "short read: no receipt" "$RECEIPT"
+mk_fake_git 'read line; printf "%s blob 99999999999\n" "$line"; printf short; exit 0'
+run_audit_fake
+assert_eq "EOF in skip loop: exit 1 (no hang)" "$RC" 1
+assert_contains "EOF in skip loop: object_unreadable" "$OUT" "object_unreadable"
+assert_not_contains "EOF in skip loop: no timeout" "$OUT" "TIMEOUT"
+
+start "FIFO inside an artifact directory is a finding and does not hang (open() on a FIFO blocks forever)"
+new_case; mkdir "$ART/Dir.app"; printf 'x\n' > "$ART/Dir.app/ok.txt"; mkfifo "$ART/Dir.app/pipe"
+make_manifest --artifact "$ART/Dir.app"; make_review
+assert_not_contains "manifest build did not hang" "$(cat "$MANIFEST")" "TIMEOUT"
+run_audit
+assert_eq "fifo: exit 1" "$RC" 1
+assert_contains "fifo: reports special_file" "$OUT" "special_file"
+assert_not_contains "fifo: no timeout" "$OUT" "TIMEOUT"
+
+png_with() { # out, chunk type, python expression for the chunk body
+    python3 -I - "$1" "$2" "$3" <<'PY'
+import struct, sys, zlib
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+kind, body = sys.argv[2].encode(), eval(sys.argv[3])
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+png += chunk(kind, body) + chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+}
+start "PNG zTXt payload over the cap is too_large, corrupt zTXt is unreadable, small valid zTXt passes (silent truncation)"
+new_case
+png_with "$ART/big.png" zTXt 'b"k\0\0" + zlib.compress(b"\0" * (65 * 1024 * 1024))'
+prepare --artifact "$ART/big.png"
+expect_fail "oversized zTXt" "too_large"
+new_case
+png_with "$ART/bad.png" zTXt 'b"k\0\0" + b"this is not zlib data"'
+prepare --artifact "$ART/bad.png"
+run_audit
+assert_eq "corrupt zTXt: exit 1" "$RC" 1
+assert_contains "corrupt zTXt: unreadable" "$OUT" "FINDING unreadable"
+new_case
+png_with "$ART/ok.png" zTXt 'b"k\0\0" + zlib.compress(b"hello")'
+prepare --artifact "$ART/ok.png"
+run_audit
+assert_eq "valid zTXt: exit 0" "$RC" 0
+
+start "more than 256 extended attributes is a too_large finding (list was silently cut at 256)"
+if command -v xattr >/dev/null 2>&1; then
+    new_case; printf 'clean\n' > "$ART/many.txt"
+    i=0; while [ "$i" -lt 270 ]; do xattr -w "com.example.k$i" v "$ART/many.txt"; i=$((i + 1)); done
+    prepare --artifact "$ART/many.txt"
+    run_audit
+    assert_eq "many xattrs: exit 1" "$RC" 1
+    assert_contains "many xattrs: too_large" "$OUT" "too_large"
+    assert_contains "many xattrs: location marks xattr" "$OUT" "xattr"
+else
+    echo "   SKIP xattr not available"
+fi
+
+start "locations never print secrets or home paths from names (redaction covered only sentinel and private patterns)"
+new_case; mkdir -p "$REPO/a$U$N_LOC" "$REPO/$TOK"
+printf 'x\n' > "$REPO/a$U$N_LOC/.env"; printf 'x\n' > "$REPO/$TOK/.env"; commit_all "named"; prepare
+run_audit
+assert_eq "redaction: exit 1" "$RC" 1
+assert_contains "redaction: findings still reported" "$OUT" "forbidden_file"
+assert_not_contains "home name not printed" "$OUT" "$N_LOC"
+assert_not_contains "token not printed" "$OUT" "$TOK"
 
 printf '\n== publication audit tests: %s passed, %s failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
