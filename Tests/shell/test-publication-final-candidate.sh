@@ -161,5 +161,23 @@ python3 -I "$AUDIT" --manifest "$MANIFEST" --manual-review "$REVIEW" --receipt "
 assert_eq "exit 2" "$?" 2
 [ ! -e "$RECEIPT" ] && ok "no receipt written" || bad "receipt written without pinned patterns"
 
+start "changing publishedBase after a pass invalidates acceptance (base is bound by the receipt)"
+# Bug caught: a widened/moved published base leaving an old receipt valid.
+CASE=$(mktemp -d "$ROOT/case.XXXXXX")
+REPO="$CASE/repo"; PROT="$CASE/protected"; mkdir -p "$REPO" "$PROT"
+git init -q -b main "$REPO"
+printf '# demo\n' > "$REPO/README.md"; git -C "$REPO" add -A && git -C "$REPO" commit -q -m one
+git -C "$REPO" update-ref refs/remotes/origin/main HEAD
+printf 'two\n' >> "$REPO/README.md"; git -C "$REPO" commit -q -am two
+MANIFEST="$PROT/manifest.json"; REVIEW="$PROT/review.json"; RECEIPT="$PROT/receipt.json"
+python3 -I "$AUDIT" --print-manifest-template --repo "$REPO" --rev HEAD --ref main --published-base origin/main > "$MANIFEST"
+printf '{"schemaVersion":1,"manifestSha256":"%s","decision":"approved","reviewer":"Test Reviewer","date":"2026-01-02","personalDataReviewedManually":true}\n' "$(sha "$MANIFEST")" > "$REVIEW"
+assert_eq "baseline audit exit 0" "$(audit; echo $?)" 0
+assert_eq "baseline verify exit 0" "$(verify; echo $?)" 0
+git -C "$REPO" update-ref refs/remotes/origin/main HEAD
+python3 -I "$AUDIT" --print-manifest-template --repo "$REPO" --rev HEAD --ref main --published-base origin/main > "$MANIFEST"
+printf '{"schemaVersion":1,"manifestSha256":"%s","decision":"approved","reviewer":"Test Reviewer","date":"2026-01-02","personalDataReviewedManually":true}\n' "$(sha "$MANIFEST")" > "$REVIEW"
+verify; assert_ne "verify rejects receipt after base moved" "$?" 0
+
 printf '\n== final candidate tests: %s passed, %s failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

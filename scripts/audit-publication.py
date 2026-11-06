@@ -9,7 +9,7 @@ to a manual privacy review, and writes a receipt only when everything passes.
   audit-publication.py --print-manifest-template --repo PATH --rev REV
                        [--ref NAME ...] [--artifact PATH ...]
                        [--include-untracked PATH ...] [--text PATH ...]
-                       [--private-patterns PATH]
+                       [--private-patterns PATH] [--published-base REF]
 
 Exit codes: 0 pass, 1 audit findings or mismatch, 2 usage / incomplete inputs.
 
@@ -55,7 +55,9 @@ EXIT_PASS, EXIT_FINDINGS, EXIT_USAGE = 0, 1, 2
 # --------------------------------------------------------------------- patterns
 # Name may end at "/", end of input, a quote, whitespace or any other delimiter.
 HOME_RX = re.compile(rb"/Users/([A-Za-z0-9._-]+)(?![A-Za-z0-9._-])")
-HOME_ALLOW = {b"Shared"}
+# Allowed /Users/<name> values: the macOS shared folder, plus obviously synthetic
+# placeholder names that tests and doc comments use instead of a real username.
+HOME_ALLOW = {b"Shared", b"someone", b"example"}
 SECRET_PATTERNS = [
     ("sentinel", re.compile(rb"PRIVATE_SENTINEL_[0-9]+")),
     ("secret_pem", re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")),
@@ -203,9 +205,12 @@ class Findings:
 
 # ---------------------------------------------------------------------- scanner
 class Scanner:
-    def __init__(self, findings, private_rx):
+    def __init__(self, findings, private_rx, published=frozenset()):
         self.f = findings
         self.private_rx = private_rx
+        # Object ids already public (reachable from the declared published base).
+        self.published = published
+        self.skipped_public = set()
         self.archive_budget = MAX_ARCHIVE_TOTAL_BYTES
 
     def scan_bytes(self, data, loc):
@@ -374,9 +379,8 @@ def decompress_bounded(data, kind):
         if len(out) > MAX_FILE_BYTES:
             raise _TooLarge()
         if not d.eof:
-            # Not finished: either input ran out (truncated) or the cap hit.
-            if len(out) >= MAX_FILE_BYTES:
-                raise _TooLarge()
+            # The cap is enforced above (max_length is one byte past it), so an
+            # unfinished stream here means the input ran out: truncated.
             raise EOFError("truncated stream")
         rest = d.unused_data
     return bytes(out)
@@ -573,6 +577,15 @@ def validate_manifest(m):
     for item in require_list(m, "nestedRepos"):
         if not isinstance(item, str):
             raise UsageError("manifest nestedRepos entry invalid")
+    pb = m.get("publishedBase")
+    if pb is not None and not (
+        isinstance(pb, dict)
+        and isinstance(pb.get("ref"), str)
+        and pb["ref"]
+        and isinstance(pb.get("sha"), str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", pb["sha"])
+    ):
+        raise UsageError("manifest publishedBase invalid")
     ppf = m.get("privatePatternsFile")
     if ppf is not None and not (isinstance(ppf, str) and ppf):
         raise UsageError("manifest privatePatternsFile invalid")
@@ -650,6 +663,24 @@ def rev_parse(repo, name):
     return git(repo, "rev-parse", "--verify", "--quiet", name).decode().strip()
 
 
+def load_published_base(repo, manifest, findings):
+    """Return the set of object ids reachable from the declared published base.
+    The ref must resolve to exactly the declared sha; otherwise report
+    published_base_mismatch and treat nothing as public (everything is scanned)."""
+    pb = manifest.get("publishedBase")
+    if pb is None:
+        return frozenset()
+    try:
+        actual = rev_parse(repo, pb["ref"] + "^{commit}")
+        if actual != pb["sha"]:
+            raise GitError("sha differs")
+        listing = git(repo, "rev-list", "--objects", actual).decode("utf-8", "replace")
+    except GitError:
+        findings.add("published_base_mismatch", "publishedBase")
+        return frozenset()
+    return frozenset(line.split(" ", 1)[0] for line in listing.splitlines() if line)
+
+
 def audit_candidate(repo, manifest, scanner):
     f = scanner.f
     cand = manifest["candidate"]
@@ -693,6 +724,12 @@ def audit_candidate(repo, manifest, scanner):
 
 
 def scan_git_object(reader, sha, path, loc, scanner):
+    if sha in scanner.published:
+        # Already public: content is not re-audited, but name policy still applies.
+        scanner.skipped_public.add(sha)
+        if path and forbidden_name(os.path.basename(path)):
+            scanner.f.add("forbidden_file", loc)
+        return
     try:
         otype, size, data = reader.get(sha)
     except GitError:
@@ -854,12 +891,18 @@ def run_audit(args, write_receipt):
     review_sha = sha256_bytes(review_raw)
     validate_review(review, manifest_sha, findings)
 
-    scanner = Scanner(findings, private_rx)
+    published = load_published_base(toplevel, manifest, findings)
+    scanner = Scanner(findings, private_rx, published)
     audit_candidate(toplevel, manifest, scanner)
     audit_dirty(toplevel, manifest, findings)
     audit_included(toplevel, manifest, scanner)
     audit_external(manifest, base, "artifacts", "artifact", scanner)
     audit_external(manifest, base, "texts", "text", scanner)
+    if published:
+        print(
+            f"NOTE: {len(scanner.skipped_public)} objects already public at "
+            f"{manifest['publishedBase']['sha'][:12]} were not re-audited"
+        )
 
     receipt = {
         "schemaVersion": SCHEMA_VERSION,
@@ -873,6 +916,7 @@ def run_audit(args, write_receipt):
         "artifacts": manifest.get("artifacts", []),
         "texts": manifest.get("texts", []),
         "privatePatternsSha256": patterns_sha,
+        "publishedBase": manifest.get("publishedBase"),
     }
     return findings, receipt, receipt_path, write_receipt
 
@@ -955,6 +999,7 @@ def cmd_verify(args):
             "artifacts",
             "texts",
             "privatePatternsSha256",
+            "publishedBase",
         ):
             if stored.get(key) != receipt[key]:
                 findings.add("receipt_mismatch", f"receipt:{key}")
@@ -1015,6 +1060,14 @@ def cmd_template(args):
             for p in args.text or []
         ],
     }
+    if args.published_base:
+        try:
+            manifest["publishedBase"] = {
+                "ref": args.published_base,
+                "sha": rev_parse(toplevel, args.published_base + "^{commit}"),
+            }
+        except GitError:
+            raise UsageError("published base ref could not be resolved")
     if args.private_patterns:
         pp = os.path.abspath(args.private_patterns)
         manifest["privatePatternsFile"] = pp
@@ -1038,6 +1091,7 @@ def build_parser():
     p.add_argument("--include-untracked", action="append")
     p.add_argument("--text", action="append")
     p.add_argument("--private-patterns")
+    p.add_argument("--published-base")
     return p
 
 
