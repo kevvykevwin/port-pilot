@@ -16,3 +16,26 @@ xcuserdata/
 *.dSYM
 Package.resolved
 .DS_Store
+
+# Publication / private-coordination defense in depth (not proof; see audit-publication.py)
+credential-*.json
+gui-credential.json
+actors.json
+export-*.json
+private-config.json
+*.receipt.json
+.env
+.env.*
+private/
+
+# Personal planning notes and bridge evidence: kept locally, never published
+spec-portpilot-*.md
+plan-portpilot-*.xml
+plans/
+DevDocs/coordination-component-map.md
+DevDocs/managed-servers-implementation.md
+DevDocs/plan-review-*.md
+DevDocs/t3-coordination-permissions.md
+scripts/inspect-t3-permissions.cjs
+Tests/fixtures/t3-permissions-*.json
+__pycache__/
