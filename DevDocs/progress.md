@@ -1,11 +1,46 @@
 # Port Pilot — Progress
 
+> Personal planning notes (specs, plans, reviews, bridge evidence) are gitignored and kept locally; links to them from this log resolve only on the author's machine.
+
+## Private-coordination P0 + P1 implemented — 2026-11-06
+
+- **P0 publication audit**: `scripts/audit-publication.py` (manifest + manual review + receipt, hash-pinned candidate/refs/history/artifacts/patterns file; reports category + location only, never matched values). Fixtures: `Tests/shell/test-publication-audit.sh` 120/120, `Tests/shell/test-publication-final-candidate.sh` (P4 mutation invalidation) 30/30. `.gitignore` defense-in-depth entries added.
+- **P1 notification contract**: `ManagedExport.swift` adds the `notification_read` / `export_control` actors in a versioned sidecar (`export-state.json`; legacy `actors.json` untouched), `notifications.list` allowlisted projection with HMAC refs, epoch-bound authenticated page tokens, replacement-only consent, control-only shutdown acknowledgement bound to the registered agent instance, revocation tombstones, `PortPilotHelper --capabilities`, and helper-replacement preflight in `managed-helper.py`. UI: `ManagedExportView.swift` (default off).
+- **Review**: opus structural review found 3 P1s (non-durable disable, fixed agent instance, compressed archives escaping audit) + P2s; all fixed. Mutation-checked the two P1 regression tests (each fails when its fix is reverted).
+- **Verified 2026-11-06**: `swift test` 217 tests, 0 failures; `swift build -c release` ok; pytest `test_managed_helper.py` 22 passed; `test-auto-update.sh` 132 passed; `test-managed-packaging.sh` PASS; `git diff --check` clean.
+- **Open**: PC15 manual keyboard/VoiceOver acceptance (view compiled only, never opened). `highWaterMark` is the global event sequence (reveals activity volume on unselected services — deferred). Decompression-bomb cap path untested. P2/P3 blocked on a confirmed private workspace; P0 evidence move blocked on a confirmed private destination. P4 needs the final candidate, a manual privacy review and protected receipt paths. Audit flagged personal paths/bridge details in DevDocs notes, `plans/`, specs, some sources/tests and `scripts/inspect-t3-permissions.cjs` — manual review required before any publication.
+- Nothing committed, installed, released or pushed.
+- **Helper-verified agent takeover (2026-11-06, user decision)**: a restarted agent may confirm shutdown after disable only when the helper proves the previously registered agent process has exited. The helper uses the kernel peer PID (`LOCAL_PEERPID`) plus process start time, recorded at each control poll. A live predecessor, or a registration with no recorded process, keeps the fence unconfirmed. Spec "Revocation fence" plus 2 edge cases and 1 test case were amended. `swift test` 226/0, private fixtures 90/0. Live end-to-end on a temporary state directory (real debug helper, real CLI-launched service, real agent, fake inbox):
+  - one coalesced message ("Service 1: Stop request needs your decision…")
+  - no path, name, actor, address, port or PID in the delivered bytes
+  - disable led to a confirmed acknowledgement with zero sends after the fence
+  - a hung real predecessor process blocked takeover; after it was killed, the successor took over and confirmed (`agentTakeover` true), with zero sends
+- **P2 (private, 2026-11-06)**: user confirmed the private workspace as a sibling repo outside this tree. The notification agent there passes 85 fixture tests against a fake helper and a fake receiver. The real Unix-socket transport was smoke-tested against a real debug helper using a temporary state directory: the framing round-trips, and forged export credentials and the user credential calling `notifications.list` are refused. A full real-helper enrollment run has not been done, because it needs a registered service. There is no provider adapter or live delivery. The private evidence destination is still unconfirmed.
+
+## Fresh plan review amendments applied — 2026-11-05
+
+- Applied all five findings from the fresh BIG review: replacement consent on recipient/selection changes, control-only shutdown acknowledgement, compatible optional enrollment storage, bounded full-outbox recovery and an actual final-candidate publication audit.
+- Added PC16–PC20 and eleven mapped acceptance cases; updated implementation ownership and the XML final publication gate. Review verdict is READY for scoped implementation/fixtures, with existing live gates retained. Documentation-only changes; runtime acceptance remains unexecuted.
+
+## Existing bridge reconciliation — 2026-11-05
+
+- Reconciled the private-coordination and writer specs, component map and XML plan with the located private T3 bridge. Reuse its verified behavior before duplicating a connector; preserve detailed operational evidence outside this public project.
+- Split connection-created and desk-thread acceptance, separated orchestration/authoring/service-control authority, and added WC13–WC15 with seven bridge compatibility cases. Human approval, exact owner acknowledgement and provider-selection enforcement remain explicit gates.
+- Documentation-only update. The prior setup record supplies historical live evidence; no new live tests, credential changes, thread creation, bridge reconfiguration or implementation performed.
+
+## Optional private coordination and writer specification — 2026-11-03
+
+- Added `spec-portpilot-private-coordination.md`, `spec-portpilot-write-container.md`, `DevDocs/coordination-component-map.md` and an XML execution companion. Public product remains independent; personal adapter/configuration belong in a separate private project and secrets outside both repositories. Initial integration is notification-only with local decisions.
+- BIG `/plan-review --apply all` completed with six amendments: publication coverage, coherent snapshots, revocation fences, bounded uncertain delivery, helper-enforced authority and durable grant/replay recovery. Report: `DevDocs/plan-review-private-coordination.md`.
+- Writer exploration begins with synthetic queue/connector/helper/issuer fixtures; packaging remains undecided. Live owner/user channels and write stages require their own evidence and enrollment. Documentation-only work: no runtime tests rerun, no live setup, file migration, credential issuance, message, publication or deployment. Existing implementation acceptance gaps remain open.
+
 ## Current State
 
 **Version**: v0.4.0 (build 3), unchanged in `VERSION`; no release or install performed.
-**Tests**: `swift test` — 118 tests, 0 failures (0.789 s), verified on 2026-10-18. Log: `/tmp/portpilot-tests-final.log`.
-**Build**: debug and release builds succeeded. Release log: `/tmp/portpilot-release-build.log` (23.30 s).
-**GUI verification**: PARTIAL. SwiftUI seed-window screenshots were inspected (`/tmp/portpilot-project-window.png`, `/tmp/portpilot-type-window.png`) for layout, category labels, the expected-services checkmark, and the fallback freshness footer. Not verified: the installed menu bar app's interactions and kill flows (Sent vs Stopped). Do not treat the reliability work as verified in the running app.
+**Tests**: `swift test` — 147 tests, zero failures (12.118 s), verified 2026-11-03; `/tmp/portpilot-20261103-tests.log`. Two identity regressions failed before the fix and pass now. T3 source-policy audit: nine checks passed. Updater/packaging shell evidence remains from 2026-11-02.
+**Build**: `swift build -c release` succeeded on 2026-11-03 (20.19 s); `/tmp/portpilot-20261103-release.log`. The app bundle/signature checks are from November 2 and were not regenerated for the newer source. Nothing installed or deployed.
+**Managed-server status**: In progress; P1/P2 are not accepted. The new ownership panel has build evidence only, without fresh screen, keyboard or VoiceOver acceptance.
+**GUI verification**: PARTIAL (historical reliability UI only). SwiftUI seed-window screenshots were inspected (`/tmp/portpilot-project-window.png`, `/tmp/portpilot-type-window.png`) for layout, category labels, the expected-services checkmark, and the fallback freshness footer. Not verified: the installed menu bar app's interactions and kill flows (Sent vs Stopped). Do not treat the reliability work as verified in the running app.
 **Working tree**: implementation, tests, README, and this progress log are uncommitted on `main`. The pre-existing `CLAUDE.md` change and untracked `plans/` were preserved. Nothing was committed, installed, released, or pushed.
 **Repo**: https://github.com/kevvykevwin/port-pilot
 
@@ -13,7 +48,11 @@
 
 2026-11-08: Added Tailscale Serve broken-link findings on `feat/serve-routes`. Port Pilot reads `tailscale serve status --json` (at most every 30 s, only with an injected reader), loopback-probes routes the scan cannot match, confirms after two dead checks at least 60 s apart, and shows a plain-language banner, a row badge and a Copy fix button. It never changes Tailscale config. Owner check (Tailscale 1.104.4): a bare `serve --https=<port> off` deletes every handler on the port, while `--set-path=/ off` removes only `/`, so web-route fixes always name their path. `ProcessClassifier.terminationBlockReason` replaces the kill button with a lock for Tailscale's IPNExtension and macOS ControlCenter (AirPlay Receiver), which macOS relaunches. `swift test`: 230 tests, 0 failures. GUI reviewed by the owner in the running app; the PR screenshot uses seed data.
 
-Previous work:
+2026-11-03: Verified the installed T3 0.1.6 authorization path and saved reproducible source-policy evidence. No message-only permission exists in the inspected build; prepared an unsent typed-coordination integration request in `DevDocs/t3-coordination-permissions.md`. Fixed stale process identity acceptance in claim/keep and cleanup's pre-fence/signal checks. Full tests and release build pass; broader feature acceptance remains open.
+
+2026-11-02: Implemented and tested a local managed-server foundation. The full coordination contract remains incomplete. See [implementation checkpoint](managed-servers-implementation.md) for supported behavior, development commands, evidence and remaining work. Helper/CLI, authenticated IPC, durable registry, direct-child launch, healthy reuse, adoption, explicit stop decisions, bounded forwarding and a basic native ownership panel are present. Arbitrary descendant supervision, automatic cleanup enablement, launch-agent lifecycle transactions, full reroute orchestration and live bot/Tailscale acceptance are not complete. No installation, startup-agent changes, PR, commit, push or deployment occurred.
+
+Previous reliability work:
 
 Implemented the six reliability and classification improvements, ran the full XCTest suite and release build, and inspected Project/Type views with seed data. Categorization is deterministic and local; no model integration was added.
 
@@ -131,6 +170,32 @@ Run the complete XCTest suite with `swift test`. Coverage includes:
 | 2026-07-29 | v0.4.0 reliability release prepared | Worktree roots, PID-safe kill flow, serialized refreshes, scanner fallback, address-aware conflicts, and full-root project identity |
 | 2026-10-18 | Reliability-review recommendations (uncommitted) | Socket bindings preserved with display-only aggregation; process incarnation identity; deterministic classifier catalog with local overrides; coalesced refresh with bounded `lsof` pipe drain, timeout, and cancellation; expected services per project; freshness/fallback footer; Sent vs Stopped kill states. `swift test`: 118 tests, 0 failures (`/tmp/portpilot-tests-final.log`); `swift build -c release` succeeded. Seed-window screenshots inspected; installed-app interactions not UI-tested. No commit, install, or release. |
 
+## Ownership exploration — 2026-11-02
+
+- Agreed scope: show all listeners, but initially automate only explicitly registered servers. Existing or manually launched servers remain visible and may be explicitly adopted; inferred ownership alone does not authorize automatic cleanup. Cleanup eligibility and integration design remain under discussion; no runtime changes implemented.
+- Agreed cleanup eligibility: a registered server may stop automatically only after every owning thread explicitly releases it and a short grace period passes, provided no user "Keep running" override or new owner claim exists. Thread completion, inactivity, and missing heartbeats trigger review rather than automatic shutdown. Grace duration remains undecided.
+- User prefers exploring coordinated rerouting, including local and Tailscale access, rather than pinning shared previews to their current backend ports. Stable user-facing addresses, routing integration, consumer updates, recovery behavior, and launch-wrapper adoption remain undecided; this is design direction, not authorization to move running services.
+- Agreed address behavior: managed previews have stable user-facing addresses while their underlying server ports may change. This resolves the address-stability question above; address identity, routing implementation, and migration/recovery details remain open.
+- Agreed preview identity: checkout/worktree plus service, independent of T3 thread identity. Multiple threads may claim the same service; distinct worktrees and distinct services receive separate preview identities. Concrete address format remains undecided.
+- Agreed coordinator scope: the coordination bot may automatically contact owning T3 threads, including waking idle threads, to identify needed registered servers, request explicit release of unused ones, and coordinate rerouting. Requests must stay within server management; unrelated development and automatic thread archival are excluded. No response leaves the server running and flagged for review. This approves the proposed feature behavior; no messages sent during this design session.
+- Agreed rerouting authority: after every owner agrees to a move, PortPilot may execute it automatically when it can verify the replacement before switching the stable address and recover from a failed switch. the coordination bot must flag unclear cases for the user's decision; moves requiring the existing server to stop before replacement verification require a user decision. Uncertainty or silence does not authorize a move.
+- Agreed review triggers: event-driven checks plus a periodic backstop. Proposed events include an occupied port during managed launch, explicit owner release, and thread completion; completion triggers ownership review, never automatic release. Periodic cadence and event integration remain to be specified; repeated unresolved cases should not generate duplicate notifications. No schedule or background worker created.
+- User wants decisions brought to their attention through the coordination bot and offered to create a dedicated coding bot for this purpose. Proposed responsibility split: the bot coordinates owners and user decisions; PortPilot verifies and executes process/routing actions under the agreed rules. Bot interface, runtime, and integration remain undecided; no bot created.
+- User subsequently created the dedicated bot and chose an existing chat-bot interface for interaction and decisions; runtime integration still needs verification.
+- Agreed reuse rule: reuse only compatible launch configurations within the same checkout/worktree and service. Incompatible configurations get named variants with separate stable preview addresses; never silently replace a preview another thread is using. Separate processes in one checkout do not isolate source-file changes; simultaneous source versions require separate checkouts or immutable artifacts.
+
+## Managed-server specification — 2026-11-02
+
+- Wrote `spec-portpilot-coordination.md` plus ownership, routing and bot child specs: 39 acceptance criteria, 75 mapped test-case rows, and 36 edge-case scenarios. This is a proposed implementation contract, not implemented behavior.
+- Ran BIG `/plan-review` in report-only mode; report: `DevDocs/plan-review-portpilot-coordination.md`. Verdict: READY WITH AMENDMENTS. Four amendments cover execution fencing, helper upgrade/child survival, Tailscale configuration concurrency, and socket framing/resource limits. Initial amendments were not applied in that pass; the follow-up below supersedes that status.
+- Implementation remains in this PortPilot coding thread; the coordination bot supplies integration discovery/review and will deliver user decisions through its existing interface. Bot access/user-response proof and installed Tailscale capabilities remain live-integration gates. No app tests, process signals, thread messages, routing changes, installation or deployment performed in this specification pass.
+
+## Managed-server review amendments applied — 2026-11-02
+
+- Re-ran BIG `/plan-review --apply`; amended the common contract and all three child specs. Applied execution fencing, helper upgrade/recovery, user-mediated v1 Tailscale setup/removal, and bounded socket framing, plus clock/configuration regression coverage.
+- Re-reviewed verdict: READY for staged implementation; no outstanding plan amendments. The specs now have 40 acceptance criteria and 104 test-case rows. Updated review: `DevDocs/plan-review-portpilot-coordination.md`.
+- Automatic backend rerouting remains in scope; automatic Tailscale configuration writes are deferred beyond v1. Bot/T3 authentication, helper child survival and remote acceptance remain explicit implementation gates. Documentation only; no runtime changes or app tests.
+
 ## Deploy Log
 
 ### 2026-11-08 01:23 — feat/serve-routes (full)
@@ -199,3 +264,36 @@ Run the complete XCTest suite with `swift test`. Coverage includes:
   - +10 more
 - Commits ahead of origin/main (1):
   - Improve listener identity, process categories, and scan reliability
+
+## Managed-server local foundation — 2026-11-02
+
+- Added helper/CLI targets and private, singleton state; framed authenticated IPC; revision/fence policy, durable replay and events; direct-child readiness and adoption; explicit user-approved stop/force operations; stable loopback byte-stream forwarding; a helper-offline-safe ownership panel.
+- Real fixtures verified disconnected-client replay, compatible reuse without another child, HTTP 10 MiB streaming, incremental SSE, WebSocket echo, per-connection backend generations, stable-port collision rejection, and foreground helper restart preserving child/claims/port. Restart remains `needs_review`; this does not prove launchd upgrade behavior or complete descendant supervision.
+- Final Swift suite: 145 tests, zero failures. Updater suite: 132 assertions, zero failures. Managed packaging fixture passed. Evidence and unimplemented criteria: `DevDocs/managed-servers-implementation.md`.
+- Tailscale read-only inventory found app-bundled CLI version 1.104.4 and three existing HTTPS selectors. No routes adopted or changed. Coordination-bot authentication evidence and a second tailnet device remain requested integration inputs.
+- Next: finish descendant lifecycle and cleanup supervision, then installer/upgrade recovery; complete reroute transactions, UI acceptance and the gated integrations. The unattended updater deliberately defers replacement of helper-bearing installations until the lifecycle transaction is verified.
+
+## Coordination-bot evidence and remote acceptance device — 2026-11-03
+
+- The user supplied setup screenshots reporting successful read-only T3 MCP access from the coordination bot over the tailnet. The separate write probe reportedly passed its scope check but failed the runtime-mode boundary (`approval-required` caller versus `full-access` target threads). This is user-supplied report evidence, not a new live or source verification.
+- P4 still needs a supported scoped owner-messaging path and proof that user-decision callbacks represent the user rather than model output. Runtime/adapter code location, read-only write-denial enforcement, ACL restriction and bot-host restart recovery remain unverified. No permission expansion, token revocation, remote message or configuration change was performed.
+- The user selected a second device for second-device Tailscale preview acceptance. Record the Safari/tailnet check against the eventual enrolled endpoint with URLs, operation ID, revision and time; remote acceptance remains pending.
+- Updated `DevDocs/managed-servers-implementation.md`. Documentation-only update; no code changes or test reruns. Previous implementation gaps remain open.
+
+## T3 permission investigation and identity checks — 2026-11-03
+
+- Reviewed the installed bundled authorization code, not only the screenshots. Source SHA-256 and locators are preserved in `Tests/fixtures/t3-permissions-0.1.6.json`; regenerate with `scripts/inspect-t3-permissions.cjs` under the installed app's Electron runtime. Nine pure-policy checks and source-wiring assertions passed. No credentials were read or issued and no live write probe was performed.
+- Confirmed the common rename/send runtime guard, CLI default ceiling, narrowing-only mode header and absence of a message-only scope. Wrote a proposed typed service-coordination inbox request, not sent externally. the coordination bot stays read-only; real-user callback authentication remains unverified.
+- New regression tests exposed claim success on reused/missing incarnations before polling and cleanup invoking its signal callback without a registry-side identity check. Added checks before claim/keep commit, before cleanup fencing and before signal dispatch; uncertainty retains ownership and enters review without a signal.
+- Verification: 147 Swift tests passed; release build passed. No fresh app bundle, installation, release, PR or deployment. Next implementation work remains descendant supervision and helper lifecycle recovery; live coordination needs the reviewed T3 integration capability and authenticated callbacks.
+
+## Managed lifecycle, reroute and kernel supervision — 2026-11-03
+
+- Added suspended spawning with a kernel fork/exit watch before user code runs. Real fixtures verify that a child cannot execute early and that even an already-exited fork permanently invalidates completeness. Automatic release cleanup now operates only with current kernel proof, a full 60-second grace and fresh identities. Forked, adopted and restarted trees remain review cases. A stopped compatible service can restart with the same ID/address and a higher generation.
+- Added encrypted restart recipes, separate private secret references, explicit environment port injection, bounded configuration reads and Git-worktree metadata identity. Missing or changed inputs prevent reuse/relaunch.
+- Implemented parallel-safe reroute preparation, revision/owner fencing, readiness, cutover, 30-second observation, bounded drain, healthy rollback and verified old-tree retirement. The real fixture preserves claims and the stable URL, reaches the new backend, and verifies old exit. Unknown trees/undrained streams stay for review rather than being reported as stopped.
+- Replaced Network.framework forwarding after reproducing loopback ENETDOWN with healthy backends. Nonblocking BSD relay tests cover generation pinning, 10 MiB HTTP, SSE, WebSocket, restart rebinding, 100 routes and 200 connections. Fixed an exit-observation race: identity lookup failure alone cannot complete retirement before ESRCH/reuse evidence.
+- Added shared GUI decision controls and incarnation-based listener role labels; managed rows direct termination through helper decisions. Added read-only Tailscale selector enrollment and drift checks. No live route was adopted or changed.
+- Added an explicit launch-agent lifecycle utility with quiescence/checkpoint, same-schema replacement/rollback, shared enrollment/update locking and an uncertain-resume commit boundary that forbids rollback over possibly accepted claims. Ten isolated installer tests passed; active children still defer upgrades and unattended updates remain disabled for helper-bearing installations. Actual launchd acceptance remains open.
+- Current full Swift suite after the final child-reaping guard: **164 tests, zero failures** (58.686 seconds), `/tmp/portpilot-20261103-verified-tests.log`. Updater: **132 assertions, zero failures**; 10 lifecycle tests and the managed packaging fixture passed. Final release build/app packaging and deep strict signature verification passed; packaged helper/CLI both read version 0.4.0. Evidence: `DevDocs/managed-servers-implementation.md`.
+- Full-spec gaps remain explicit in that checkpoint: interruption/recovery and installer fault matrices, bind retry/relocation handling, framework/hot-reload and native accessibility acceptance, second-device remote acceptance, and the gated coordination-bot integration. No installation, deployment, PR, live startup change or external message occurred.
