@@ -11,7 +11,7 @@ AUDIT="$SCRIPT_DIR/../../scripts/audit-publication.py"
 PASS=0
 FAIL=0
 ROOT=$(mktemp -d) || exit 1
-trap 'rm -rf "$ROOT"' EXIT INT TERM
+trap 'chmod -R u+rwx "$ROOT" 2>/dev/null; rm -rf "$ROOT"' EXIT INT TERM
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 
@@ -642,6 +642,163 @@ assert_eq "redaction: exit 1" "$RC" 1
 assert_contains "redaction: findings still reported" "$OUT" "forbidden_file"
 assert_not_contains "home name not printed" "$OUT" "$N_LOC"
 assert_not_contains "token not printed" "$OUT" "$TOK"
+
+# ---- review round: zip layouts the stream extractor reads but zipfile does not
+# mk_zip_layout KIND OUT: builds a zip whose bytes hold an entry the central
+# directory does not list. The sentinel is deflated so the raw scan cannot see it.
+mk_zip_layout() {
+    python3 -I - "$1" "$2" "$SENT" <<'PY'
+import io, sys, zipfile
+kind, out, sent = sys.argv[1], sys.argv[2], sys.argv[3].encode()
+def build(entries):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, d in entries:
+            z.writestr(n, d)
+        start = z.start_dir
+    return b.getvalue(), start
+dirty, dstart = build([("s.txt", b"note " + sent + b"\n")])
+clean, _ = build([("c.txt", b"clean text " * 20)])
+local_only = dirty[:dstart]
+assert sent not in dirty, "sentinel must be hidden by deflate"
+if kind == "concat":
+    data = dirty + clean
+elif kind == "prefix":
+    data = local_only + clean
+elif kind == "middle":
+    import struct
+    base, cd = build([("a.txt", b"clean a " * 20), ("b.txt", b"clean b " * 20)])
+    z = zipfile.ZipFile(io.BytesIO(base))
+    off_b = z.infolist()[1].header_offset
+    ins = len(local_only)
+    data = bytearray(base[:off_b] + local_only + base[off_b:])
+    cd += ins
+    # patch b's central-directory header_offset and the end-of-directory offset
+    pos = data.index(b"PK\x01\x02", cd)
+    pos = data.index(b"PK\x01\x02", pos + 4)
+    struct.pack_into("<I", data, pos + 42, off_b + ins)
+    eocd = data.rindex(b"PK\x05\x06")
+    struct.pack_into("<I", data, eocd + 16, cd)
+    data = bytes(data)
+open(out, "wb").write(data)
+PY
+}
+
+start "zip A concatenated with clean zip B: A's deflated entry is not in B's central directory but a stream extractor reads it (archive_unreadable)"
+new_case; mk_zip_layout concat "$ART/cat.zip"; prepare --artifact "$ART/cat.zip"
+expect_fail "concatenated zips" "archive_unreadable"
+
+start "unlisted deflated local entry placed before a clean zip is archive_unreadable (lowest central-directory offset not 0)"
+new_case; mk_zip_layout prefix "$ART/pre.zip"; prepare --artifact "$ART/pre.zip"
+expect_fail "unlisted prefix entry" "archive_unreadable"
+
+start "unlisted deflated local entry between two listed entries is archive_unreadable (local-header signature at an offset no directory entry owns)"
+new_case; mk_zip_layout middle "$ART/mid.zip"; prepare --artifact "$ART/mid.zip"
+expect_fail "unlisted middle entry" "archive_unreadable"
+
+start "ordinary zips with many deflated entries, a stored nested zip and data descriptors still pass (no false positive)"
+new_case; mkdir "$CASE/zs"
+python3 -I - "$CASE/zs" "$ART/ctl.zip" <<'PY'
+import io, os, sys, zipfile
+d, out = sys.argv[1], sys.argv[2]
+for i in range(6):
+    open(os.path.join(d, f"f{i}.txt"), "w").write(f"line {i}\n" * 50)
+inner = io.BytesIO()
+with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("in.txt", "inner clean\n" * 30)
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for i in range(6):
+        z.write(os.path.join(d, f"f{i}.txt"), f"f{i}.txt")
+    z.writestr(zipfile.ZipInfo("nested.zip"), inner.getvalue(), zipfile.ZIP_STORED)
+PY
+prepare --artifact "$ART/ctl.zip"
+run_audit
+assert_eq "python zip control: exit 0" "$RC" 0
+if command -v ditto >/dev/null 2>&1; then
+    mkdir -p "$CASE/zs/Fake.app/Contents"; cp "$CASE/zs"/f*.txt "$CASE/zs/Fake.app/Contents/"
+    ditto -c -k --keepParent "$CASE/zs/Fake.app" "$ART/ditto.zip"
+    rm -f "$RECEIPT"; make_manifest --artifact "$ART/ditto.zip"; make_review; run_audit
+    assert_eq "ditto zip control: exit 0" "$RC" 0
+fi
+if command -v zip >/dev/null 2>&1; then
+    (cd "$CASE/zs" && zip -q -r "$ART/cli.zip" Fake.app f0.txt)
+    rm -f "$RECEIPT"; make_manifest --artifact "$ART/cli.zip"; make_review; run_audit
+    assert_eq "zip CLI control: exit 0" "$RC" 0
+fi
+
+# ---- review round: symlink targets inside artifact directories
+start "in-bundle symlink whose target holds the sentinel fails (targets were hashed, never scanned)"
+new_case; mkdir "$ART/Dir.app"; ln -s "inner_$SENT" "$ART/Dir.app/link"
+prepare --artifact "$ART/Dir.app"
+expect_fail "symlink target sentinel" "sentinel"
+new_case; mkdir "$ART/Dir.app"; ln -s "tok-$TOK" "$ART/Dir.app/link"
+prepare --artifact "$ART/Dir.app"
+run_audit
+assert_contains "symlink target token: secret_github_token" "$OUT" "secret_github_token"
+assert_not_contains "symlink target token: not printed" "$OUT" "$TOK"
+new_case; mkdir "$ART/Dir.app"; ln -s "$U$N_LOC/x/y" "$ART/Dir.app/link"
+prepare --artifact "$ART/Dir.app"
+run_audit
+assert_contains "symlink absolute home target: home_path" "$OUT" "home_path"
+assert_not_contains "symlink absolute home target: name not printed" "$OUT" "$N_LOC"
+
+start "an artifact that is itself a symlink has its target scanned (top-level symlink case)"
+new_case; ln -s "inner_$SENT" "$ART/top.link"; prepare --artifact "$ART/top.link"
+expect_fail "top-level symlink target" "sentinel"
+
+# ---- review round: redaction keeps the useful part of a location
+start "artifact finding location keeps the in-artifact file name while the home name and token are replaced"
+new_case; D="$ART$U$N_LOC/Dir.app"; mkdir -p "$D"; printf 'x\n' > "$D/.env"; printf 'x\n' > "$D/n-$TOK.txt"
+prepare --artifact "$D"
+run_audit
+assert_eq "redaction keeps path: exit 1" "$RC" 1
+assert_contains "location still shows relative file name" "$OUT" "Dir.app/.env"
+assert_not_contains "location is not wholly replaced" "$OUT" "<redacted-location>"
+assert_not_contains "home name not printed" "$OUT" "$N_LOC"
+assert_not_contains "token not printed" "$OUT" "$TOK"
+assert_contains "token replaced in place" "$OUT" "/n-<redacted>.txt"
+
+# ---- review round: unreadable files do not crash the audit
+start "chmod 000 file inside an artifact directory is an unreadable finding, not a traceback (template and audit)"
+if [ "$(id -u)" -eq 0 ]; then
+    echo "   SKIP running as root"
+else
+    new_case; D="$ART$U$N_LOC/Dir.app"; mkdir -p "$D"; printf 'x\n' > "$D/ok.txt"; printf '%s\n' "$SENT" > "$D/locked.txt"
+    chmod 000 "$D/locked.txt"
+    make_manifest --artifact "$D"; TRC=$?; make_review
+    assert_eq "template exits 0" "$TRC" 0
+    assert_contains "manifest is not empty" "$(cat "$MANIFEST")" "artifacts"
+    run_audit; chmod 644 "$D/locked.txt"
+    assert_eq "unreadable file: exit 1" "$RC" 1
+    assert_contains "unreadable file: reports unreadable" "$OUT" "FINDING unreadable"
+    assert_contains "unreadable file: location names it" "$OUT" "locked.txt"
+    assert_not_contains "unreadable file: no traceback" "$OUT" "Traceback"
+    assert_not_contains "unreadable file: home name not printed" "$OUT" "$N_LOC"
+    assert_absent "unreadable file: no receipt" "$RECEIPT"
+fi
+
+# ---- review round: home path split across tracked directories
+start "tracked path fixtures/Users/<name>/x.txt fails (tree objects store one component at a time)"
+new_case; mkdir -p "$REPO/fixtures/Users/$N_LOC"; printf 'x\n' > "$REPO/fixtures/Users/$N_LOC/x.txt"
+commit_all "split path"; prepare
+run_audit
+assert_eq "split home path: exit 1" "$RC" 1
+assert_contains "split home path: home_path" "$OUT" "home_path"
+assert_not_contains "split home path: name not printed" "$OUT" "$N_LOC"
+
+start "split home path in a file already public (published base) is not re-flagged"
+new_case; mkdir -p "$REPO/fixtures/Users/$N_LOC"; printf 'x\n' > "$REPO/fixtures/Users/$N_LOC/x.txt"
+commit_all "split path"; mk_pub_ref; prepare --published-base origin/main
+run_audit
+assert_eq "public split path: exit 0" "$RC" 0
+
+# ---- review round: first-object short read
+start "short cat-file read reports the FIRST object requested (a revert of the length check would drop this location)"
+new_case; prepare
+mk_fake_git 'read line; printf "%s blob 100\n" "$line"; printf short; exit 0'
+run_audit_fake
+SHORT=$(git -C "$REPO" rev-parse --short=10 HEAD)
+assert_contains "first object flagged" "$OUT" "FINDING object_unreadable tree@$SHORT:README.md"
 
 printf '\n== publication audit tests: %s passed, %s failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
