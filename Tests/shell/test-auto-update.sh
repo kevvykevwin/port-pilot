@@ -198,6 +198,15 @@ if [ "\$1" = "fetch" ] && [ "\${HANG_FETCH:-0}" = "1" ]; then sleep 60; exit 0; 
 exec "$REAL_GIT" "\$@"
 GITSHIM
 
+    # launchctl: the real launchd is never queried. `print` succeeds only when
+    # FAKE_LAUNCHCTL_LOADED=1, simulating an agent that is loaded in the session.
+    cat > "$SHIM/launchctl" << 'LAUNCHCTL'
+#!/bin/bash
+echo "$*" >> "${LAUNCHCTL_LOG:-/dev/null}"
+[ "$1" = "print" ] && [ "${FAKE_LAUNCHCTL_LOADED:-0}" = "1" ] && exit 0
+exit 1
+LAUNCHCTL
+
     chmod +x "$SHIM"/*
 }
 
@@ -263,6 +272,8 @@ run_updater() {
         PORTPILOT_INSTALL_ROOT="$INSTALL" \
         PORTPILOT_STATE_DIR="$STATE" \
         PORTPILOT_LOG_DIR="$LOGS" \
+        PORTPILOT_LAUNCHCTL="$SHIM/launchctl" \
+        LAUNCHCTL_LOG="$ROOT/launchctl.log" \
         PORTPILOT_POLL_SECS=1 \
         PORTPILOT_LAUNCH_SETTLE_SECS=1 \
         FAKE_RUNNING_MARKER="$ROOT/app-running" \
@@ -288,7 +299,19 @@ install_helper_agent() {
     mkdir -p "$ROOT/LaunchAgents"
     printf '<plist/>\n' > "$(helper_plist)"
 }
-notify_count() { grep -c "display notification" "$ROOT/notifications" 2>/dev/null || true; }
+# Pushes a new VERSION to origin from a throwaway clone, so the sandbox clone
+# under test stays behind and must discover it by fetching.
+push_origin_version() {
+    local ver="$1" tmp="$ROOT/pusher"
+    /bin/rm -rf "$tmp"
+    git clone -q "$ORIGIN" "$tmp"
+    git -C "$tmp" config user.email test@example.com
+    git -C "$tmp" config user.name Test
+    printf 'VERSION=%s\nBUILD=9\n' "$ver" > "$tmp/VERSION"
+    git -C "$tmp" commit -qam "bump to $ver"
+    git -C "$tmp" push -q origin main
+}
+notify_count() { [ -f "$ROOT/notifications" ] || { echo 0; return; }; grep -c "display notification" "$ROOT/notifications" || true; }
 
 test_bundled_helper_without_agent_still_updates() {
     start "a bundled helper with no launch agent must not freeze auto-updates forever"
@@ -306,7 +329,7 @@ test_bundled_helper_without_agent_still_updates() {
 }
 
 test_managed_helper_defers_even_force() {
-    start "an active helper launch agent must defer replacement even with --force, and say so once per version"
+    start "an active helper must defer even with --force, and a later upstream release must notify again (key was the stale local VERSION)"
     setup
     install_app_version 0.0.1
     add_bundled_helper
@@ -317,14 +340,110 @@ test_managed_helper_defers_even_force() {
     assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
     assert_exists "helper retained" "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
     assert_eq "notified once" "$(notify_count)" "1"
-    assert_contains "names the supported path" "$(cat "$ROOT/notifications")" "managed-helper.py upgrade --candidate"
+    local msg; msg="$(cat "$ROOT/notifications")"
+    assert_contains "names the target version" "$msg" "v0.4.0 is available"
+    assert_contains "names the real candidate path" "$msg" "$PROJECT/build/PortPilot.app"
+    assert_contains "names the build script" "$msg" "$PROJECT/scripts/build-app.sh"
+    assert_contains "names the supported command" "$msg" "$PROJECT/scripts/managed-helper.py upgrade --candidate $PROJECT/build/PortPilot.app"
     run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "second run still deferred" "$(installed_version_of)" "0.0.1"
     assert_eq "second run does not re-notify" "$(notify_count)" "1"
-    printf 'VERSION=0.5.0\nBUILD=4\n' > "$PROJECT/VERSION"
+    local head_before; head_before="$(git -C "$PROJECT" rev-parse HEAD)"
+    push_origin_version 0.6.0
     run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
-    assert_eq "new target version notifies again" "$(notify_count)" "2"
-    assert_eq "still retained after new version" "$(installed_version_of)" "0.0.1"
+    assert_eq "upstream release notifies again" "$(notify_count)" "2"
+    assert_contains "names the new version" "$(tail -1 "$ROOT/notifications")" "v0.6.0 is available"
+    push_origin_version 0.7.0
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "next release notifies again" "$(notify_count)" "3"
+    assert_eq "clone never fast-forwarded" "$(git -C "$PROJECT" rev-parse HEAD)" "$head_before"
+    assert_eq "still retained after new versions" "$(installed_version_of)" "0.0.1"
+    assert_absent "nothing was built" "$PROJECT/build"
+    teardown
+}
+
+test_helper_agent_up_to_date_is_silent() {
+    start "an active helper on an already up-to-date machine must not claim an update is on hold"
+    setup
+    install_app_version 0.4.0
+    seed_installed_sha
+    install_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "reports up to date" "$OUTPUT" "already up to date"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "no memo written" "$STATE/helper-defer-notified"
+    teardown
+}
+
+test_helper_loaded_without_plist_defers() {
+    start "a helper loaded in launchd but with its plist deleted must still defer (plist-only detection missed it)"
+    setup
+    install_app_version 0.0.1
+    run_updater --force FAKE_LAUNCHCTL_LOADED=1 "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs the deferral" "$OUTPUT" "managed helper is active"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    assert_eq "notified" "$(notify_count)" "1"
+    assert_contains "queried the label read-only" "$(cat "$ROOT/launchctl.log")" "print gui/$(id -u)/com.portpilot.managed-helper"
+    # Agent gone from both signals: memo cleared and the normal path resumes.
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "updates once the helper is gone" "$(installed_version_of)" "0.4.0"
+    assert_absent "memo cleared" "$STATE/helper-defer-notified"
+    teardown
+}
+
+test_helper_dry_run_is_silent() {
+    start "--dry-run with an active helper must not notify or write the memo"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    run_updater --dry-run "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "says what it would do" "$OUTPUT" "would notify about v0.4.0"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "no memo written" "$STATE/helper-defer-notified"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_agent_missing_version_logs_skip() {
+    start "a missing VERSION file with an active helper must exit 0 with a skip line, not die silently under set -e"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    /bin/rm -f "$PROJECT/VERSION"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs a skip" "$OUTPUT" "SKIP:"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_agent_missing_version_target_logs_skip() {
+    start "an unreadable VERSION at the target commit with an active helper must still log a skip"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    git -C "$PROJECT" rm -q VERSION
+    git -C "$PROJECT" commit -qm "drop VERSION"
+    git -C "$PROJECT" push -q origin main
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs a skip" "$OUTPUT" "SKIP:"
+    assert_contains "target version unknown" "$OUTPUT" "vunknown"
+    teardown
+}
+
+test_helper_agent_with_missing_install_points_to_uninstall() {
+    start "an active helper plus a MISSING bundle must point at uninstall, since upgrade cannot replace an absent app"
+    setup
+    install_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "notified once" "$(notify_count)" "1"
+    assert_contains "points to uninstall" "$(cat "$ROOT/notifications")" "managed-helper.py uninstall"
+    assert_absent "nothing installed" "$INSTALL/PortPilot.app"
     teardown
 }
 
@@ -338,6 +457,7 @@ test_helper_agent_with_broken_install_notifies() {
     assert_eq "exits 0" "$STATUS" "0"
     assert_eq "notified once" "$(notify_count)" "1"
     assert_contains "mentions the broken install" "$(cat "$ROOT/notifications")" "broken"
+    assert_contains "says it cannot repair automatically" "$(cat "$ROOT/notifications")" "cannot repair automatically"
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "not re-notified on the next run" "$(notify_count)" "1"
     assert_absent "bundle not replaced under an active helper" "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"
@@ -1046,6 +1166,12 @@ test_build_failure_notifies() {
 # ------------------------------------------------------------------------ main
 test_bundled_helper_without_agent_still_updates
 test_managed_helper_defers_even_force
+test_helper_agent_up_to_date_is_silent
+test_helper_loaded_without_plist_defers
+test_helper_dry_run_is_silent
+test_helper_agent_missing_version_logs_skip
+test_helper_agent_missing_version_target_logs_skip
+test_helper_agent_with_missing_install_points_to_uninstall
 test_helper_agent_with_broken_install_notifies
 test_up_to_date
 test_dirty_sources_skip
