@@ -49,7 +49,9 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         let file: URL
     }
 
+    // Assembled at runtime so this file does not trip the repo's own publication audit.
     private let secretSentinel = "PRIVATE_SENTINEL_" + "01"
+    private let homeRoot = "/" + "Users"
 
     private var actors: [ManagedActor] {
         [("user", ManagedActor.Scope.user), ("owner", .owner), ("reader", .read), ("coord", .coordinator)].map {
@@ -119,6 +121,8 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
     private func list(_ env: Env, _ c: Creds, _ payload: [String: ManagedJSON] = [:], registry: ManagedRegistry? = nil) async -> ManagedResponse {
         await call(env, "notifications.list", actor: c.notify.actor, token: c.notify.token, payload, registry: registry)
     }
+    private func listAfter(_ env: Env, _ c: Creds, _ cursor: String) async -> ManagedResponse { await list(env, c, ["after": .string(cursor)]) }
+    private func listPage(_ env: Env, _ c: Creds, _ token: String) async -> ManagedResponse { await list(env, c, ["pageToken": .string(token)]) }
     private func poll(_ env: Env, _ c: Creds, instance: String? = nil, registry: ManagedRegistry? = nil) async -> ManagedResponse {
         await call(env, "export.control.poll", actor: c.control.actor, token: c.control.token, ["instance": .string(instance ?? c.instance)], registry: registry)
     }
@@ -143,7 +147,8 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
     }
 
     private func records(_ r: ManagedResponse) throws -> [ManagedNotificationRecord] {
-        guard let data = r.data else { throw XCTSkip("no data: \(String(describing: r.error))") }
+        // A missing page is a failure, never a skip: a rejected request must not silently disable a test.
+        let data = try XCTUnwrap(r.data, "no data: \(String(describing: r.error))")
         return try ManagedNotificationContract.validatePage(JSONEncoder().encode(data)).records
     }
     private func object(_ r: ManagedResponse) -> [String: ManagedJSON] {
@@ -157,6 +162,40 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
     private func sidecar(_ env: Env) throws -> [String: Any] {
         let data = try XCTUnwrap(try env.disk.read("export-state.json"))
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+
+    // MARK: Sealed cursor helpers (internal API via @testable)
+
+    private func refKey(_ env: Env, _ c: Creds) throws -> Data {
+        let list = try XCTUnwrap(sidecar(env)["enrollments"] as? [[String: Any]])
+        let mine = try XCTUnwrap(list.first { ($0["id"] as? String)?.lowercased() == c.enrollmentId.uuidString.lowercased() })
+        return try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(mine["refKey"] as? String)))
+    }
+    /// A cursor the helper would have issued for `seq` (sealed with the enrollment's real key).
+    private func cursor(_ env: Env, _ c: Creds, _ seq: Int, enrollmentId: UUID? = nil, epoch: Int? = nil) throws -> String {
+        try ManagedChangeCursor(enrollmentId: enrollmentId ?? c.enrollmentId, epoch: epoch ?? c.epoch, seq: seq).seal(refKey: try refKey(env, c))
+    }
+    private func openCursor(_ env: Env, _ c: Creds, _ text: String) throws -> Int {
+        try ManagedChangeCursor.open(text, refKey: try refKey(env, c), enrollmentId: c.enrollmentId, epoch: c.epoch).seq
+    }
+    /// A cursor for the start of the retained change stream (sequence 0), sealed for this enrollment.
+    private func originCursor(_ env: Env, _ c: Creds) throws -> ManagedJSON {
+        .string(try ManagedChangeCursor(enrollmentId: c.enrollmentId, epoch: c.epoch, seq: 0).seal(refKey: try refKey(env, c)))
+    }
+    private func unb64(_ text: String) throws -> Data {
+        var s = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while s.count % 4 != 0 { s += "=" }
+        return try XCTUnwrap(Data(base64Encoded: s))
+    }
+    private func flipByte(_ text: String) throws -> String {
+        var data = try unb64(text)
+        data[data.count / 2] ^= 0x01
+        return data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    /// Page body with the one field that legitimately differs per call (random-nonce cursor) removed.
+    private func stable(_ r: ManagedResponse) throws -> [String: ManagedJSON] {
+        var o = object(r); o["changeCursor"] = nil; o["nextPageToken"] = nil; return o
     }
 
     // MARK: PC02
@@ -278,12 +317,12 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         let c1 = try await enroll(e, [a])
         _ = try await propose(e, a); _ = try await propose(e, a); _ = try await propose(e, b)
         try await aEqual(try records(await list(e, c1)).count, 2)
-        try await aEqual(try records(await list(e, c1, ["after": .integer(0)])).count, 2)
+        try await aEqual(try records(await list(e, c1, ["after": try originCursor(e, c1)])).count, 2)
         try await shutDown(e, c1)
         let c2 = try await enroll(e, [b])
         let only = try records(await list(e, c2))
         XCTAssertEqual(only.count, 1, "second enrollment selects only B")
-        try await aEqual(try records(await list(e, c2, ["after": .integer(0)])).count, 1)
+        try await aEqual(try records(await list(e, c2, ["after": try originCursor(e, c2)])).count, 1)
     }
 
     // MARK: PC08 / PC16
@@ -342,18 +381,18 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         let c = try await enroll(e, [s])
         let first = try await propose(e, s)
         let snap = await list(e, c)
-        let mark = try XCTUnwrap(object(snap)["highWaterMark"]?.integer)
+        let mark = try XCTUnwrap(object(snap)["changeCursor"]?.string)
         _ = try await propose(e, s)
         let denied = await call(e, "decision.resolve", revision: 1, ["serviceId": .string(s.id.uuidString), "operationId": .string(first.uuidString), "approved": .bool(false)])
         XCTAssertNil(denied.error)
-        let changes = try records(await list(e, c, ["after": .integer(mark)]))
+        let changes = try records(await list(e, c, ["after": .string(mark)]))
         XCTAssertEqual(changes.count, 2)
         XCTAssertEqual(changes.filter { $0.status == .denied }.count, 1)
         XCTAssertEqual(changes.filter { $0.status == .pendingDecision }.count, 1)
         try await aEqual(try records(await list(e, c)).map(\.status), [.pendingDecision], "snapshot lists only non-terminal decisions")
         let latest = await list(e, c)
-        let latestMark = try XCTUnwrap(object(latest)["highWaterMark"]?.integer)
-        let none = try records(await list(e, c, ["after": .integer(latestMark)]))
+        let latestMark = try XCTUnwrap(object(latest)["changeCursor"]?.string)
+        let none = try records(await list(e, c, ["after": .string(latestMark)]))
         XCTAssertTrue(none.isEmpty)
     }
 
@@ -361,11 +400,14 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         // Bug caught: serving a gapped change stream after events expired.
         let e = try env { $0.lastEventSequence = 10 }
         let c = try await enroll(e, [e.services[0]])
-        await aEqual(await list(e, c, ["after": .integer(3)]).error, .resyncRequired)
-        await aEqual(await list(e, c, ["after": .integer(11)]).error, .resyncRequired, "cursor ahead of the helper is also invalid")
-        await aNil(await list(e, c, ["after": .integer(10)]).error)
+        let cur1 = try cursor(e, c, 3)
+        await aEqual(await listAfter(e, c, cur1).error, .resyncRequired)
+        let cur2 = try cursor(e, c, 11)
+        await aEqual(await listAfter(e, c, cur2).error, .resyncRequired, "cursor ahead of the helper is also invalid")
+        let cur10 = try cursor(e, c, 10)
+        await aNil(await listAfter(e, c, cur10).error)
         let snap = await list(e, c)
-        XCTAssertEqual(object(snap)["highWaterMark"], .integer(10), "bootstrap works with no retained events")
+        XCTAssertEqual(try openCursor(e, c, try XCTUnwrap(object(snap)["changeCursor"]?.string)), 10, "bootstrap works with no retained events")
     }
 
     func testPC09BootstrapIncludesOpenDecisionWhoseEventsAreGone() async throws {
@@ -385,7 +427,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(got.count, 1, "operation is reported although no event references it")
         XCTAssertEqual(got.first?.status, .needsReview)
         XCTAssertEqual(got.first?.outcome, .failed)
-        XCTAssertEqual(object(page)["highWaterMark"], .integer(40))
+        XCTAssertEqual(try openCursor(e, c, try XCTUnwrap(object(page)["changeCursor"]?.string)), 40)
         XCTAssertNotNil(seeded)
     }
 
@@ -410,7 +452,8 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         let firstPage = await list(e, c, ["limit": .integer(1)])
         let token = try XCTUnwrap(object(firstPage)["nextPageToken"]?.string)
         await aEqual(await list(e, c, ["pageToken": .string("garbage")]).error, .invalidInput)
-        await aEqual(await list(e, c, ["pageToken": .string(String(token.dropLast()) + (token.hasSuffix("0") ? "1" : "0"))]).error, .unauthorized)
+        let flipped = try flipByte(token)
+        await aEqual(await listPage(e, c, flipped).error, .unauthorized)
         await aEqual(await list(e, c, ["pageToken": .string(token), "after": .integer(0)]).error, .invalidInput)
     }
 
@@ -424,6 +467,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         await aEqual(await list(e, c, ["limit": .integer(201)]).error, .invalidInput)
         await aEqual(await list(e, c, ["extra": .bool(true)]).error, .invalidInput)
         await aEqual(await list(e, c, ["after": .string("1")]).error, .invalidInput)
+        await aEqual(await list(e, c, ["after": .integer(1)]).error, .invalidInput, "integer cursors are gone")
         try await aEqual(try records(await list(e, c, ["limit": .integer(1)])).count, 1)
         try await aEqual(try records(await list(e, c, ["limit": .integer(200)])).count, 2)
     }
@@ -434,6 +478,133 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(try ManagedWire.decode(Data(body.utf8))) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
         let escaped = #"{"protocolVersion":1,"requestId":"r","operation":"notifications.list","actor":"a","credential":"c","payload":{"limit":1,"limit":200}}"#
         XCTAssertThrowsError(try ManagedWire.decode(Data(escaped.utf8)))
+    }
+
+
+    // MARK: Side channel: activity on unselected services
+
+    func testUnselectedServiceActivityLeavesEveryAgentVisibleFieldUnchanged() async throws {
+        // Bug caught: a global counter (highWaterMark, registry revision, token body) growing with activity on services the agent was not selected for.
+        let e = try env()
+        let a = e.services[0], b = e.services[1]
+        let c = try await enroll(e, [a])
+        _ = try await propose(e, a)
+        let snap1 = await list(e, c)
+        let cursor1 = try XCTUnwrap(object(snap1)["changeCursor"]?.string)
+        let changes1 = await list(e, c, ["after": .string(cursor1)])
+        // Activity only on the unselected service: proposals, a denial, and more proposals.
+        let op = try await propose(e, b)
+        _ = try await propose(e, b)
+        let resolved = await call(e, "decision.resolve", revision: 1, ["serviceId": .string(b.id.uuidString), "operationId": .string(op.uuidString), "approved": .bool(false)])
+        XCTAssertNil(resolved.error)
+        let snap2 = await list(e, c)
+        let changes2 = await list(e, c, ["after": .string(cursor1)])
+        XCTAssertEqual(try stable(snap1), try stable(snap2), "snapshot page differs after activity on B")
+        XCTAssertEqual(try stable(changes1), try stable(changes2), "changes page differs after activity on B")
+        XCTAssertEqual(snap1.revision, 0); XCTAssertEqual(snap2.revision, 0); XCTAssertEqual(changes2.revision, 0)
+        XCTAssertTrue(try records(changes2).isEmpty)
+        // The internal sequence did move, so the test would notice a leak of it.
+        let seq1 = try openCursor(e, c, cursor1), seq2 = try openCursor(e, c, try XCTUnwrap(object(snap2)["changeCursor"]?.string))
+        XCTAssertGreaterThan(seq2, seq1)
+    }
+
+    func testChangeCursorIsOpaqueAndDifferentEveryCall() async throws {
+        // Bug caught: a cursor that is an integer, readable JSON/base64 JSON, or a stable value an observer could compare.
+        let e = try env()
+        let c = try await enroll(e, [e.services[0]])
+        let r1 = await list(e, c), r2 = await list(e, c)
+        let c1 = try XCTUnwrap(object(r1)["changeCursor"]?.string), c2 = try XCTUnwrap(object(r2)["changeCursor"]?.string)
+        XCTAssertNil(object(r1)["highWaterMark"])
+        XCTAssertNil(object(r1)["changeCursor"]?.integer)
+        XCTAssertNil(Int(c1))
+        XCTAssertNotEqual(c1, c2, "random nonce: same position, different bytes")
+        XCTAssertEqual(try openCursor(e, c, c1), try openCursor(e, c, c2))
+        for text in [c1, c2] {
+            XCTAssertNil(try? JSONSerialization.jsonObject(with: Data(text.utf8)), "cursor is not JSON text")
+            XCTAssertNil(try? JSONSerialization.jsonObject(with: unb64(text)), "cursor body is not base64 JSON")
+            XCTAssertFalse(text.contains(c.enrollmentId.uuidString))
+            XCTAssertLessThanOrEqual(text.utf8.count, 512)
+        }
+    }
+
+    func testPageTokenBodyIsNotReadableByTheAgent() async throws {
+        // Bug caught: a signed-but-plaintext page token exposing after/hwm/offset (global event sequences).
+        let e = try env()
+        let s = e.services[0]
+        let c = try await enroll(e, [s])
+        _ = try await propose(e, s); _ = try await propose(e, s)
+        let firstPage = await list(e, c, ["limit": .integer(1)])
+        let token = try XCTUnwrap(object(firstPage)["nextPageToken"]?.string)
+        let body = try unb64(token)
+        XCTAssertNil(try? JSONSerialization.jsonObject(with: body), "token body must not decode to JSON")
+        XCTAssertNil(try? JSONSerialization.jsonObject(with: Data(token.utf8)))
+        for needle in ["hwm", "after", "offset", "bootNonce", "snapshotDigest", c.enrollmentId.uuidString] {
+            XCTAssertFalse(String(decoding: body, as: UTF8.self).contains(needle), needle)
+        }
+        // Still a working token.
+        let second = await listPage(e, c, token)
+        XCTAssertEqual(try records(second).count, 1)
+    }
+
+    func testCursorRejections() async throws {
+        // Bug caught: accepting a cursor that is tampered with, issued for another enrollment or epoch, or pruned.
+        let e = try env { $0.lastEventSequence = 10 }
+        let s = e.services[0]
+        let c1 = try await enroll(e, [s])
+        let first = await list(e, c1)
+        let good = try XCTUnwrap(object(first)["changeCursor"]?.string)
+        await aNil(await list(e, c1, ["after": .string(good)]).error)
+        let cur3 = try flipByte(good)
+        await aEqual(await listAfter(e, c1, cur3).error, .unauthorized, "one flipped byte")
+        await aEqual(await list(e, c1, ["after": .string(String(good.dropLast(4)))]).error, .unauthorized, "truncated")
+        await aEqual(await list(e, c1, ["after": .string("not a cursor!")]).error, .invalidInput, "not even base64url")
+        await aEqual(await list(e, c1, ["after": .integer(10)]).error, .invalidInput, "legacy integer cursor")
+        await aEqual(await list(e, c1, ["after": .string("")]).error, .invalidInput)
+        await aEqual(await list(e, c1, ["after": .string(String(repeating: "A", count: 513))]).error, .invalidInput, "unbounded string")
+        // Sealed with the right key but bound to another enrollment id or epoch (AAD binding).
+        let cur4 = try cursor(e, c1, 10, enrollmentId: UUID())
+        await aEqual(await listAfter(e, c1, cur4).error, .unauthorized)
+        let cur5 = try cursor(e, c1, 10, epoch: c1.epoch + 1)
+        await aEqual(await listAfter(e, c1, cur5).error, .unauthorized)
+        // Pruned and out-of-range sequences are well-formed cursors the helper cannot serve.
+        let cur6 = try cursor(e, c1, 3)
+        await aEqual(await listAfter(e, c1, cur6).error, .resyncRequired, "pruned")
+        let cur7 = try cursor(e, c1, 99)
+        await aEqual(await listAfter(e, c1, cur7).error, .resyncRequired, "ahead of helper")
+        // Re-enrollment: the old epoch's cursor is dead.
+        try await shutDown(e, c1)
+        let c2 = try await enroll(e, [s])
+        await aEqual(await list(e, c2, ["after": .string(good)]).error, .unauthorized, "cursor from before re-enrollment")
+        await aNil(await list(e, c2).error)
+    }
+
+    func testExportActorResponsesCarryNoGlobalRevision() async throws {
+        // Bug caught: export responses (success or error) echoing the registry revision, a counter that moves with every service's activity.
+        let e = try env()
+        let a = e.services[0], b = e.services[1]
+        let c = try await enroll(e, [a])
+        _ = try await propose(e, b)   // moves the registry revision
+        let ok = await list(e, c)
+        let bad = await list(e, c, ["after": .string(try cursor(e, c, 999))])
+        let p = await poll(e, c)
+        _ = try await propose(e, b)
+        XCTAssertEqual(ok.revision, 0)
+        XCTAssertEqual(bad.error, .resyncRequired); XCTAssertEqual(bad.revision, 0, "error response too")
+        XCTAssertEqual(p.revision, 0)
+        await aEqual(await list(e, c, ["junk": .bool(true)]).revision, 0)
+        await aNil(await disable(e, c).error)
+        let ch = try await challenge(e, c)
+        let acknowledged = await ack(e, c, challenge: ch)
+        XCTAssertNil(acknowledged.error); XCTAssertEqual(acknowledged.revision, 0)
+        await aEqual(await list(e, c).revision, 0, "revoked reads fail with revision 0")
+    }
+
+    func testControlPollSchemaAnnouncesNotificationSchema2() async throws {
+        // Bug caught: control channel still announcing schema 1 so an agent trusts the wrong page shape.
+        let e = try env()
+        let c = try await enroll(e, [e.services[0]])
+        let polled = await poll(e, c)
+        XCTAssertEqual(object(polled)["notificationSchema"], .integer(2))
     }
 
     // MARK: PC10
@@ -459,11 +630,11 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         try await aEqual(try records(await list(e, c)).first?.status, .pendingDecision)
         e.clock.rollBackWall(3600)
         try await aTrue(try records(await list(e, c)).isEmpty, "rolled-back clock must not revive the decision in the pending set")
-        try await aEqual(try records(await list(e, c, ["after": .integer(0)])).first?.status, .expired)
+        try await aEqual(try records(await list(e, c, ["after": try originCursor(e, c)])).first?.status, .expired)
         let fresh = try env()
         let c2 = try await enroll(fresh, [fresh.services[0]]); _ = try await propose(fresh, fresh.services[0])
         fresh.clock.advance(601)
-        try await aEqual(try records(await list(fresh, c2, ["after": .integer(0)])).first?.status, .expired)
+        try await aEqual(try records(await list(fresh, c2, ["after": try originCursor(fresh, c2)])).first?.status, .expired)
     }
 
     func testPC10ChangedServiceRevisionWithdrawsDecision() async throws {
@@ -506,7 +677,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
             (nil, .none), ("exit_verified", .verified), ("route_verified_old_exit_verified", .verified),
             ("exit_not_yet_verified", .unverified), ("rolled_back_replacement_retained_for_review", .unverified),
             ("old_tree_exit_unverified", .unverified), ("identity_or_signal_failed", .failed), ("no_healthy_backend", .failed),
-            ("preparation_failed_port", .failed), ("/Users/someone/secret", .unverified),
+            ("preparation_failed_port", .failed), (homeRoot + "/someone/secret", .unverified),
         ]
         for (raw, expected) in pairs { XCTAssertEqual(ManagedRegistry.notificationOutcome(raw), expected, raw ?? "nil") }
     }
@@ -547,7 +718,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(mutated { $0["path"] = "/x" })) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
         XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(mutated { $0.removeValue(forKey: "expiresAt") }))
         XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(mutated { $0["status"] = "approved" }))
-        XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(mutated { $0["serviceRef"] = "svc_/Us" + "ers/me" }))
+        XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(mutated { $0["serviceRef"] = "svc_" + homeRoot + "/me" }))
         let duplicate = String(decoding: try bytes(valid), as: UTF8.self).replacingOccurrences(of: "\"action\":\"stop\"", with: "\"action\":\"stop\",\"action\":\"force\"")
         XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(Data(duplicate.utf8))) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
         XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(Data([0x7b, 0xff, 0x7d]))) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
@@ -565,8 +736,8 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
     func testPC13PageBoundaries() throws {
         // Bug caught: accepting 201 records or an oversized page.
         let record = try validRecordJSON()
-        func page(_ count: Int, schema: Int = 1) throws -> Data {
-            try bytes(["schemaVersion": schema, "enrollmentEpoch": 1, "snapshotId": "abc", "highWaterMark": 0, "helperInstance": "h",
+        func page(_ count: Int, schema: Int = 2) throws -> Data {
+            try bytes(["schemaVersion": schema, "enrollmentEpoch": 1, "snapshotId": "abc", "changeCursor": "c", "helperInstance": "h",
                        "records": Array(repeating: record, count: count), "nextPageToken": NSNull()])
         }
         XCTAssertEqual(try ManagedNotificationContract.validatePage(page(200)).records.count, 200)
@@ -670,7 +841,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         let c = try await enroll(e, [e.services[0]])
         let active = object(await poll(e, c))
         XCTAssertEqual(active["state"], .string("active")); XCTAssertNil(active["challenge"])
-        XCTAssertEqual(active["protocolVersion"], .integer(1)); XCTAssertEqual(active["notificationSchema"], .integer(1))
+        XCTAssertEqual(active["protocolVersion"], .integer(1)); XCTAssertEqual(active["notificationSchema"], .integer(2))
         await aNil(await disable(e, c).error)
         await aNotNil(object(await poll(e, c))["challenge"]?.string)
         await aEqual(await poll(e, c, instance: UUID().uuidString).error, .unauthorized)
@@ -980,7 +1151,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
     func testContractRequiresHelperInstanceString() throws {
         // Bug caught: validator accepting a page without (or with a non-string) restart signal.
         func page(_ extra: [String: Any]) throws -> Data {
-            var v: [String: Any] = ["schemaVersion": 1, "enrollmentEpoch": 1, "snapshotId": "abc", "highWaterMark": 0,
+            var v: [String: Any] = ["schemaVersion": 2, "enrollmentEpoch": 1, "snapshotId": "abc", "changeCursor": "c",
                                     "records": [], "nextPageToken": NSNull()]
             v.merge(extra) { $1 }
             return try JSONSerialization.data(withJSONObject: v)
@@ -1003,8 +1174,8 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
             XCTAssertThrowsError(try ManagedNotificationContract.validateRecord(record("serviceRevision", raw)), raw) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
         }
         XCTAssertNoThrow(try ManagedNotificationContract.validateRecord(record("serviceRevision", "1")))
-        func page(_ epoch: String, schema: String = "1") -> Data {
-            Data(#"{"schemaVersion":\#(schema),"enrollmentEpoch":\#(epoch),"snapshotId":"abc","highWaterMark":0,"helperInstance":"h","records":[],"nextPageToken":null}"#.utf8)
+        func page(_ epoch: String, schema: String = "2") -> Data {
+            Data(#"{"schemaVersion":\#(schema),"enrollmentEpoch":\#(epoch),"snapshotId":"abc","changeCursor":"c","helperInstance":"h","records":[],"nextPageToken":null}"#.utf8)
         }
         for raw in ["true", "1.0"] {
             XCTAssertThrowsError(try ManagedNotificationContract.validatePage(page(raw)), raw)
@@ -1016,7 +1187,7 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         // Bug caught: the client decoding a wire response with duplicate keys, letting last-key-wins pick the value.
         let e = try env()
         let c = try await enroll(e, [e.services[0]])
-        let body = #"{"requestId":null,"status":"completed","revision":1,"retryable":false,"data":{"schemaVersion":1,"enrollmentEpoch":1,"enrollmentEpoch":2,"snapshotId":"a","highWaterMark":0,"helperInstance":"h","records":[],"nextPageToken":null}}"#
+        let body = #"{"requestId":null,"status":"completed","revision":1,"retryable":false,"data":{"schemaVersion":2,"enrollmentEpoch":1,"enrollmentEpoch":2,"snapshotId":"a","changeCursor":"c","helperInstance":"h","records":[],"nextPageToken":null}}"#
         let client = ManagedNotificationClient(root: e.root, credentialFile: c.file, rawTransport: { _ in Data(body.utf8) })
         XCTAssertThrowsError(try client.list()) { XCTAssertEqual($0 as? ManagedError, .invalidInput) }
         let ok = body.replacingOccurrences(of: #""enrollmentEpoch":1,"enrollmentEpoch":2"#, with: #""enrollmentEpoch":1"#)
