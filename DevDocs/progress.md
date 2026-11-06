@@ -2,6 +2,16 @@
 
 > Personal planning notes (specs, plans, reviews, bridge evidence) are gitignored and kept locally; links to them from this log resolve only on the author's machine.
 
+## Known gaps closed; P4 dry run — 2026-11-06
+
+- **Export side channel closed**: `notifications.list` no longer returns the global event sequence. It returns an AES-GCM sealed, enrollment-bound `changeCursor` (page schema 2). Page tokens are sealed rather than only signed, and export-actor responses carry revision 0. Mutation-checked: reintroducing the revision, the sequence or a plaintext cursor each fails a test. Residual: a pruned cursor still returns `resyncRequired`, and pruning depends on global event volume.
+- **Decompression cap tested**: gzip, bzip2 and xz bombs report `too_large`, and a stream exactly at 64 MiB passes. Removed an unreachable branch; the cap tests are mutation-checked.
+- **Audit published base**: a manifest may declare `publishedBase` (ref plus exact sha). Already-public objects are not re-audited; filename policy still applies everywhere.
+- **Shipped binaries**: the release build remaps the checkout path and strips debug symbols, so no binary embeds a home path. Signature verifies, and the helper and CLI run.
+- Two notification tests were silently skipping. A rejected list call now fails instead of skipping.
+- **Verified**: Swift 232 tests (0 failures, 0 skipped after the fix), release build, pytest 22, publication audit 181, final-candidate 33, updater 132, packaging PASS, private agent fixtures 94.
+- **P4 dry run** (HEAD `e374461`, fresh app zip, published base `origin/main`): 7 findings. Four are the unsigned manual review. Three are synthetic test fixtures (a fake sentinel and placeholder home paths) inside two unpublished history blobs. The current tree and the app artifact are clean. Clearing the history blobs needs a local history rewrite of unpushed commits, or an explicit fixture allowance; both are user decisions. PC15 keyboard/VoiceOver acceptance is still manual.
+
 ## Private-coordination P0 + P1 implemented — 2026-11-06
 
 - **P0 publication audit**: `scripts/audit-publication.py` (manifest + manual review + receipt, hash-pinned candidate/refs/history/artifacts/patterns file; reports category + location only, never matched values). Fixtures: `Tests/shell/test-publication-audit.sh` 120/120, `Tests/shell/test-publication-final-candidate.sh` (P4 mutation invalidation) 30/30. `.gitignore` defense-in-depth entries added.
