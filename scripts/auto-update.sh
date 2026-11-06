@@ -38,8 +38,10 @@ FAILED_LAUNCH_MEMO="$STATE_DIR/last-failed-launch"
 # registered as this per-user launch agent. Overridable so tests never see the
 # real one.
 HELPER_PLIST="${PORTPILOT_HELPER_PLIST:-$HOME/Library/LaunchAgents/com.portpilot.managed-helper.plist}"
-# Records which version we already told the user about, so a 6-hourly run does
-# not repeat the same notification.
+HELPER_LABEL="com.portpilot.managed-helper"
+HELPER_LAUNCHCTL="${PORTPILOT_LAUNCHCTL:-/bin/launchctl}"
+# Records which target (health + version + commit) we already told the user
+# about, so a 6-hourly run does not repeat the same notification.
 HELPER_DEFER_MEMO="$STATE_DIR/helper-defer-notified"
 # Which commit the installed bundle was actually built from. Version equality is
 # not a proxy for this: a fast-forward advances the clone before the build runs,
@@ -277,29 +279,17 @@ fi
 # (HELPER_PLIST), which runs it from inside the installed bundle. Only then is
 # replacing the bundle unsafe: the swap must be quiesced, checkpointed,
 # health-checked and rolled back by `scripts/managed-helper.py upgrade
-# --candidate <built app>`. So: no agent means the normal path; an agent means
-# defer, even with --force, and tell the user once per target version.
-# A broken install (no main executable) is reported too, but never repaired here,
-# since the repair would replace the bundle under the active helper.
-# This check precedes fetch/build/quit and never touches the helper or its state.
+# --candidate <built app>`. "Active" means the plist exists OR launchd has the
+# service loaded (a deleted plist does not unload a running agent). Both checks
+# are read-only. The deferral itself happens after the read-only fetch, once we
+# know whether an update is actually pending (see helper_gate below).
+HELPER_ACTIVE=false
 if [ -f "$HELPER_PLIST" ]; then
-    DEFER_KEY="$(sed -n 's/^[[:space:]]*VERSION=//p' "$PROJECT_DIR/VERSION" 2>/dev/null | head -1 | tr -d '"'"'"' \t\r')"
-    DEFER_KEY="${DEFER_KEY:-unknown}"
-    if [ -x "$INSTALLED_APP/Contents/MacOS/$APP_NAME" ]; then
-        DEFER_MSG="Update to v$DEFER_KEY is on hold: the managed helper is active. Run scripts/managed-helper.py upgrade --candidate <built app> to upgrade it."
-        DEFER_REASON="managed helper is active (launch agent installed); bundle replacement must go through scripts/managed-helper.py upgrade --candidate <built app>; existing installation retained"
-        DEFER_KEY="healthy:$DEFER_KEY"
-    else
-        DEFER_MSG="Port Pilot is broken or missing, but the managed helper is active so it cannot be repaired automatically. Run scripts/managed-helper.py upgrade --candidate <built app>."
-        DEFER_REASON="managed helper is active and the installed app is broken or missing; not repairing under an active helper; use scripts/managed-helper.py upgrade --candidate <built app>"
-        DEFER_KEY="broken:$DEFER_KEY"
-    fi
-    if [ "$DRY_RUN" = false ] && [ "$(sed -n 1p "$HELPER_DEFER_MEMO" 2>/dev/null || true)" != "$DEFER_KEY" ]; then
-        notify "$DEFER_MSG"
-        printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
-    fi
-    skip "$DEFER_REASON"
-elif [ -f "$HELPER_DEFER_MEMO" ] && [ "$DRY_RUN" = false ]; then
+    HELPER_ACTIVE=true
+elif "$HELPER_LAUNCHCTL" print "gui/$(id -u)/$HELPER_LABEL" >/dev/null 2>&1; then
+    HELPER_ACTIVE=true
+fi
+if [ "$HELPER_ACTIVE" = false ] && [ -f "$HELPER_DEFER_MEMO" ] && [ "$DRY_RUN" = false ]; then
     rm -f "$HELPER_DEFER_MEMO" 2>/dev/null || true
 fi
 
@@ -310,7 +300,9 @@ command -v swift >/dev/null 2>&1 || die "swift toolchain not found on PATH (Xcod
 git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "$PROJECT_DIR is not a git working tree"
 [ -x "$PROJECT_DIR/scripts/build-app.sh" ] || die "scripts/build-app.sh missing or not executable"
-[ -f "$PROJECT_DIR/VERSION" ] || die "VERSION file missing — cannot determine target version"
+# With an active helper nothing below modifies anything, so a missing VERSION is
+# reported by the gate as a skip rather than a failure.
+[ -f "$PROJECT_DIR/VERSION" ] || [ "$HELPER_ACTIVE" = true ] || die "VERSION file missing — cannot determine target version"
 
 cd "$PROJECT_DIR"
 
@@ -350,7 +342,7 @@ REMOTE_SHA="$(git rev-parse "origin/$BRANCH")"
 source_version() {
     # Parsed, not sourced: three scripts read this file, and a stray `exit` or
     # `set -x` in a sourced file would break all of them.
-    sed -n 's/^[[:space:]]*VERSION=//p' "$PROJECT_DIR/VERSION" | head -1 | tr -d '"'"'"' \t\r'
+    sed -n 's/^[[:space:]]*VERSION=//p' "$PROJECT_DIR/VERSION" 2>/dev/null | head -1 | tr -d '"'"'"' \t\r' || true
 }
 
 installed_version() {
@@ -365,7 +357,7 @@ installed_version() {
 }
 
 SRC_VERSION="$(source_version)"
-[ -n "$SRC_VERSION" ] || die "could not parse VERSION= from $PROJECT_DIR/VERSION"
+[ -n "$SRC_VERSION" ] || [ "$HELPER_ACTIVE" = true ] || die "could not parse VERSION= from $PROJECT_DIR/VERSION"
 INST_VERSION="$(installed_version)"
 
 BEHIND=0
@@ -412,6 +404,46 @@ fi
 
 if [ ${#REASONS[@]} -eq 0 ]; then
     skip "already up to date (v$INST_VERSION @ ${LOCAL_SHA:0:7})"
+fi
+
+# ---------------------------------------------------------------- helper gate
+# An update is pending. If the managed helper is active the bundle must not be
+# touched here, even with --force: replacing it is `managed-helper.py upgrade`'s
+# job. Everything above is read-only (fetch only updates remote refs), and
+# everything below modifies the clone or the bundle, so this is the last point
+# where deferring is free. Every substitution carries a fallback: under
+# `set -e` a failed one would exit silently instead of logging a skip.
+# A broken install is reported but never repaired here, and a missing one can
+# only be fixed by uninstalling the helper, since `upgrade` cannot replace an
+# absent app.
+if [ "$HELPER_ACTIVE" = true ]; then
+    TARGET_VERSION="$(git show "$TARGET_SHA:VERSION" 2>/dev/null | sed -n 's/^[[:space:]]*VERSION=//p' | head -1 | tr -d '"'"'"' \t\r' || true)"
+    TARGET_VERSION="${TARGET_VERSION:-unknown}"
+    UPGRADE_CMD="$PROJECT_DIR/scripts/managed-helper.py upgrade --candidate $BUILT_APP"
+    BUILD_CMD="$PROJECT_DIR/scripts/build-app.sh"
+    case "$INST_VERSION" in
+        none)
+            DEFER_STATE="missing"
+            DEFER_MSG="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically. Run $PROJECT_DIR/scripts/managed-helper.py uninstall, then rerun the updater."
+            ;;
+        broken)
+            DEFER_STATE="broken"
+            DEFER_MSG="Port Pilot is broken and v$TARGET_VERSION is available, but the managed helper is active so it cannot repair automatically. Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
+            ;;
+        *)
+            DEFER_STATE="healthy"
+            DEFER_MSG="Port Pilot v$TARGET_VERSION is available but the managed helper is active, so it was not installed. Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
+            ;;
+    esac
+    DEFER_KEY="$DEFER_STATE:$TARGET_VERSION:$TARGET_SHA"
+    if [ "$DRY_RUN" = true ]; then
+        skip "DRY RUN: managed helper is active ($DEFER_STATE install); would notify about v$TARGET_VERSION and leave the installation alone"
+    fi
+    if [ "$(sed -n 1p "$HELPER_DEFER_MEMO" 2>/dev/null || true)" != "$DEFER_KEY" ]; then
+        notify "$DEFER_MSG"
+        printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
+    fi
+    skip "managed helper is active ($DEFER_STATE install); v$TARGET_VERSION pending; bundle replacement must go through scripts/managed-helper.py upgrade --candidate $BUILT_APP; existing installation retained"
 fi
 
 # A commit that builds and passes tests can still crash on launch. Without this

@@ -6,9 +6,10 @@
 
 - **History**: rebased the unpushed work onto `origin/main` (dropped a duplicate commit) and rewrote the synthetic fixture literals out of the unpushed history, so every published blob passes the audit.
 - **Pre-push review** (Python, Swift, shell/config, cross-model) found and fixed:
-  - publication-audit fail-open paths: git replace refs, shallow/grafted history, unreadable artifact directories and files, concatenated tars and zips, unlisted zip entries, symlink targets, file/tree/member names, short object reads, FIFOs, truncated PNG metadata and xattrs; findings redact only the matched value;
+  - publication-audit fail-open paths: git replace refs, shallow/grafted history, unreadable artifact directories and files, concatenated tars and zips, zip entries hidden from the central directory or behind a prefix, symlink targets, corrupt xz, file/tree/member names, short object reads, FIFOs, truncated PNG metadata and xattrs; findings redact only the matched value;
   - callers that fail authentication no longer see the global registry revision;
-  - the updater no longer stops updating once the bundle contains the helper. It defers only while the helper's launch agent is installed, and then notifies once per version with the supported `managed-helper.py upgrade` path.
+  - a revocation whose tombstone and sidecar writes both fail stays revoked across a helper restart;
+  - the updater no longer stops updating once the bundle contains the helper. It checks upstream first, defers only while the helper's launch agent is installed or loaded, and then notifies once per pending version with the supported `managed-helper.py upgrade` path.
 - **P4**: the owner signed the manual privacy review; the final audit of the release candidate passes and its receipt verifies.
 - Deferred review notes (non-blocking): sealed cursor length grows with global event count; retained reroute replacement children are not reaped; agent takeover treats a missing identity as exit; peer PID/start-time read window; some test rigs skip instead of fail; CLI option-only crash; persistence single read; `publishedBase` accepts any ref; build path remap uses the logical path.
 
@@ -56,12 +57,12 @@
 
 ## Current State
 
-**Version**: v0.5.0 (build 4) in `VERSION`, bumped 2026-11-06 for the managed-servers helper, CLI and notification export. Released as `v0.5.0` after the P4 audit (2026-11-07).
+**Version**: v0.5.0 (build 4) in `VERSION`, bumped 2026-11-06 for the managed-servers helper, CLI and notification export. Prepared for the `v0.5.0` release after the P4 audit (2026-11-07).
 **Tests**: `swift test` — 147 tests, zero failures (12.118 s), verified 2026-11-03; `/tmp/portpilot-20261103-tests.log`. Two identity regressions failed before the fix and pass now. T3 source-policy audit: nine checks passed. Updater/packaging shell evidence remains from 2026-11-02.
 **Build**: `swift build -c release` succeeded on 2026-11-03 (20.19 s); `/tmp/portpilot-20261103-release.log`. The app bundle/signature checks are from November 2 and were not regenerated for the newer source. Nothing installed or deployed.
 **Managed-server status**: In progress; P1/P2 are not accepted. The new ownership panel has build evidence only, without fresh screen, keyboard or VoiceOver acceptance.
 **GUI verification**: PARTIAL (historical reliability UI only). SwiftUI seed-window screenshots were inspected (`/tmp/portpilot-project-window.png`, `/tmp/portpilot-type-window.png`) for layout, category labels, the expected-services checkmark, and the fallback freshness footer. Not verified: the installed menu bar app's interactions and kill flows (Sent vs Stopped). Do not treat the reliability work as verified in the running app.
-**Working tree**: committed and pushed with the v0.5.0 release; personal planning notes stay gitignored.
+**Working tree**: committed for the v0.5.0 release; personal planning notes stay gitignored.
 **Repo**: https://github.com/kevvykevwin/port-pilot
 
 ## Last Action
