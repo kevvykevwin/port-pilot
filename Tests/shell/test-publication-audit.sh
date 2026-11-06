@@ -11,7 +11,12 @@ AUDIT="$SCRIPT_DIR/../../scripts/audit-publication.py"
 PASS=0
 FAIL=0
 ROOT=$(mktemp -d) || exit 1
-trap 'chmod -R u+rwx "$ROOT" 2>/dev/null; rm -rf "$ROOT"' EXIT INT TERM
+trap 'chmod -R u+rwx "$ROOT" 2>/dev/null; rm -rf "$ROOT"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ -n "$TRAP_PROBE" ]; then # self-test of the signal traps (see end of file)
+    echo "PROBE_ROOT=$ROOT"; kill -"$TRAP_PROBE" $$; echo PROBE_CONTINUED; exit 0
+fi
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 
@@ -799,6 +804,163 @@ mk_fake_git 'read line; printf "%s blob 100\n" "$line"; printf short; exit 0'
 run_audit_fake
 SHORT=$(git -C "$REPO" rev-parse --short=10 HEAD)
 assert_contains "first object flagged" "$OUT" "FINDING object_unreadable tree@$SHORT:README.md"
+
+# ---- review round 2: walk local headers like a streaming extractor
+cat > "$ROOT/mkzip.py" <<'PY'
+import io, struct, sys, zlib, zipfile
+kind, out, sent = sys.argv[1], sys.argv[2], sys.argv[3].encode()
+def deflate(b):
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(b) + c.flush()
+def crc(b): return zlib.crc32(b) & 0xFFFFFFFF
+def local(name, method, flags, c, cs, us, data):
+    return b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, flags, method, 0, 0x21, c, cs, us, len(name), 0) + name + data
+def cdent(name, method, flags, c, cs, us, off):
+    return b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", 20, 20, flags, method, 0, 0x21, c, cs, us, len(name), 0, 0, 0, 0, 0, off) + name
+def eocd(n, size, off): return b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, n, n, size, off, 0)
+clean = b"clean text " * 20
+hid = b"note " + sent + b"\n"
+ad, hd = deflate(clean), deflate(hid)
+assert sent not in ad + hd
+H = local(b"h.txt", 8, 0, crc(hid), len(hd), len(hid), hd)
+def finish(body, cd_entries):
+    cd = b"".join(cd_entries)
+    return body + cd + eocd(len(cd_entries), len(cd), len(body))
+def plain_zip(entries):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, d in entries: z.writestr(n, d)
+    return b.getvalue()
+if kind == "csize_cover":
+    A = local(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), ad)
+    data = finish(A + H, [cdent(b"a.txt", 8, 0, crc(clean), len(ad) + len(H), len(clean), 0)])
+elif kind == "csize_cover_dd":
+    dd = b"PK\x07\x08" + struct.pack("<III", crc(clean), len(ad), len(clean))
+    A = local(b"a.txt", 8, 8, 0, 0, 0, ad + dd)
+    data = finish(A + H, [cdent(b"a.txt", 8, 8, crc(clean), len(ad) + len(dd) + len(H), len(clean), 0)])
+elif kind == "stored_cover":
+    A = local(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
+    cov = clean + H
+    data = finish(A + H, [cdent(b"a.txt", 0, 0, crc(cov), len(cov), len(cov), 0)])
+elif kind == "method_mismatch":
+    A = local(b"s.txt", 8, 0, crc(hid), len(hd), len(hid), hd)
+    data = finish(A, [cdent(b"s.txt", 0, 0, crc(hd), len(hd), len(hd), 0)])
+elif kind == "sfx_prefix":
+    data = b"#!/bin/sh\nexit 0\n" + plain_zip([("s.txt", hid)])
+elif kind == "png_polyglot":
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b"")
+    data = png + plain_zip([("s.txt", hid)])
+elif kind == "png_clean":
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b"")
+elif kind == "zip64_stream":
+    class U(io.RawIOBase):
+        def __init__(s, f): s.f = f
+        def writable(s): return True
+        def write(s, b): return s.f.write(b)
+    with open(out, "wb") as f:
+        with zipfile.ZipFile(U(f), "w", zipfile.ZIP_DEFLATED) as z:
+            with z.open("big.txt", "w", force_zip64=True) as w: w.write(b"line\n" * 5000)
+            with z.open("small.txt", "w") as w: w.write(b"small clean\n" * 10)
+            with z.open("st.txt", "w", force_zip64=True) as w: w.write(b"more\n" * 100)
+    sys.exit(0)
+else:
+    raise SystemExit("unknown kind")
+open(out, "wb").write(data)
+PY
+
+for K in csize_cover csize_cover_dd stored_cover method_mismatch; do
+    start "zip $K: central directory lies about sizes/method so a hidden local entry is read by bsdtar/unzip but not zipfile (archive_unreadable)"
+    new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
+    expect_fail "$K" "archive_unreadable"
+done
+
+start "method_mismatch and csize_cover: the bytes the walk decodes are scanned (sentinel found, not just unreadable)"
+new_case; python3 -I "$ROOT/mkzip.py" method_mismatch "$ART/mm.zip" "$SENT"; prepare --artifact "$ART/mm.zip"
+expect_fail "method mismatch decoded" "sentinel"
+new_case; python3 -I "$ROOT/mkzip.py" csize_cover "$ART/cc.zip" "$SENT"; prepare --artifact "$ART/cc.zip"
+expect_fail "csize cover decoded" "sentinel"
+
+start "zip after a prefix (shell script + zip, PNG + zip) is treated as a zip: archive_unreadable and members scanned"
+new_case; python3 -I "$ROOT/mkzip.py" sfx_prefix "$ART/sfx.zip" "$SENT"; prepare --artifact "$ART/sfx.zip"
+expect_fail "sfx prefix" "archive_unreadable"
+new_case; python3 -I "$ROOT/mkzip.py" png_polyglot "$ART/poly.png" "$SENT"; prepare --artifact "$ART/poly.png"
+expect_fail "png polyglot" "archive_unreadable"
+assert_contains "png polyglot member scanned" "$OUT" "sentinel"
+
+start "prefixed zip committed as a git blob is archive_unreadable too (blobs and artifacts share the path)"
+new_case; python3 -I "$ROOT/mkzip.py" sfx_prefix "$REPO/tool.bin" "$SENT"; commit_all "sfx"; prepare
+expect_fail "sfx blob" "archive_unreadable"
+
+start "ordinary PNG without an end-of-central-directory record is not treated as a zip"
+new_case; python3 -I "$ROOT/mkzip.py" png_clean "$ART/ok.png" "$SENT"; prepare --artifact "$ART/ok.png"
+run_audit
+assert_eq "clean png: exit 0" "$RC" 0
+
+ctl_zip() { # label, file: audit a standard-tool zip as the only artifact
+    rm -f "$RECEIPT"; make_manifest --artifact "$2"; make_review; run_audit
+    assert_eq "$1: exit 0 (no false positive)" "$RC" 0
+    assert_not_contains "$1: no archive_unreadable" "$OUT" "archive_unreadable"
+}
+start "positive controls: zip -r -, -0, -fd, -z comment, ditto (+ --sequesterRsrc), zip64 streaming writer"
+new_case; mkdir -p "$CASE/zs/Fake.app/Contents"
+for i in 1 2 3; do python3 -I -c 'import sys;print(("line %s\n" % sys.argv[1]) * 60, end="")' "$i" > "$CASE/zs/Fake.app/Contents/f$i.txt"; done
+cp "$CASE/zs/Fake.app/Contents/f1.txt" "$CASE/zs/f0.txt"
+prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
+(cd "$CASE/zs" && zip -q -r - Fake.app f0.txt > "$ART/stream.zip")
+ctl_zip "zip -r - (streamed)" "$ART/stream.zip"
+(cd "$CASE/zs" && zip -q -0 -r "$ART/store.zip" Fake.app f0.txt)
+ctl_zip "zip -0" "$ART/store.zip"
+(cd "$CASE/zs" && zip -q -fd -r "$ART/fd.zip" Fake.app f0.txt)
+ctl_zip "zip -fd" "$ART/fd.zip"
+(cd "$CASE/zs" && printf 'archive comment\n' | zip -q -z -r "$ART/cmt.zip" Fake.app f0.txt)
+ctl_zip "zip -z comment" "$ART/cmt.zip"
+ditto -c -k --keepParent "$CASE/zs/Fake.app" "$ART/d1.zip"; ctl_zip "ditto --keepParent" "$ART/d1.zip"
+ditto -c -k --sequesterRsrc --keepParent "$CASE/zs/Fake.app" "$ART/d2.zip"; ctl_zip "ditto --sequesterRsrc" "$ART/d2.zip"
+python3 -I "$ROOT/mkzip.py" zip64_stream "$ART/z64.zip" "$SENT"; ctl_zip "zip64 streaming writer" "$ART/z64.zip"
+
+start "corrupt xz is archive_unreadable, not a LZMAError traceback"
+new_case; printf '\3757zXZ\000garbage' > "$ART/bad.xz"; prepare --artifact "$ART/bad.xz"
+run_audit
+assert_eq "corrupt xz: exit 1" "$RC" 1
+assert_contains "corrupt xz: archive_unreadable" "$OUT" "archive_unreadable"
+assert_not_contains "corrupt xz: no traceback" "$OUT" "Traceback"
+
+start "overlapping private patterns are redacted as one span (sequential sub leaked the remainder)"
+new_case; P1="Ac""me"; P2="Ac""me Falcon Project"
+printf 'about %s here\n' "$P2" > "$REPO/docs/$P2.md"; commit_all "overlap"
+printf '%s\n%s\n' "$P1" "$P2" > "$CASE/pp.txt"; prepare --private-patterns "$CASE/pp.txt"
+run_audit
+assert_eq "overlap: exit 1" "$RC" 1
+assert_contains "overlap: private_pattern reported" "$OUT" "private_pattern"
+assert_not_contains "overlap: remainder not printed" "$OUT" "Falcon"
+assert_not_contains "overlap: first pattern not printed" "$OUT" "$P1"
+
+start "public blob renamed under x/Users/<name>/ is flagged (path scan ran after the published early return)"
+new_case; mk_pub_ref
+mkdir -p "$REPO/x$U$N_LOC"; git -C "$REPO" mv docs/app.py "$REPO/x$U$N_LOC/app.py"; commit_all "move"
+prepare --published-base origin/main
+run_audit
+assert_eq "renamed public blob: exit 1" "$RC" 1
+assert_contains "renamed public blob: home_path" "$OUT" "home_path"
+assert_not_contains "renamed public blob: name not printed" "$OUT" "$N_LOC"
+
+start "blob already audited under one path, seen again under x/Users/<name>/ in history, is flagged (audit_ref dedup skipped the path)"
+new_case; mkdir -p "$REPO/x$U$N_LOC"; cp "$REPO/docs/app.py" "$REPO/x$U$N_LOC/app.py"
+commit_all "copy under home path"; prepare
+run_audit
+assert_eq "dedup path: exit 1" "$RC" 1
+assert_contains "dedup path: home_path" "$OUT" "home_path"
+
+start "INT and TERM traps clean up and exit 130 / 143 (trap used to swallow the signal and keep running)"
+for SIGNAME in INT TERM; do
+    TRAP_OUT=$(TRAP_PROBE=$SIGNAME sh "$0" 2>&1); TRAP_RC=$?
+    case $SIGNAME in INT) WANT=130 ;; TERM) WANT=143 ;; esac
+    assert_eq "$SIGNAME: exit status" "$TRAP_RC" "$WANT"
+    assert_not_contains "$SIGNAME: did not continue past the signal" "$TRAP_OUT" "PROBE_CONTINUED"
+    assert_absent "$SIGNAME: temp root removed" "$(printf '%s\n' "$TRAP_OUT" | sed -n 's/^PROBE_ROOT=//p')"
+done
 
 printf '\n== publication audit tests: %s passed, %s failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

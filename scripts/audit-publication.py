@@ -217,18 +217,30 @@ class Findings:
         self._redact = [rx for _, rx in SECRET_PATTERNS] + [r for r in extra_rx]
 
     def location(self, loc):
-        """Locations can embed file names, so they get every content pattern."""
+        """Locations can embed file names, so they get every content pattern.
+        Spans from every pattern are collected on the ORIGINAL bytes and merged,
+        so overlapping matches cannot leave a remainder behind."""
         raw = loc.encode("utf-8", "surrogateescape")
-        # Replace only the matched segment so the rest of the path stays useful.
+        spans = []
         for rx in self._redact:
-            raw = rx.sub(b"<redacted>", raw)
-        raw = HOME_RX.sub(
-            lambda m: m.group(0)
-            if m.group(1) in HOME_ALLOW
-            else b"/Users/<redacted>",
-            raw,
-        )
-        return raw.decode("utf-8", "replace")
+            for m in rx.finditer(raw):
+                if m.end() > m.start():
+                    spans.append((m.start(), m.end(), b"<redacted>"))
+        for m in HOME_RX.finditer(raw):
+            if m.group(1) not in HOME_ALLOW:
+                spans.append((m.start(), m.end(), b"/Users/<redacted>"))
+        spans.sort(key=lambda t: (t[0], -t[1]))
+        out, pos, i = bytearray(), 0, 0
+        while i < len(spans):
+            start, end, repl = spans[i]
+            i += 1
+            while i < len(spans) and spans[i][0] < end:
+                end, repl = max(end, spans[i][1]), b"<redacted>"
+                i += 1
+            out += raw[pos:start] + repl
+            pos = end
+        out += raw[pos:]
+        return bytes(out).decode("utf-8", "replace")
 
     def add(self, code, loc):
         key = (code, loc)
@@ -242,8 +254,10 @@ class Findings:
 
 # ---------------------------------------------------------------------- scanner
 class Scanner:
-    def __init__(self, findings, private_rx, published=frozenset()):
+    def __init__(self, findings, private_rx, published=frozenset(), public_paths=frozenset()):
         self.f = findings
+        # Path strings already public in the base (files and their directories).
+        self.public_paths = public_paths
         self.private_rx = private_rx
         # Object ids already public (reachable from the declared published base).
         self.published = published
@@ -309,6 +323,7 @@ class Scanner:
             EOFError,
             OSError,
             zlib.error,
+            lzma.LZMAError,
             ValueError,
             NotImplementedError,
             RuntimeError,
@@ -360,10 +375,16 @@ class Scanner:
             if len(infos) > MAX_ARCHIVE_MEMBERS:
                 self.f.add("archive_limit", loc)
                 return
-            if _has_unlisted_entries(data, infos):
-                # zipfile trusts only the last central directory; a stream
-                # extractor (bsdtar -xOf -) also reads entries it never lists.
+            consistent, bodies = _walk_zip(data, infos, zf.start_dir)
+            if not consistent:
+                # zipfile trusts only the central directory; a stream extractor
+                # (bsdtar -xOf -) walks local headers and can read entries the
+                # directory never lists or sizes differently.
                 self.f.add("archive_unreadable", loc)
+                for name, body in bodies:
+                    if not self._take_budget(len(body), loc):
+                        return
+                    self.scan_bytes(body, f"{loc}!{name}#local-header")
             for info in infos:
                 mloc = f"{loc}!{info.filename}"
                 if not self._member_ok(info.filename, mloc) or info.is_dir():
@@ -408,25 +429,122 @@ class Scanner:
 
 
 ZIP_LOCAL_SIG = b"PK\x03\x04"
+ZIP_DD_SIG = b"PK\x07\x08"
+_ZIP_LOCAL_FMT = "<4sHHHHHIIIHH"  # 30 bytes
+_INFLATE_CHUNK = 1 << 16
 
 
-def _has_unlisted_entries(data, infos):
-    """True when the bytes hold anything but the entries the central directory
-    lists, back to back: a prefix, concatenated zips, or a stray local header.
-    Local-header signatures inside a listed entry's data (stored nested zips)
-    are skipped by walking entry spans."""
-    cursor = 0
-    for info in sorted(infos, key=lambda i: i.header_offset):
-        off = info.header_offset
-        if data.find(ZIP_LOCAL_SIG, cursor, off) != -1:
-            return True
-        if cursor == 0 and off != 0:
-            return True
-        if data[off : off + 4] != ZIP_LOCAL_SIG or len(data) < off + 30:
-            return True
-        name_len, extra_len = struct.unpack("<HH", data[off + 26 : off + 30])
-        cursor = max(cursor, off + 30 + name_len + extra_len + info.compress_size)
-    return data.find(ZIP_LOCAL_SIG, cursor) != -1
+class _WalkStop(Exception):
+    """The walk cannot tell where the next local header starts."""
+
+
+def _inflate_span(data, start, budget):
+    """Inflate the raw deflate stream at data[start:]. Returns (output, end)
+    where end is the first byte after the stream (zlib's unused_data decides)."""
+    d = zlib.decompressobj(-15)
+    out = bytearray()
+    pos = start
+    while not d.eof:
+        if pos >= len(data):
+            raise _WalkStop
+        chunk = data[pos : pos + _INFLATE_CHUNK]
+        pos += len(chunk)
+        while chunk:
+            out += d.decompress(chunk, MAX_FILE_BYTES + 1 - len(out))
+            if len(out) > MAX_FILE_BYTES or len(out) > budget:
+                raise _TooLarge()
+            if d.eof:
+                break
+            chunk = d.unconsumed_tail
+    return bytes(out), pos - len(d.unused_data)
+
+
+def _data_descriptor_end(data, pos, crc, csize, usize, boundaries):
+    """End offset of a data descriptor at pos (signed or not, 32- or 64-bit
+    sizes) whose values match and which is followed by a plausible boundary."""
+    for sig in (ZIP_DD_SIG, b""):
+        if data[pos : pos + len(sig)] != sig:
+            continue
+        body = pos + len(sig)
+        for fmt in ("<III", "<IQQ"):
+            size = struct.calcsize(fmt)
+            if len(data) < body + size:
+                continue
+            if struct.unpack(fmt, data[body : body + size]) != (crc, csize, usize):
+                continue
+            end = body + size
+            if end in boundaries or data.startswith(ZIP_LOCAL_SIG, end):
+                return end
+    return None
+
+
+def _walk_zip(data, infos, start_dir):
+    """Walk local headers the way a streaming extractor does and compare with
+    the central directory. Returns (consistent, bodies); bodies holds
+    (name, decoded bytes) for entries whose local view differs from the
+    directory or that the directory does not list, so callers can scan them."""
+    by_offset = {i.header_offset: i for i in infos}
+    boundaries = set(by_offset) | {start_dir}
+    consistent = len(by_offset) == len(infos)
+    bodies, seen, cursor = [], set(), 0
+    budget = MAX_ARCHIVE_TOTAL_BYTES
+    try:
+        while cursor < start_dir and data.startswith(ZIP_LOCAL_SIG, cursor):
+            if len(data) < cursor + 30:
+                raise _WalkStop
+            _, _, flags, method, _, _, crc, csize, usize, nlen, elen = struct.unpack(
+                _ZIP_LOCAL_FMT, data[cursor : cursor + 30]
+            )
+            lname = data[cursor + 30 : cursor + 30 + nlen]
+            body_start = cursor + 30 + nlen + elen
+            info = by_offset.get(cursor)
+            seen.add(cursor)
+            entry_ok = info is not None
+            if info is not None:
+                enc = "utf-8" if info.flag_bits & 0x800 else "cp437"
+                entry_ok = (
+                    lname == info.orig_filename.encode(enc, "surrogateescape")
+                    and method == info.compress_type
+                    and (flags & 0x9) == (info.flag_bits & 0x9)
+                )
+            if flags & 0x1 or method not in (0, 8):
+                consistent = False
+                raise _WalkStop  # encrypted / unsupported: cannot find the end
+            has_dd = bool(flags & 0x8)
+            if method == 8:
+                body, end = _inflate_span(data, body_start, budget)
+            else:
+                if has_dd:
+                    raise _WalkStop  # stored + descriptor: end is not knowable
+                if csize == 0xFFFFFFFF and info is not None:
+                    csize = info.compress_size
+                if csize == 0xFFFFFFFF or body_start + csize > len(data):
+                    raise _WalkStop
+                body, end = data[body_start : body_start + csize], body_start + csize
+            budget -= len(body)
+            if budget < 0:
+                raise _TooLarge()
+            if has_dd:
+                if info is not None:
+                    want = (info.CRC, info.compress_size, info.file_size)
+                else:
+                    want = (zlib.crc32(body) & 0xFFFFFFFF, end - body_start, len(body))
+                dd_end = _data_descriptor_end(data, end, *want, boundaries)
+                if dd_end is None:
+                    entry_ok = False
+                    raise _WalkStop
+                end = dd_end
+            elif info is not None and (
+                end - body_start != info.compress_size or len(body) != info.file_size
+            ):
+                entry_ok = False
+            if not entry_ok:
+                consistent = False
+                bodies.append((lname.decode("utf-8", "replace"), body))
+            cursor = end
+    except _WalkStop:
+        consistent = False
+    return (consistent and seen == set(by_offset) and cursor == start_dir), bodies
 
 
 class _TooLarge(Exception):
@@ -469,6 +587,12 @@ def archive_kind(data):
         return "xz"
     if data[257:262] == b"ustar":
         return "tar"
+    # A zip behind a prefix (self-extracting script, PNG polyglot): extractors
+    # find it through the end record at the tail.
+    if (
+        b"PK\x05\x06" in data[-65557:] or b"PK\x06\x07" in data[-65557:]
+    ) and zipfile.is_zipfile(io.BytesIO(data)):
+        return "zip"
     return None
 
 
@@ -807,16 +931,27 @@ def load_published_base(repo, manifest, findings):
     published_base_mismatch and treat nothing as public (everything is scanned)."""
     pb = manifest.get("publishedBase")
     if pb is None:
-        return frozenset()
+        return frozenset(), frozenset()
     try:
         actual = rev_parse(repo, pb["ref"] + "^{commit}")
         if actual != pb["sha"]:
             raise GitError("sha differs")
         listing = git(repo, "rev-list", "--objects", actual).decode("utf-8", "replace")
+        touched = git(
+            repo, "log", "--name-only", "-z", "--format=", "--no-renames", "-m",
+            "--root", actual,
+        ).decode("utf-8", "replace")
     except GitError:
         findings.add("published_base_mismatch", "publishedBase")
-        return frozenset()
-    return frozenset(line.split(" ", 1)[0] for line in listing.splitlines() if line)
+        return frozenset(), frozenset()
+    objects = frozenset(line.split(" ", 1)[0] for line in listing.splitlines() if line)
+    paths = set()
+    names = [line.split(" ", 1)[1] for line in listing.splitlines() if " " in line]
+    for name in names + touched.split("\0"):
+        name = name.strip("\n")
+        parts = name.split("/")
+        paths.update("/".join(parts[:i]) for i in range(1, len(parts) + 1) if name)
+    return objects, frozenset(paths)
 
 
 def audit_candidate(repo, manifest, scanner):
@@ -862,16 +997,18 @@ def audit_candidate(repo, manifest, scanner):
 
 
 def scan_git_object(reader, sha, path, loc, scanner):
+    if path and (sha not in scanner.published or path not in scanner.public_paths):
+        # Tree objects store one component at a time, so a home path split
+        # across directories only exists in the full path string. This runs
+        # before the published early return: a public blob can be moved to a
+        # new path. A path already public in the base is not re-flagged.
+        scanner.scan_bytes(path.encode("utf-8", "surrogateescape"), loc)
     if sha in scanner.published:
         # Already public: content is not re-audited, but name policy still applies.
         scanner.skipped_public.add(sha)
         if path and forbidden_name(os.path.basename(path)):
             scanner.f.add("forbidden_file", loc)
         return
-    if path:
-        # Tree objects store one component at a time, so a home path split
-        # across directories only exists in the full path string.
-        scanner.scan_bytes(path.encode("utf-8", "surrogateescape"), loc)
     try:
         otype, size, data = reader.get(sha)
     except GitError:
@@ -933,6 +1070,10 @@ def audit_ref(repo, ref, reader, scanned, scanner):
         if path and forbidden_name(os.path.basename(path)):
             f.add("forbidden_file", loc)
         if sha in scanned:
+            # Same object under another path: the object was audited, the path
+            # string (which can hold a home path) was not.
+            if path and path not in scanner.public_paths:
+                scanner.scan_bytes(path.encode("utf-8", "surrogateescape"), loc)
             continue
         scanned.add(sha)
         scan_git_object(reader, sha, path, loc, scanner)
@@ -1046,8 +1187,8 @@ def run_audit(args, write_receipt):
     review_sha = sha256_bytes(review_raw)
     validate_review(review, manifest_sha, findings)
 
-    published = load_published_base(toplevel, manifest, findings)
-    scanner = Scanner(findings, private_rx, published)
+    published, public_paths = load_published_base(toplevel, manifest, findings)
+    scanner = Scanner(findings, private_rx, published, public_paths)
     check_history_integrity(toplevel, findings)
     audit_candidate(toplevel, manifest, scanner)
     audit_dirty(toplevel, manifest, findings)
