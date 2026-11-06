@@ -17,6 +17,11 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t
 
 # Sentinel is assembled at runtime so this file never contains the full value.
 SENT="PRIVATE_SENTINEL_""01"
+# Home-directory fixture names are assembled the same way, so this file itself
+# never contains a literal /Users/<name> that the audit would flag.
+U="/Users/"
+N_SOME="some""person"; N_QUOTE="quote""person"; N_EOF="eof""person"; N_STR="strings""person"
+N_ALLOW1="some""one"; N_ALLOW2="exam""ple"; N_OTHER="other""person"
 
 ok()  { PASS=$((PASS + 1)); printf '   ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '   FAIL %s\n' "$1"; }
@@ -147,7 +152,7 @@ run_audit; assert_eq "exit 1" "$RC" 1; assert_contains "forbidden_file" "$OUT" "
 start "generic secrets and home paths are caught (patterns not silently dropped)"
 new_case
 printf 'token ghp_%s\n' "abcdefghijklmnopqrstuvwxyz0123456789" > "$REPO/a.txt"
-printf 'path /Use''rs/someperson/project/x\n' > "$REPO/b.txt"
+printf 'path %s%s/project/x\n' "$U" "$N_SOME" > "$REPO/b.txt"
 printf 'ok /Users/Shared/ok\n' > "$REPO/c.txt"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "s"; prepare
 run_audit
@@ -155,7 +160,7 @@ assert_contains "github token" "$OUT" "secret_github_token"
 assert_contains "home path" "$OUT" "home_path"
 assert_not_contains "allowlisted /Users/Shared not flagged" "$OUT" "c.txt"
 assert_not_contains "token value not printed" "$OUT" "ghp_abcdef"
-assert_not_contains "name not printed" "$OUT" "someperson"
+assert_not_contains "name not printed" "$OUT" "$N_SOME"
 
 start "undeclared nested repository fails (gitlink/embedded repo not skipped)"
 new_case; mkdir "$CASE/inner"; git init -q -b main "$CASE/inner"
@@ -288,16 +293,16 @@ assert_absent "no receipt" "$RECEIPT"
 
 start "home paths terminated by quote or end of file are flagged; /Users/Shared is not"
 new_case
-printf '{"p": "/Use''rs/quoteperson"}\n' > "$REPO/q.json"
-printf 'at end /Use''rs/eofperson' > "$REPO/e.txt"
+printf '{"p": "%s%s"}\n' "$U" "$N_QUOTE" > "$REPO/q.json"
+printf 'at end %s%s' "$U" "$N_EOF" > "$REPO/e.txt"
 printf 'shared /Users/Shared/x and /Users/Shared\n' > "$REPO/s.txt"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m h; prepare
 run_audit
 assert_contains "quoted path flagged" "$OUT" "q.json"
 assert_contains "end-of-file path flagged" "$OUT" "e.txt"
 assert_not_contains "Shared not flagged" "$OUT" "s.txt"
-assert_not_contains "name not printed" "$OUT" "quoteperson"
-assert_not_contains "eof name not printed" "$OUT" "eofperson"
+assert_not_contains "name not printed" "$OUT" "$N_QUOTE"
+assert_not_contains "eof name not printed" "$OUT" "$N_EOF"
 
 start "UTF-16LE file with BOM holding the sentinel fails"
 new_case
@@ -310,15 +315,144 @@ expect_fail "utf16 bom" "sentinel"
 
 start "UTF-16 .strings file without BOM holding a home path fails"
 new_case
-python3 -I - "$ART/Localizable.strings" <<'PY'
+python3 -I - "$ART/Localizable.strings" "$U$N_STR" <<'PY'
 import sys
-open(sys.argv[1], "wb").write(('"k" = "/Use' 'rs/stringsperson/x";\n').encode("utf-16-le"))
+open(sys.argv[1], "wb").write(('"k" = "%s/x";\n' % sys.argv[2]).encode("utf-16-le"))
 PY
 prepare --artifact "$ART/Localizable.strings"
 run_audit
 assert_eq "exit 1" "$RC" 1
 assert_contains "home_path" "$OUT" "home_path"
-assert_not_contains "name not printed" "$OUT" "stringsperson"
+assert_not_contains "name not printed" "$OUT" "$N_STR"
+
+start "decompression bomb: tiny .gz/.bz2/.xz expanding past the 64 MiB cap fails closed as too_large"
+# Bug caught: decompressing without a cap (memory blowup) or treating an over-cap stream as clean/unreadable.
+new_case
+python3 -I - "$ART" <<'PY'
+import bz2, gzip, lzma, os, sys
+blob = b"\0" * (65 * 1024 * 1024)  # 1 MiB over MAX_FILE_BYTES
+open(os.path.join(sys.argv[1], "bomb.bin.gz"), "wb").write(gzip.compress(blob, 9))
+open(os.path.join(sys.argv[1], "bomb.bin.bz2"), "wb").write(bz2.compress(blob, 9))
+open(os.path.join(sys.argv[1], "bomb.bin.xz"), "wb").write(lzma.compress(blob))
+PY
+for k in gz bz2 xz; do
+    size=$(wc -c < "$ART/bomb.bin.$k" | tr -d ' ')
+    if [ "$size" -lt 1048576 ]; then ok "bomb.$k is small on disk ($size bytes)"; else bad "bomb.$k not small ($size bytes)"; fi
+    make_manifest --artifact "$ART/bomb.bin.$k"; make_review
+    expect_fail "bomb $k" "too_large"
+    assert_not_contains "bomb $k: not misreported as unreadable" "$OUT" "archive_unreadable"
+done
+
+start "stream exactly at the 64 MiB cap is scanned, not rejected (cap boundary)"
+# Bug caught: an off-by-one cap that rejects legitimate at-limit content.
+new_case
+python3 -I - "$ART" <<'PY'
+import gzip, os, sys
+open(os.path.join(sys.argv[1], "edge.bin.gz"), "wb").write(gzip.compress(b"\0" * (64 * 1024 * 1024), 9))
+PY
+prepare --artifact "$ART/edge.bin.gz"
+run_audit
+assert_eq "at-cap gz: exit 0" "$RC" 0
+assert_not_contains "at-cap gz: no too_large" "$OUT" "too_large"
+
+start "allowlisted placeholder home names pass; any other username still fails"
+# Bug caught: allowlist matching too loosely (prefix/substring) or placeholders still flagged.
+new_case
+printf 'a %s%s/x\n' "$U" "$N_ALLOW1" > "$REPO/ok1.txt"
+printf 'b %s%s/x\n' "$U" "$N_ALLOW2" > "$REPO/ok2.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -q -m "placeholders"; prepare
+run_audit
+assert_eq "placeholders only: exit 0" "$RC" 0
+printf 'c %s%s/x\n' "$U" "$N_ALLOW1""x" > "$REPO/near.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -q -m "near miss"; prepare
+rm -f "$RECEIPT"
+expect_fail "placeholder-prefixed name" "home_path"
+assert_contains "location names near.txt" "$OUT" "near.txt"
+new_case
+printf 'd %s%s/x\n' "$U" "$N_OTHER" > "$REPO/real.txt"
+git -C "$REPO" add -A && git -C "$REPO" commit -q -m "other"; prepare
+expect_fail "other username" "home_path"
+assert_not_contains "other name not printed" "$OUT" "$N_OTHER"
+
+# ---- published base (already-public objects are not re-audited)
+# pub_case: REPO's initial commit is made "public" by an origin/main ref; the
+# base file and a forbidden-name file are added before that ref is cut.
+mk_pub_ref() { git -C "$REPO" update-ref refs/remotes/origin/main HEAD; PUBSHA=$(git -C "$REPO" rev-parse HEAD); }
+commit_all() { git -C "$REPO" add -A && git -C "$REPO" commit -q -m "$1"; }
+
+start "secret only in a blob reachable from the published base passes, with a NOTE"
+# Bug caught: published history re-scanned, blocking a release over already-public content.
+new_case; printf 'note %s\n' "$SENT" > "$REPO/docs/old.md"; commit_all "old"; mk_pub_ref
+git -C "$REPO" commit -q --allow-empty -m "next"; prepare --published-base origin/main
+run_audit
+assert_eq "exit 0" "$RC" 0
+assert_contains "NOTE printed" "$OUT" "objects already public at ${PUBSHA%"${PUBSHA#????????????}"} were not re-audited"
+assert_exists "receipt written" "$RECEIPT"
+assert_eq "receipt records base sha" "$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["publishedBase"]["sha"])' "$RECEIPT")" "$PUBSHA"
+
+start "same secret in a NEW candidate commit still fails with a base declared"
+# Bug caught: the skip keyed on path/commit instead of object id, hiding new content.
+new_case; mk_pub_ref; printf 'note %s\n' "$SENT" > "$REPO/docs/new.md"; commit_all "new"
+prepare --published-base origin/main
+expect_fail "new commit" "sentinel"
+assert_contains "location names new.md" "$OUT" "docs/new.md"
+
+start "secret in a base blob re-added in a new commit passes only because the blob is public"
+# Documents the object-id semantics: identical bytes already public are skipped.
+new_case; printf 'note %s\n' "$SENT" > "$REPO/docs/old.md"; commit_all "old"; mk_pub_ref
+cp "$REPO/docs/old.md" "$REPO/docs/copy.md"; commit_all "copy"; prepare --published-base origin/main
+run_audit
+assert_eq "identical public bytes: exit 0" "$RC" 0
+
+start "tree file unchanged from base is skipped; changed by one byte it is scanned"
+# Bug caught: a tree entry skipped by path rather than by blob id, hiding edits.
+new_case; printf 'note %s\n' "$SENT" > "$REPO/docs/old.md"; commit_all "old"; mk_pub_ref
+printf 'x\n' >> "$REPO/docs/old.md"; commit_all "edit"; prepare --published-base origin/main
+expect_fail "one-byte change" "sentinel"
+assert_contains "location names old.md" "$OUT" "docs/old.md"
+
+start "published base sha mismatch fails"
+# Bug caught: trusting the manifest sha without checking what the ref points at.
+new_case; mk_pub_ref; git -C "$REPO" commit -q --allow-empty -m "later"; prepare --published-base origin/main
+git -C "$REPO" update-ref refs/remotes/origin/main HEAD
+run_audit
+assert_eq "exit 1" "$RC" 1
+assert_contains "published_base_mismatch" "$OUT" "published_base_mismatch"
+assert_absent "no receipt" "$RECEIPT"
+
+start "published base ref that does not exist fails (and scans everything)"
+# Bug caught: a missing base silently treated as 'nothing public' without failing.
+new_case; mk_pub_ref; prepare --published-base origin/main
+git -C "$REPO" update-ref -d refs/remotes/origin/main
+run_audit
+assert_eq "exit 1" "$RC" 1
+assert_contains "published_base_mismatch" "$OUT" "published_base_mismatch"
+python3 -I "$AUDIT" --print-manifest-template --repo "$REPO" --rev HEAD --ref main --published-base origin/nope >/dev/null 2>&1
+assert_eq "template with unknown base exits 2" "$?" 2
+
+start "forbidden filename existing only in the base still fails (name policy not skipped)"
+# Bug caught: skipping a public object also skipping the filename check.
+new_case; printf '{}' > "$REPO/credential-abc.json"; commit_all "cred"; mk_pub_ref
+git -C "$REPO" commit -q --allow-empty -m "next"; prepare --published-base origin/main
+run_audit
+assert_eq "exit 1" "$RC" 1
+assert_contains "forbidden_file" "$OUT" "forbidden_file"
+assert_absent "no receipt" "$RECEIPT"
+
+start "malformed publishedBase in manifest exits 2"
+new_case; prepare
+python3 -I - "$MANIFEST" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); m["publishedBase"] = {"ref": "origin/main", "sha": "nothex"}; json.dump(m, open(sys.argv[1], "w"))
+PY
+make_review
+python3 -I "$AUDIT" --manifest "$MANIFEST" --manual-review "$REVIEW" --receipt "$RECEIPT" >/dev/null 2>&1
+assert_eq "exit 2" "$?" 2
+
+start "absent publishedBase keeps old behavior: history secret fails, no NOTE"
+new_case; printf 'note %s\n' "$SENT" > "$REPO/docs/old.md"; commit_all "old"; mk_pub_ref; prepare
+expect_fail "no base declared" "sentinel"
+assert_not_contains "no NOTE" "$OUT" "already public"
 
 start "sentinel only in an extended attribute of an artifact file fails"
 if command -v xattr >/dev/null 2>&1; then

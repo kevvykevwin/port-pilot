@@ -323,7 +323,7 @@ final class PortStoreTests: XCTestCase {
         // /Applications (e.g. ~/Applications, Downloads-run apps).
         let chromeHelper = makeEntry(
             pid: 5, port: 50000, name: "Google Chrome Helper",
-            executablePath: "/Users/dev/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/140.0/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
+            executablePath: "/Users/example/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/140.0/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
         )
         XCTAssertTrue(PortCategory.isMacApp(chromeHelper))
     }

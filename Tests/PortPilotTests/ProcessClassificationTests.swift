@@ -22,7 +22,7 @@ final class ProcessClassificationTests: XCTestCase {
                                 scriptPath: "/opt/homebrew/lib/node_modules/portless/dist/cli.js")
         XCTAssertEqual(PortCategory.categorize(portless), .infrastructure)
         let editor = makeEntry(pid: 1, port: 60000, name: "node",
-                              scriptPath: "/Users/test/.vscode/extensions/ms-python.vscode-pylance-2026.1.1/server.js")
+                              scriptPath: "/Users/someone/.vscode/extensions/ms-python.vscode-pylance-2026.1.1/server.js")
         XCTAssertEqual(PortCategory.categorize(editor), .editorServices)
     }
 

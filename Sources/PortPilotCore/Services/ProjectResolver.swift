@@ -43,7 +43,7 @@ public final class ProjectResolver: Sendable {
     // MARK: - Public API
 
     /// Resolves a process's working directory to its nearest standardized
-    /// project-root path (e.g., "/Users/me/Projects/sift-coffee"), or nil.
+    /// project-root path (e.g., "/Users/someone/Projects/my-app"), or nil.
     public func resolve(pid: pid_t, startTime: Date) -> String? {
         let key = CacheKey(pid: pid, startTime: startTime)
 
