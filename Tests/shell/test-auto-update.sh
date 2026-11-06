@@ -275,18 +275,72 @@ run_updater() {
 
 # ----------------------------------------------------------------------- tests
 
-test_managed_helper_defers_even_force() {
-    start "managed helper defers replacement until lifecycle recovery is verified"
-    setup
-    install_app_version 0.0.1
+# The helper is only dangerous to replace while it is ACTIVE as a launch agent.
+# These tests point the updater at a sandbox plist path, never the real one.
+add_bundled_helper() {
     mkdir -p "$INSTALL/PortPilot.app/Contents/Helpers"
     printf '#!/bin/sh\nexit 0\n' > "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
     chmod +x "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
-    run_updater --force
+}
+HELPER_PLIST_NAME="com.portpilot.managed-helper.plist"
+helper_plist() { echo "$ROOT/LaunchAgents/$HELPER_PLIST_NAME"; }
+install_helper_agent() {
+    mkdir -p "$ROOT/LaunchAgents"
+    printf '<plist/>\n' > "$(helper_plist)"
+}
+notify_count() { grep -c "display notification" "$ROOT/notifications" 2>/dev/null || true; }
+
+test_bundled_helper_without_agent_still_updates() {
+    start "a bundled helper with no launch agent must not freeze auto-updates forever"
+    setup
+    install_app_version 0.0.1
+    add_bundled_helper
+    mkdir -p "$STATE"
+    printf "healthy:0.4.0\n" > "$STATE/helper-defer-notified"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
-    assert_contains "explains lifecycle gate" "$OUTPUT" "managed helper upgrade requires a verified lifecycle transaction"
+    assert_eq "new version installed" "$(installed_version_of)" "0.4.0"
+    assert_eq "no staged bundle left" "$(staged_bundle_count)" "0"
+    assert_absent "stale defer memo cleared once the agent is gone" "$STATE/helper-defer-notified"
+    teardown
+}
+
+test_managed_helper_defers_even_force() {
+    start "an active helper launch agent must defer replacement even with --force, and say so once per version"
+    setup
+    install_app_version 0.0.1
+    add_bundled_helper
+    install_helper_agent
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs the deferral" "$OUTPUT" "managed helper is active"
     assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
     assert_exists "helper retained" "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
+    assert_eq "notified once" "$(notify_count)" "1"
+    assert_contains "names the supported path" "$(cat "$ROOT/notifications")" "managed-helper.py upgrade --candidate"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "second run still deferred" "$(installed_version_of)" "0.0.1"
+    assert_eq "second run does not re-notify" "$(notify_count)" "1"
+    printf 'VERSION=0.5.0\nBUILD=4\n' > "$PROJECT/VERSION"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "new target version notifies again" "$(notify_count)" "2"
+    assert_eq "still retained after new version" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_agent_with_broken_install_notifies() {
+    start "an active helper agent plus a broken install must notify, not skip silently"
+    setup
+    mkdir -p "$INSTALL/PortPilot.app/Contents"
+    printf '<plist/>\n' > "$INSTALL/PortPilot.app/Contents/Info.plist"
+    install_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "notified once" "$(notify_count)" "1"
+    assert_contains "mentions the broken install" "$(cat "$ROOT/notifications")" "broken"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "not re-notified on the next run" "$(notify_count)" "1"
+    assert_absent "bundle not replaced under an active helper" "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"
     teardown
 }
 
@@ -990,7 +1044,9 @@ test_build_failure_notifies() {
 }
 
 # ------------------------------------------------------------------------ main
+test_bundled_helper_without_agent_still_updates
 test_managed_helper_defers_even_force
+test_helper_agent_with_broken_install_notifies
 test_up_to_date
 test_dirty_sources_skip
 test_untracked_scratch_does_not_block

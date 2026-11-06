@@ -34,6 +34,13 @@ LOG_MAX_BYTES=$((2 * 1024 * 1024))
 STATE_DIR="${PORTPILOT_STATE_DIR:-$HOME/Library/Application Support/PortPilot}"
 BACKUP_DIR="$STATE_DIR/backups"
 FAILED_LAUNCH_MEMO="$STATE_DIR/last-failed-launch"
+# The managed helper runs from inside the installed bundle only when it has been
+# registered as this per-user launch agent. Overridable so tests never see the
+# real one.
+HELPER_PLIST="${PORTPILOT_HELPER_PLIST:-$HOME/Library/LaunchAgents/com.portpilot.managed-helper.plist}"
+# Records which version we already told the user about, so a 6-hourly run does
+# not repeat the same notification.
+HELPER_DEFER_MEMO="$STATE_DIR/helper-defer-notified"
 # Which commit the installed bundle was actually built from. Version equality is
 # not a proxy for this: a fast-forward advances the clone before the build runs,
 # so a commit that leaves VERSION untouched and then fails to build would look
@@ -266,11 +273,34 @@ if [ "$DRY_RUN" = false ]; then
     done
 fi
 
-# Managed-helper upgrades require quiescence, checkpointing, and demonstrated
-# launchd child recovery. Until that transaction is accepted, defer even --force.
+# The bundled helper is just a file until it is registered as the launch agent
+# (HELPER_PLIST), which runs it from inside the installed bundle. Only then is
+# replacing the bundle unsafe: the swap must be quiesced, checkpointed,
+# health-checked and rolled back by `scripts/managed-helper.py upgrade
+# --candidate <built app>`. So: no agent means the normal path; an agent means
+# defer, even with --force, and tell the user once per target version.
+# A broken install (no main executable) is reported too, but never repaired here,
+# since the repair would replace the bundle under the active helper.
 # This check precedes fetch/build/quit and never touches the helper or its state.
-if [ -x "$INSTALLED_APP/Contents/Helpers/PortPilotHelper" ]; then
-    skip "managed helper upgrade requires a verified lifecycle transaction; existing installation retained"
+if [ -f "$HELPER_PLIST" ]; then
+    DEFER_KEY="$(sed -n 's/^[[:space:]]*VERSION=//p' "$PROJECT_DIR/VERSION" 2>/dev/null | head -1 | tr -d '"'"'"' \t\r')"
+    DEFER_KEY="${DEFER_KEY:-unknown}"
+    if [ -x "$INSTALLED_APP/Contents/MacOS/$APP_NAME" ]; then
+        DEFER_MSG="Update to v$DEFER_KEY is on hold: the managed helper is active. Run scripts/managed-helper.py upgrade --candidate <built app> to upgrade it."
+        DEFER_REASON="managed helper is active (launch agent installed); bundle replacement must go through scripts/managed-helper.py upgrade --candidate <built app>; existing installation retained"
+        DEFER_KEY="healthy:$DEFER_KEY"
+    else
+        DEFER_MSG="Port Pilot is broken or missing, but the managed helper is active so it cannot be repaired automatically. Run scripts/managed-helper.py upgrade --candidate <built app>."
+        DEFER_REASON="managed helper is active and the installed app is broken or missing; not repairing under an active helper; use scripts/managed-helper.py upgrade --candidate <built app>"
+        DEFER_KEY="broken:$DEFER_KEY"
+    fi
+    if [ "$DRY_RUN" = false ] && [ "$(sed -n 1p "$HELPER_DEFER_MEMO" 2>/dev/null || true)" != "$DEFER_KEY" ]; then
+        notify "$DEFER_MSG"
+        printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
+    fi
+    skip "$DEFER_REASON"
+elif [ -f "$HELPER_DEFER_MEMO" ] && [ "$DRY_RUN" = false ]; then
+    rm -f "$HELPER_DEFER_MEMO" 2>/dev/null || true
 fi
 
 # ------------------------------------------------------------------ preflight
@@ -637,7 +667,7 @@ if [ "$WAS_RUNNING" = false ]; then
 fi
 
 # Clear the memo: this commit installed and launched fine.
-rm -f "$FAILED_LAUNCH_MEMO" 2>/dev/null || true
+rm -f "$FAILED_LAUNCH_MEMO" "$HELPER_DEFER_MEMO" 2>/dev/null || true
 
 mkdir -p "$STATE_DIR"
 if [ "$DIRTY_BUILD" = true ]; then
