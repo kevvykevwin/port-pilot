@@ -275,6 +275,21 @@ run_updater() {
 
 # ----------------------------------------------------------------------- tests
 
+test_managed_helper_defers_even_force() {
+    start "managed helper defers replacement until lifecycle recovery is verified"
+    setup
+    install_app_version 0.0.1
+    mkdir -p "$INSTALL/PortPilot.app/Contents/Helpers"
+    printf '#!/bin/sh\nexit 0\n' > "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
+    chmod +x "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
+    run_updater --force
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "explains lifecycle gate" "$OUTPUT" "managed helper upgrade requires a verified lifecycle transaction"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    assert_exists "helper retained" "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
+    teardown
+}
+
 # An idle run must be cheap and silent — this is 99% of the 6-hourly firings.
 test_up_to_date() {
     start "idle run with a current install does nothing"
@@ -975,6 +990,7 @@ test_build_failure_notifies() {
 }
 
 # ------------------------------------------------------------------------ main
+test_managed_helper_defers_even_force
 test_up_to_date
 test_dirty_sources_skip
 test_untracked_scratch_does_not_block

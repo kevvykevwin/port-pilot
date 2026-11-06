@@ -23,9 +23,14 @@ swift build -c release
 echo "Creating .app bundle..."
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/Resources/bin"
+mkdir -p "$APP_DIR/Contents/Helpers"
 
 cp .build/release/PortPilot "$APP_DIR/Contents/MacOS/"
+cp .build/release/PortPilotHelper "$APP_DIR/Contents/Helpers/PortPilotHelper"
+cp .build/release/PortPilotCLI "$APP_DIR/Contents/Resources/bin/portpilot"
+cp "$VERSION_FILE" "$APP_DIR/Contents/Resources/VERSION"
+cp scripts/managed-helper.py "$APP_DIR/Contents/Resources/bin/managed-helper.py"
 cp Assets/icon.svg "$APP_DIR/Contents/Resources/"
 
 cat > "$APP_DIR/Contents/Info.plist" << PLIST
@@ -60,6 +65,8 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
 PLIST
 
 echo "Code signing..."
+codesign -s - --force "$APP_DIR/Contents/Helpers/PortPilotHelper"
+codesign -s - --force "$APP_DIR/Contents/Resources/bin/portpilot"
 codesign -s - --force "$APP_DIR"
 
 echo "Done! App at: $APP_DIR"

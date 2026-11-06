@@ -3,6 +3,7 @@ import PortPilotCore
 
 struct PortListView: View {
     let store: PortStore
+    var managedReports: [ManagedServiceReport] = []
 
     var body: some View {
         let labels = ProjectDisplayName.labels(for: store.entries.compactMap { store.projectOwner(for: $0) })
@@ -11,7 +12,7 @@ struct PortListView: View {
         LazyVStack(alignment: .leading, spacing: 12) {
             ForEach(store.grouped) { group in
                 CollapsibleSection(group: group, store: store, projectDisplayNames: labels,
-                                   reviewProjects: reviewProjects, overlappingRows: overlappingRows)
+                                   reviewProjects: reviewProjects, overlappingRows: overlappingRows, managedReports: managedReports)
             }
         }
     }
@@ -23,15 +24,17 @@ private struct CollapsibleSection: View {
     let projectDisplayNames: [String: String]
     let reviewProjects: Set<String>
     let overlappingRows: Set<String>
+    let managedReports: [ManagedServiceReport]
     @State private var isCollapsed: Bool
 
     init(group: PortGroup, store: PortStore, projectDisplayNames: [String: String],
-         reviewProjects: Set<String>, overlappingRows: Set<String>) {
+         reviewProjects: Set<String>, overlappingRows: Set<String>, managedReports: [ManagedServiceReport]) {
         self.group = group
         self.store = store
         self.projectDisplayNames = projectDisplayNames
         self.reviewProjects = reviewProjects
         self.overlappingRows = overlappingRows
+        self.managedReports = managedReports
         self._isCollapsed = State(initialValue: group.collapsedByDefault)
     }
 
@@ -53,6 +56,7 @@ private struct CollapsibleSection: View {
                         classification: store.classification(for: entry),
                         bindingSummary: store.bindingSummary(for: entry),
                         serveFindings: store.serveFindings(for: entry),
+                        managedAssociation: ManagedListenerAssociation.match(entry, reports: managedReports),
                         onCategoryChange: { store.setCategory($0, for: entry) }
                     )
                 }
