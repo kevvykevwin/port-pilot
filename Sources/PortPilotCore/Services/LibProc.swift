@@ -9,6 +9,16 @@ private let PROX_FDTYPE_SOCKET: UInt32 = 2
 
 public enum LibProc {
 
+    /// Parent and start time come from one kernel read, never from parsed `ps`
+    /// output. Callers must revalidate the parent before accepting ancestry.
+    public static func processAncestry(pid: pid_t) -> (parent: pid_t, start: Date)? {
+        var info = proc_bsdinfo()
+        let size = MemoryLayout<proc_bsdinfo>.size
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size else { return nil }
+        return (pid_t(info.pbi_ppid), Date(timeIntervalSince1970:
+            Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000))
+    }
+
     // MARK: - PID Enumeration
 
     /// Returns all active PIDs on the system.

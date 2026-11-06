@@ -266,6 +266,13 @@ if [ "$DRY_RUN" = false ]; then
     done
 fi
 
+# Managed-helper upgrades require quiescence, checkpointing, and demonstrated
+# launchd child recovery. Until that transaction is accepted, defer even --force.
+# This check precedes fetch/build/quit and never touches the helper or its state.
+if [ -x "$INSTALLED_APP/Contents/Helpers/PortPilotHelper" ]; then
+    skip "managed helper upgrade requires a verified lifecycle transaction; existing installation retained"
+fi
+
 # ------------------------------------------------------------------ preflight
 command -v git   >/dev/null 2>&1 || die "git not found on PATH"
 command -v swift >/dev/null 2>&1 || die "swift toolchain not found on PATH (Xcode / CLT missing?)"

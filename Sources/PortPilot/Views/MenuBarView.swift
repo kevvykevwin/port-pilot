@@ -3,6 +3,7 @@ import PortPilotCore
 
 struct MenuBarView: View {
     @Bindable var store: PortStore
+    @State private var managedReports: [ManagedServiceReport] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -37,6 +38,9 @@ struct MenuBarView: View {
                 Divider()
             }
 
+            ManagedServicesView(onReports: { managedReports = $0 })
+            Divider()
+
             // MARK: - Port List or Empty State
             if store.scanError != nil && !store.entries.isEmpty {
                 HStack(spacing: 8) {
@@ -65,7 +69,7 @@ struct MenuBarView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    PortListView(store: store)
+                    PortListView(store: store, managedReports: managedReports)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }

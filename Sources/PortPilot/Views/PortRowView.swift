@@ -9,6 +9,7 @@ struct PortRowView: View {
     let classification: ProcessClassification
     let bindingSummary: String
     var serveFindings: [ServeRouteFinding] = []
+    var managedAssociation: ManagedListenerAssociation? = nil
     var onCategoryChange: (PortCategory?) -> Void
 
     private enum KillState: Equatable {
@@ -81,7 +82,7 @@ struct PortRowView: View {
     }
 
     private func beginGracefulTermination() {
-        guard killTask == nil else { return }
+        guard killTask == nil, managedAssociation == nil else { return }
 
         killConfirmResetTask?.cancel()
         killConfirmResetTask = nil
@@ -249,6 +250,10 @@ struct PortRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .help(classification.reason + "\n" + bindingSummary)
+                if let association = managedAssociation {
+                    Text(association.label).font(.caption2).foregroundStyle(.secondary)
+                    Text("Use Managed services for ownership and stop decisions.").font(.caption2).foregroundStyle(.secondary)
+                }
 
                 if let desc = entry.vsCodeExtensionDescription {
                     Text(desc)
@@ -305,8 +310,8 @@ struct PortRowView: View {
                     killButtonLabel
                 }
                 .buttonStyle(.borderless)
-                .disabled(killState == .terminating || killState == .forceKilling)
-                .help(killHelp)
+                .disabled(managedAssociation != nil || killState == .terminating || killState == .forceKilling)
+                .help(managedAssociation == nil ? killHelp : "Use the shared decision in Managed services.")
             }
         }
         .padding(.vertical, 4)
@@ -333,6 +338,7 @@ struct PortRowView: View {
             Button("Copy PID")          { copy(String(entry.pid)) }
             if ProcessClassifier.allowsTermination(entry) {
                 Button("Copy Terminate Command") { copy("kill -TERM \(entry.pid)") }
+                    .disabled(managedAssociation != nil)
             }
             ForEach(serveFindings, id: \.route) { finding in
                 Button(removalMenuTitle(for: finding.route)) { copy(finding.route.removalCommand) }

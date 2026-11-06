@@ -58,7 +58,7 @@ public enum ProcessClassifier {
     ]
     private static let infrastructure: Set<String> = [
         "cloudflared", "cliproxyapi", "caddy", "nginx", "haproxy", "traefik",
-        "dockerd", "com.docker.backend", "tailscaled", "portless",
+        "dockerd", "com.docker.backend", "tailscaled", "portless", "PortPilotHelper",
     ]
 
     /// Tailscale's networking extension, which owns every Serve selector listener.
