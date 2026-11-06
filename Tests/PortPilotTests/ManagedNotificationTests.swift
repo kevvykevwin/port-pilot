@@ -1141,6 +1141,60 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
         await aEqual(await list(e, c, registry: restart(e)).error, .unauthorized)
     }
 
+    private func twoFaultEnv(sidecar sidecarFault: Fault, tombstone tombstoneFault: Fault) throws -> Env {
+        let root = try directory()
+        let disk = try ManagedPersistence(root: root, writeFault: { name in
+            (sidecarFault.value && name == "export-state.json") || (tombstoneFault.value && name.hasPrefix("export-revoked-")) })
+        var state = ManagedState(); state.services = [seededService(name: "alpha")]; try disk.commit(state)
+        let clock = Clock()
+        let registry = ManagedRegistry(persistence: disk, actors: actors, uptime: { clock.time }, now: { clock.date }, identity: { _ in nil })
+        return Env(registry: registry, disk: disk, root: root, clock: clock, services: state.services)
+    }
+
+    func testDisableWithTombstoneAndSidecarBothFailingStaysRevokedAcrossRestart() async throws {
+        // Bug caught: the tombstone write error was ignored, so when the sidecar write also failed the disk
+        // still said "active" with no marker and a helper restart revived the already-issued read credential.
+        let sidecarFault = Fault(), tombstoneFault = Fault(); let e = try twoFaultEnv(sidecar: sidecarFault, tombstone: tombstoneFault)
+        let c = try await enroll(e, e.services)
+        sidecarFault.value = true; tombstoneFault.value = true
+        await aEqual(await disable(e, c).error, .recoveryRequired)
+        await aEqual(await list(e, c).error, .recoveryRequired, "same process: refused while revocation is not durable")
+        // Restart while writes are still failing: the old credential must not be accepted.
+        let restarted = restart(e)
+        let during = await list(e, c, registry: restarted).error
+        XCTAssertNotNil(during, "credential served after restart although revocation never became durable")
+        await aEqual(during, .recoveryRequired)
+        // Restart after writes recover: revocation is persisted before serving, then the credential is unauthorized.
+        sidecarFault.value = false; tombstoneFault.value = false
+        await aEqual(await list(e, c, registry: restart(e)).error, .unauthorized)
+        await aEqual(await list(e, c, registry: restarted).error, .unauthorized)
+        let book = try sidecar(e)
+        XCTAssertEqual(((book["enrollments"] as? [[String: Any]])?.first?["state"]) as? String, "revoked")
+    }
+
+    func testDisableWithOnlyTombstoneFailingStillSucceedsAndRestartShowsRevoked() async throws {
+        // Bug caught: treating a failed tombstone as fatal (or leaving "active" on disk) when the sidecar write succeeded.
+        let sidecarFault = Fault(), tombstoneFault = Fault(); let e = try twoFaultEnv(sidecar: sidecarFault, tombstone: tombstoneFault)
+        let c = try await enroll(e, e.services)
+        tombstoneFault.value = true
+        await aNil(await disable(e, c).error)
+        await aEqual(await list(e, c).error, .unauthorized)
+        await aEqual(await list(e, c, registry: restart(e)).error, .unauthorized)
+        let book = try sidecar(e)
+        XCTAssertEqual(((book["enrollments"] as? [[String: Any]])?.first?["state"]) as? String, "revoked")
+    }
+
+    func testActiveEnrollmentWhoseCredentialFileVanishedLoadsAsRevoked() async throws {
+        // Bug caught: an active sidecar entry with its credential file deleted (the leftover of a revocation
+        // that could not be written) being trusted as active after restart.
+        let e = try env()
+        let c = try await enroll(e, e.services)
+        try FileManager.default.removeItem(at: c.file)
+        await aEqual(await list(e, c, registry: restart(e)).error, .unauthorized)
+        let book = try sidecar(e)
+        XCTAssertEqual(((book["enrollments"] as? [[String: Any]])?.first?["state"]) as? String, "revoked")
+    }
+
     func testMissingSidecarWithCredentialOrTombstoneFilesFailsExportClosed() async throws {
         // Bug caught: a lost sidecar resetting epochHighWater to 0 so epochs and revocations are forgotten.
         let e = try env()

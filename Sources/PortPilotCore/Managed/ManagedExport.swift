@@ -343,6 +343,17 @@ enum ManagedExportStore {
                 pending = true
             }
         }
+        // Last line of defence when a revocation could not be made durable at all (tombstone AND sidecar
+        // writes failed): `disable` removes the enrollment's credential files, so an "active" enrollment
+        // with no credential file for its epoch was revoked, or lost its only delivery path. Either way it
+        // loads as revoked and `pending` forces a persist before any export request is served.
+        for i in book.enrollments.indices where book.enrollments[i].state == .active
+            && persistence.names(withPrefix: "\(credentialPrefix)\(book.enrollments[i].epoch)-").isEmpty {
+            book.enrollments[i].state = .revoked
+            book.enrollments[i].revokedAt = Date()
+            book.enrollments[i].shutdownChallenge = randomHex(16)
+            pending = true
+        }
         return (book, nil, pending)
     }
     static func randomBytes(_ count: Int) -> [UInt8] {
@@ -595,14 +606,20 @@ extension ManagedRegistry {
             // Durable marker first, so a crash or write failure below cannot leave "active" as the only disk truth.
             let tombstone = ManagedExportTombstone(enrollmentId: revoked.id, epoch: revoked.epoch,
                 revokedAt: Int(revoked.revokedAt?.timeIntervalSince1970 ?? 0), shutdownChallenge: revoked.shutdownChallenge ?? "")
-            try? persistence.write(Self.tombstoneName(revoked.id), data: ManagedDigest.canonical(tombstone))
+            // A failed marker is tolerated only because both fallbacks are fail-closed: if the sidecar write
+            // succeeds, disk says revoked; if it also fails, the catch below removes the credential files and
+            // `ManagedExportStore.load` treats "active enrollment, no credential file" as revoked after a restart.
+            do { try persistence.write(Self.tombstoneName(revoked.id), data: ManagedDigest.canonical(tombstone)) }
+            catch { /* covered by the sidecar write below or the credential-file signal in its catch */ }
             do { try persistExport(book); try? persistence.remove(Self.tombstoneName(revoked.id)) }
             catch {
                 // Fail closed: reads stay revoked in memory, the revocation is retried before any later
                 // export request, and the credential file is removed so it cannot be replayed from disk.
                 exportBook = book
                 exportRevocationPending = true
-                for name in persistence.names(withPrefix: "\(ManagedExportStore.credentialPrefix)\(revoked.epoch)-") { try? persistence.remove(name) }
+                for name in persistence.names(withPrefix: "\(ManagedExportStore.credentialPrefix)\(revoked.epoch)-") {
+                    try? persistence.remove(name)
+                }
                 throw error
             }
         }
