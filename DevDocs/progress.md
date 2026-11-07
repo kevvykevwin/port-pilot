@@ -11,6 +11,10 @@
 
 ## Last Action
 
+2026-11-08: Added Tailscale Serve broken-link findings on `feat/serve-routes`. Port Pilot reads `tailscale serve status --json` (at most every 30 s, only with an injected reader), loopback-probes routes the scan cannot match, confirms after two dead checks at least 60 s apart, and shows a plain-language banner, a row badge and a Copy fix button. It never changes Tailscale config. Owner check (Tailscale 1.104.4): a bare `serve --https=<port> off` deletes every handler on the port, while `--set-path=/ off` removes only `/`, so web-route fixes always name their path. `ProcessClassifier.terminationBlockReason` replaces the kill button with a lock for Tailscale's IPNExtension and macOS ControlCenter (AirPlay Receiver), which macOS relaunches. `swift test`: 230 tests, 0 failures. GUI reviewed by the owner in the running app; the PR screenshot uses seed data.
+
+Previous work:
+
 Implemented the six reliability and classification improvements, ran the full XCTest suite and release build, and inspected Project/Type views with seed data. Categorization is deterministic and local; no model integration was added.
 
 ## Next Steps
@@ -128,6 +132,29 @@ Run the complete XCTest suite with `swift test`. Coverage includes:
 | 2026-10-18 | Reliability-review recommendations (uncommitted) | Socket bindings preserved with display-only aggregation; process incarnation identity; deterministic classifier catalog with local overrides; coalesced refresh with bounded `lsof` pipe drain, timeout, and cancellation; expected services per project; freshness/fallback footer; Sent vs Stopped kill states. `swift test`: 118 tests, 0 failures (`/tmp/portpilot-tests-final.log`); `swift build -c release` succeeded. Seed-window screenshots inspected; installed-app interactions not UI-tested. No commit, install, or release. |
 
 ## Deploy Log
+
+### 2026-11-08 01:23 — feat/serve-routes (full)
+<!-- deploy:bfed8cc-1794066829-ViSIMm -->
+- Files: 20 changed (`Sources/ (11), Tests/ (6), (root) (3)`)
+  - `CLAUDE.md`
+  - `Sources/PortPilot/PortPilotApp.swift`
+  - `Sources/PortPilot/Views/MenuBarView.swift`
+  - `Sources/PortPilot/Views/PortListView.swift`
+  - `Sources/PortPilot/Views/PortRowView.swift`
+  - `Sources/PortPilot/Views/ServeFindingsBanner.swift`
+  - `Sources/PortPilotCore/Services/BackendLiveness.swift`
+  - `Sources/PortPilotCore/Services/LoopbackProbe.swift`
+  - `Sources/PortPilotCore/Services/ProcessClassifier.swift`
+  - `Sources/PortPilotCore/Services/ServeRoutes.swift`
+  - `Sources/PortPilotCore/Services/ServeStatusReading.swift`
+  - `Sources/PortPilotCore/ViewModels/PortStore.swift`
+  - `Tests/PortPilotTests/LoopbackProbeTests.swift`
+  - `Tests/PortPilotTests/ProcessClassificationTests.swift`
+  - `Tests/PortPilotTests/ServeRouteStoreTests.swift`
+  - +5 more
+- Commits ahead of origin/main (2):
+  - docs: record serve-route findings and the no-kill rule
+  - feat: flag broken Tailscale links and stop offering kills that cannot work
 
 ### 2026-10-18 12:01 — feat/process-classification (full)
 <!-- deploy:72f6dfd-1792292445-azZfiu -->
