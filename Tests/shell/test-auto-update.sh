@@ -248,6 +248,29 @@ installed_version_of() {
     plutil -extract CFBundleShortVersionString raw -o - "$plist" 2>/dev/null || echo "unknown"
 }
 
+# Every invocation of the real script goes through this wrapper so that none of
+# them can reach the real launchctl, home directory or /Applications. Later
+# VAR=VAL arguments override earlier ones (env applies them left to right).
+sandbox_env() {
+    # exec: when backgrounded, $! must be the script itself, not a wrapper subshell
+    # that a signal would kill while the script keeps running.
+    exec env \
+        PATH="$SHIM:$PATH" \
+        TMPDIR="$SANDBOX_TMP" \
+        HOME="$ROOT/home" \
+        PORTPILOT_PROJECT_DIR="$PROJECT" \
+        PORTPILOT_INSTALL_ROOT="$INSTALL" \
+        PORTPILOT_STATE_DIR="$STATE" \
+        PORTPILOT_LOG_DIR="$LOGS" \
+        PORTPILOT_LAUNCHCTL="$SHIM/launchctl" \
+        LAUNCHCTL_LOG="$ROOT/launchctl.log" \
+        PORTPILOT_POLL_SECS=1 \
+        PORTPILOT_LAUNCH_SETTLE_SECS=1 \
+        FAKE_RUNNING_MARKER="$ROOT/app-running" \
+        NOTIFY_LOG="$ROOT/notifications" \
+        "$@"
+}
+
 # Runs the real script against the sandbox. Extra env comes in as VAR=VAL args.
 run_updater() {
     # Order-independent: env pairs and flags may be interleaved. Breaking at the
@@ -264,20 +287,7 @@ run_updater() {
         case "$arg" in *=*) ;; *) script_args+=("$arg") ;; esac
     done
 
-    OUTPUT="$(env \
-        PATH="$SHIM:$PATH" \
-        TMPDIR="$SANDBOX_TMP" \
-        HOME="$ROOT/home" \
-        PORTPILOT_PROJECT_DIR="$PROJECT" \
-        PORTPILOT_INSTALL_ROOT="$INSTALL" \
-        PORTPILOT_STATE_DIR="$STATE" \
-        PORTPILOT_LOG_DIR="$LOGS" \
-        PORTPILOT_LAUNCHCTL="$SHIM/launchctl" \
-        LAUNCHCTL_LOG="$ROOT/launchctl.log" \
-        PORTPILOT_POLL_SECS=1 \
-        PORTPILOT_LAUNCH_SETTLE_SECS=1 \
-        FAKE_RUNNING_MARKER="$ROOT/app-running" \
-        NOTIFY_LOG="$ROOT/notifications" \
+    OUTPUT="$(sandbox_env \
         ${env_pairs[@]+"${env_pairs[@]}"} \
         bash "$REAL_SCRIPT" ${script_args[@]+"${script_args[@]}"} 2>&1)"
     STATUS=$?
@@ -311,6 +321,10 @@ push_origin_version() {
     git -C "$tmp" commit -qam "bump to $ver"
     git -C "$tmp" push -q origin main
 }
+# The updater escapes quotes for AppleScript, so undo that to read what the user
+# will actually see (and paste).
+notices() { [ -f "$ROOT/notifications" ] && sed 's/\\"/"/g' "$ROOT/notifications"; return 0; }
+origin_tip() { git -C "$ORIGIN" rev-parse main; }
 notify_count() { [ -f "$ROOT/notifications" ] || { echo 0; return; }; grep -c "display notification" "$ROOT/notifications" || true; }
 
 test_bundled_helper_without_agent_still_updates() {
@@ -340,15 +354,14 @@ test_managed_helper_defers_even_force() {
     assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
     assert_exists "helper retained" "$INSTALL/PortPilot.app/Contents/Helpers/PortPilotHelper"
     assert_eq "notified once" "$(notify_count)" "1"
-    local msg; msg="$(cat "$ROOT/notifications")"
+    local msg; msg="$(notices)"
     assert_contains "names the target version" "$msg" "v0.4.0 is available"
-    assert_contains "names the real candidate path" "$msg" "$PROJECT/build/PortPilot.app"
-    assert_contains "names the build script" "$msg" "$PROJECT/scripts/build-app.sh"
-    assert_contains "names the supported command" "$msg" "$PROJECT/scripts/managed-helper.py upgrade --candidate $PROJECT/build/PortPilot.app"
+    assert_contains "names the real candidate path" "$msg" "\"$PROJECT/build/PortPilot.app\""
+    assert_contains "names the build script, quoted" "$msg" "\"$PROJECT/scripts/build-app.sh\""
+    assert_contains "upgrade command runs through python3 (script is not executable)" "$msg" "python3 \"$PROJECT/scripts/managed-helper.py\" upgrade --candidate \"$PROJECT/build/PortPilot.app\""
     run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "second run still deferred" "$(installed_version_of)" "0.0.1"
     assert_eq "second run does not re-notify" "$(notify_count)" "1"
-    local head_before; head_before="$(git -C "$PROJECT" rev-parse HEAD)"
     push_origin_version 0.6.0
     run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "upstream release notifies again" "$(notify_count)" "2"
@@ -356,9 +369,73 @@ test_managed_helper_defers_even_force() {
     push_origin_version 0.7.0
     run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "next release notifies again" "$(notify_count)" "3"
-    assert_eq "clone never fast-forwarded" "$(git -C "$PROJECT" rev-parse HEAD)" "$head_before"
+    assert_eq "clone is at origin's tip so the build steps build the release" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
     assert_eq "still retained after new versions" "$(installed_version_of)" "0.0.1"
     assert_absent "nothing was built" "$PROJECT/build"
+    teardown
+}
+
+test_helper_defer_fast_forwards_so_the_notice_builds_the_release() {
+    start "deferring under an active helper must fast-forward the clone, so following the notice builds the release (not the installed version)"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    push_origin_version 0.6.0
+    local old_head; old_head="$(git -C "$PROJECT" rev-parse HEAD)"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "clone moved" "$([ "$(git -C "$PROJECT" rev-parse HEAD)" != "$old_head" ] && echo yes)" "yes"
+    assert_eq "clone HEAD equals origin's tip" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
+    assert_absent "nothing built in the gate" "$PROJECT/build"
+    assert_eq "installed bundle untouched" "$(installed_version_of)" "0.0.1"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "names the new version" "$(notices)" "v0.6.0 is available"
+    assert_contains "python3 upgrade command" "$(notices)" "python3 \"$PROJECT/scripts/managed-helper.py\" upgrade --candidate \"$PROJECT/build/PortPilot.app\""
+    # Follow the notice: run the build step it names, then inspect the candidate.
+    "$PROJECT/scripts/build-app.sh"
+    assert_eq "the candidate the notice points at is the target version" \
+        "$(plutil -extract CFBundleShortVersionString raw -o - "$PROJECT/build/PortPilot.app/Contents/Info.plist")" "0.6.0"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "no repeat notice" "$(notify_count)" "1"
+    teardown
+}
+
+test_helper_defer_blocked_fast_forward_gives_merge_command() {
+    start "if the clone cannot be fast-forwarded the notice must give the merge command, not build steps that would rebuild old code"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    # Local main gets a commit origin never sees, then origin moves on: diverged.
+    printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
+    git -C "$PROJECT" commit -qam "local commit"
+    push_origin_version 0.6.0
+    local old_head; old_head="$(git -C "$PROJECT" rev-parse HEAD)"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "clone untouched" "$(git -C "$PROJECT" rev-parse HEAD)" "$old_head"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "gives the exact merge command" "$(notices)" "git -C \"$PROJECT\" merge --ff-only origin/main"
+    case "$(notices)" in *"build-app.sh"*) bad "notice still gives build steps" ;; *) ok "notice does not give build steps" ;; esac
+    assert_absent "nothing built" "$PROJECT/build"
+    assert_eq "installed bundle untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_installed_equals_target_is_silent() {
+    start "after a successful managed upgrade (installed-sha never updated) the installed version equals the target: no notice, no memo"
+    setup
+    install_app_version 0.4.0
+    install_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs the skip" "$OUTPUT" "already installed"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "no memo" "$STATE/helper-defer-notified"
+    push_origin_version 0.6.0
+    install_app_version 0.6.0
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "still silent when installed == target after a fast-forward" "$(notify_count)" "0"
+    assert_eq "clone at origin's tip" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
     teardown
 }
 
@@ -415,7 +492,57 @@ test_helper_agent_missing_version_logs_skip() {
     /bin/rm -f "$PROJECT/VERSION"
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
-    assert_contains "logs a skip" "$OUTPUT" "SKIP:"
+    assert_contains "skips for the dirty tree (the deletion is an uncommitted build-input change)" "$OUTPUT" "uncommitted changes in build inputs"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    assert_eq "no notification" "$(notify_count)" "0"
+    teardown
+}
+
+test_helper_agent_committed_missing_version_reaches_gate() {
+    start "a COMMITTED VERSION deletion with an active helper reaches the gate and skips there, not at the dirty-tree check"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    git -C "$PROJECT" rm -q VERSION
+    git -C "$PROJECT" commit -qm "drop VERSION"
+    git -C "$PROJECT" push -q origin main
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "skipped inside the helper gate" "$OUTPUT" "managed helper is active"
+    case "$OUTPUT" in *"uncommitted changes"*) bad "tripped the dirty-tree skip instead" ;; *) ok "did not trip the dirty-tree skip" ;; esac
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    assert_absent "nothing built" "$PROJECT/build"
+    teardown
+}
+
+test_no_helper_missing_version_is_an_error() {
+    start "without a helper a committed-missing VERSION must fail loudly (exit 1, ERROR), never install or notify"
+    setup
+    install_app_version 0.0.1
+    git -C "$PROJECT" rm -q VERSION
+    git -C "$PROJECT" commit -qm "drop VERSION"
+    git -C "$PROJECT" push -q origin main
+    run_updater
+    assert_eq "exits 1" "$STATUS" "1"
+    assert_contains "logs an ERROR" "$OUTPUT" "ERROR:"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "nothing built" "$PROJECT/build"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_no_helper_unparseable_version_is_an_error() {
+    start "without a helper an unparseable VERSION must fail loudly (exit 1, ERROR), never install or notify"
+    setup
+    install_app_version 0.0.1
+    printf 'this is not a version\n' > "$PROJECT/VERSION"
+    git -C "$PROJECT" commit -qam "garbage VERSION"
+    git -C "$PROJECT" push -q origin main
+    run_updater
+    assert_eq "exits 1" "$STATUS" "1"
+    assert_contains "logs an ERROR" "$OUTPUT" "ERROR:"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "nothing built" "$PROJECT/build"
     assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
     teardown
 }
@@ -431,6 +558,7 @@ test_helper_agent_missing_version_target_logs_skip() {
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
     assert_contains "logs a skip" "$OUTPUT" "SKIP:"
+    assert_contains "skipped inside the helper gate" "$OUTPUT" "managed helper is active"
     assert_contains "target version unknown" "$OUTPUT" "vunknown"
     teardown
 }
@@ -442,7 +570,9 @@ test_helper_agent_with_missing_install_points_to_uninstall() {
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
     assert_eq "notified once" "$(notify_count)" "1"
-    assert_contains "points to uninstall" "$(cat "$ROOT/notifications")" "managed-helper.py uninstall"
+    assert_contains "points to uninstall" "$(notices)" "managed-helper.py\" uninstall"
+    assert_contains "falls back to a manual bootout when the helper is not running" "$(notices)" "launchctl bootout gui/\$(id -u)/com.portpilot.managed-helper"
+    assert_contains "and removing the plist" "$(notices)" "remove $(helper_plist)"
     assert_absent "nothing installed" "$INSTALL/PortPilot.app"
     teardown
 }
@@ -1005,11 +1135,7 @@ test_linked_worktree_is_accepted() {
     # the branch guard is covered separately.
     git -C "$PROJECT" worktree add -q --detach "$ROOT/wt" main >/dev/null 2>&1
     assert_exists "worktree .git is a file" "$ROOT/wt/.git"
-    OUTPUT="$(env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
-        PORTPILOT_PROJECT_DIR="$ROOT/wt" PORTPILOT_INSTALL_ROOT="$INSTALL" \
-        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
-        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
-        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
+    OUTPUT="$(sandbox_env PORTPILOT_PROJECT_DIR="$ROOT/wt" \
         bash "$REAL_SCRIPT" --dry-run 2>&1)"
     STATUS=$?
     assert_eq "exits 0" "$STATUS" "0"
@@ -1028,12 +1154,7 @@ test_signal_mid_install_restores_the_app() {
     install_app_version 0.0.1
     seed_installed_sha
 
-    env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
-        PORTPILOT_PROJECT_DIR="$PROJECT" PORTPILOT_INSTALL_ROOT="$INSTALL" \
-        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
-        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
-        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
-        PAUSE_AFTER_BACKUP=1 PAUSE_MARKER="$ROOT/paused" \
+    sandbox_env PAUSE_AFTER_BACKUP=1 PAUSE_MARKER="$ROOT/paused" \
         bash "$REAL_SCRIPT" >/dev/null 2>&1 &
     UPDATER_PID=$!
 
@@ -1062,12 +1183,7 @@ test_signal_after_swap_restores_previous_version() {
     install_app_version 0.0.1
     seed_installed_sha
 
-    env PATH="$SHIM:$PATH" TMPDIR="$SANDBOX_TMP" HOME="$ROOT/home" \
-        PORTPILOT_PROJECT_DIR="$PROJECT" PORTPILOT_INSTALL_ROOT="$INSTALL" \
-        PORTPILOT_STATE_DIR="$STATE" PORTPILOT_LOG_DIR="$LOGS" \
-        PORTPILOT_POLL_SECS=1 PORTPILOT_LAUNCH_SETTLE_SECS=1 \
-        FAKE_RUNNING_MARKER="$ROOT/app-running" NOTIFY_LOG="$ROOT/notifications" \
-        PAUSE_AFTER_SWAP=1 PAUSE_MARKER="$ROOT/paused" \
+    sandbox_env PAUSE_AFTER_SWAP=1 PAUSE_MARKER="$ROOT/paused" \
         bash "$REAL_SCRIPT" >/dev/null 2>&1 &
     UPDATER_PID=$!
 
@@ -1166,10 +1282,16 @@ test_build_failure_notifies() {
 # ------------------------------------------------------------------------ main
 test_bundled_helper_without_agent_still_updates
 test_managed_helper_defers_even_force
+test_helper_defer_fast_forwards_so_the_notice_builds_the_release
+test_helper_defer_blocked_fast_forward_gives_merge_command
+test_helper_installed_equals_target_is_silent
 test_helper_agent_up_to_date_is_silent
 test_helper_loaded_without_plist_defers
 test_helper_dry_run_is_silent
 test_helper_agent_missing_version_logs_skip
+test_helper_agent_committed_missing_version_reaches_gate
+test_no_helper_missing_version_is_an_error
+test_no_helper_unparseable_version_is_an_error
 test_helper_agent_missing_version_target_logs_skip
 test_helper_agent_with_missing_install_points_to_uninstall
 test_helper_agent_with_broken_install_notifies

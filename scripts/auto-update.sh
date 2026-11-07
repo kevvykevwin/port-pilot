@@ -117,7 +117,10 @@ log() {
 # The bad outcomes here are invisible otherwise: launchd stdout goes to
 # /dev/null and nobody watches a log file. Surface them on the desktop.
 notify() {
-    osascript -e "display notification \"$1\" with title \"Port Pilot update\"" >/dev/null 2>&1 || true
+    # Escape for the AppleScript string literal: messages carry quoted paths.
+    local msg="${1//\\/\\\\}"
+    msg="${msg//\"/\\\"}"
+    osascript -e "display notification \"$msg\" with title \"Port Pilot update\"" >/dev/null 2>&1 || true
 }
 
 # Match only the installed bundle's executable. A name-only match also catches a
@@ -419,20 +422,53 @@ fi
 if [ "$HELPER_ACTIVE" = true ]; then
     TARGET_VERSION="$(git show "$TARGET_SHA:VERSION" 2>/dev/null | sed -n 's/^[[:space:]]*VERSION=//p' | head -1 | tr -d '"'"'"' \t\r' || true)"
     TARGET_VERSION="${TARGET_VERSION:-unknown}"
-    UPGRADE_CMD="$PROJECT_DIR/scripts/managed-helper.py upgrade --candidate $BUILT_APP"
-    BUILD_CMD="$PROJECT_DIR/scripts/build-app.sh"
+    # The notice must be copy-paste correct: managed-helper.py is not executable,
+    # so it is run through python3, and paths are quoted.
+    UPGRADE_CMD="python3 \"$PROJECT_DIR/scripts/managed-helper.py\" upgrade --candidate \"$BUILT_APP\""
+    BUILD_CMD="\"$PROJECT_DIR/scripts/build-app.sh\""
+    MERGE_CMD="git -C \"$PROJECT_DIR\" merge --ff-only origin/$BRANCH"
+    # The notice tells the user to build from the clone, so the clone must already
+    # be at the release. Building from a stale clone would reinstall the installed
+    # version and the memo would then keep the updater silent about this release.
+    # This is the same guarded fast-forward the normal path uses; the dirty-tree
+    # and unpushed-work checks have already run. The clone is not the bundle the
+    # helper runs from, so moving it is safe. Nothing is built or installed here.
+    FF_FAILED=false
+    if [ "$DRY_RUN" = false ] && [ "$BEHIND" -gt 0 ]; then
+        if git merge --ff-only "origin/$BRANCH" >/dev/null 2>&1; then
+            log "fast-forwarded ${LOCAL_SHA:0:7} -> $(git rev-parse --short=7 HEAD) (managed helper active; not building)"
+            LOCAL_SHA="$(git rev-parse HEAD)"
+            BEHIND=0
+        else
+            FF_FAILED=true
+        fi
+    fi
+    # `managed-helper.py upgrade` does not record installed-sha, so after a
+    # successful upgrade the SHA check above still reports a pending update. The
+    # installed version matching the target with the clone current means there is
+    # nothing left to do.
+    if [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$BEHIND" -eq 0 ]; then
+        skip "managed helper is active; v$INST_VERSION is already installed and the clone is current (${LOCAL_SHA:0:7})"
+    fi
     case "$INST_VERSION" in
         none)
             DEFER_STATE="missing"
-            DEFER_MSG="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically. Run $PROJECT_DIR/scripts/managed-helper.py uninstall, then rerun the updater."
-            ;;
-        broken)
-            DEFER_STATE="broken"
-            DEFER_MSG="Port Pilot is broken and v$TARGET_VERSION is available, but the managed helper is active so it cannot repair automatically. Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
+            DEFER_MSG="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically. Run python3 \"$PROJECT_DIR/scripts/managed-helper.py\" uninstall, then rerun the updater. If the helper is not running that command fails; instead run launchctl bootout gui/\$(id -u)/$HELPER_LABEL then remove $HELPER_PLIST, then rerun the updater."
             ;;
         *)
-            DEFER_STATE="healthy"
-            DEFER_MSG="Port Pilot v$TARGET_VERSION is available but the managed helper is active, so it was not installed. Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
+            if [ "$INST_VERSION" = "broken" ]; then
+                DEFER_STATE="broken"
+                DEFER_MSG="Port Pilot is broken and v$TARGET_VERSION is available, but the managed helper is active so it cannot repair automatically."
+            else
+                DEFER_STATE="healthy"
+                DEFER_MSG="Port Pilot v$TARGET_VERSION is available but the managed helper is active, so it was not installed."
+            fi
+            if [ "$FF_FAILED" = true ]; then
+                DEFER_STATE="$DEFER_STATE-noff"
+                DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded (local $BRANCH diverged, or a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
+            else
+                DEFER_MSG="$DEFER_MSG Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
+            fi
             ;;
     esac
     DEFER_KEY="$DEFER_STATE:$TARGET_VERSION:$TARGET_SHA"
@@ -443,7 +479,7 @@ if [ "$HELPER_ACTIVE" = true ]; then
         notify "$DEFER_MSG"
         printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
     fi
-    skip "managed helper is active ($DEFER_STATE install); v$TARGET_VERSION pending; bundle replacement must go through scripts/managed-helper.py upgrade --candidate $BUILT_APP; existing installation retained"
+    skip "managed helper is active ($DEFER_STATE install); v$TARGET_VERSION pending; bundle replacement must go through: $UPGRADE_CMD; existing installation retained"
 fi
 
 # A commit that builds and passes tests can still crash on launch. Without this
