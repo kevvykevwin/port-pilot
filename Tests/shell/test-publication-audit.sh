@@ -878,6 +878,14 @@ elif kind in ("zip64_local_lie", "zip64_no_extra", "zip64_csize_only"):
         ex = b""
     A = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 45, 0, 0, 0, 0x21, crc(clean), 0xFFFFFFFF, 0xFFFFFFFF, 5, len(ex)) + b"a.txt" + ex + clean
     data = finish(A + H, [cdent(b"a.txt", 0, 0, crc(cov), len(cov), len(cov), 0)])
+elif kind == "zip64_csize_ambiguous":
+    # Stored entry, only the local compressed size unset, 16-byte extra (A, B).
+    # APPNOTE order reads csize=B (matching the directory); libarchive reads
+    # csize=A and then finds the hidden deflated entry inside the span.
+    cov = clean + H
+    ex = struct.pack("<HHQQ", 1, 16, len(clean), len(cov))
+    A = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 45, 0, 0, 0, 0x21, crc(cov), 0xFFFFFFFF, len(cov), 5, len(ex)) + b"a.txt" + ex + clean
+    data = finish(A + H, [cdent(b"a.txt", 0, 0, crc(cov), len(cov), len(cov), 0)])
 elif kind == "zip64_real":
     with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
         zi = zipfile.ZipInfo("st.txt"); zi.compress_type = zipfile.ZIP_STORED
@@ -1003,9 +1011,13 @@ start "non-zero bytes after the end record stay archive_unreadable even when a z
 new_case; python3 -I "$ROOT/mkzip.py" zero_pad "$ART/padbad.zip" "$SENT"; printf 'X' >> "$ART/padbad.zip"; prepare --artifact "$ART/padbad.zip"
 expect_fail "padding then non-zero byte" "archive_unreadable"
 
-start "deflated entry with only the local compressed size unset and a 16-byte zip64 extra is accepted when consistent"
-new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
-python3 -I "$ROOT/mkzip.py" local_csize_only "$ART/lcs.zip" "$SENT"; ctl_zip "local csize only, 16-byte extra" "$ART/lcs.zip"
+start "only the local compressed size unset, 16-byte zip64 extra whose two readings differ: archive_unreadable (APPNOTE and libarchive would walk different entries)"
+new_case; python3 -I "$ROOT/mkzip.py" local_csize_only "$ART/lcs.zip" "$SENT"; prepare --artifact "$ART/lcs.zip"
+expect_fail "ambiguous local csize" "archive_unreadable"
+
+start "stored entry whose ambiguous local zip64 csize hides a deflated entry that streaming bsdtar extracts"
+new_case; python3 -I "$ROOT/mkzip.py" zip64_csize_ambiguous "$ART/amb.zip" "$SENT"; prepare --artifact "$ART/amb.zip"
+expect_fail "ambiguous csize hides entry" "archive_unreadable"
 
 start "corrupted central-directory header_offset is archive_unreadable, not an OverflowError traceback"
 new_case; python3 -I "$ROOT/mkzip.py" cd_offset_ff "$ART/off.zip" "$SENT"; prepare --artifact "$ART/off.zip"
