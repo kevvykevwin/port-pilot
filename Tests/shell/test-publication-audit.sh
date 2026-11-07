@@ -865,6 +865,39 @@ elif kind == "zip64_stream":
             with z.open("small.txt", "w") as w: w.write(b"small clean\n" * 10)
             with z.open("st.txt", "w", force_zip64=True) as w: w.write(b"more\n" * 100)
     sys.exit(0)
+elif kind in ("zip64_local_lie", "zip64_no_extra", "zip64_csize_only"):
+    # Stored entry whose local 32-bit sizes are 0xFFFFFFFF. The directory covers
+    # the hidden deflated local entry that follows; the local zip64 extra says
+    # what a stream extractor reads.
+    cov = clean + H
+    if kind == "zip64_local_lie":
+        ex = struct.pack("<HHQQ", 1, 16, len(clean), len(clean))
+    elif kind == "zip64_csize_only":
+        ex = struct.pack("<HHQQ", 1, 16, len(cov), len(clean))
+    else:
+        ex = b""
+    A = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 45, 0, 0, 0, 0x21, crc(clean), 0xFFFFFFFF, 0xFFFFFFFF, 5, len(ex)) + b"a.txt" + ex + clean
+    data = finish(A + H, [cdent(b"a.txt", 0, 0, crc(cov), len(cov), len(cov), 0)])
+elif kind == "zip64_real":
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+        zi = zipfile.ZipInfo("st.txt"); zi.compress_type = zipfile.ZIP_STORED
+        with z.open(zi, "w", force_zip64=True) as w: w.write(b"stored line\n" * 50)
+        zi = zipfile.ZipInfo("df.txt"); zi.compress_type = zipfile.ZIP_DEFLATED
+        with z.open(zi, "w", force_zip64=True) as w: w.write(b"deflated line\n" * 500)
+    sys.exit(0)
+elif kind in ("comment_zip", "comment_local", "trailing_bytes", "sig_in_cd_name", "plain_comment"):
+    inner = plain_zip([("s.txt", hid)])
+    if kind == "comment_local":
+        inner = H  # a bare local entry, no end record: only the first end record is real
+    assert sent not in inner
+    b = io.BytesIO()
+    cm = inner if kind in ("comment_zip", "comment_local") else b"plain comment text\n"
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("sig/PK\x03\x04.txt" if kind == "sig_in_cd_name" else "c.txt", clean)
+        z.comment = cm
+    data = b.getvalue()
+    if kind == "trailing_bytes":
+        data += b"\0\0\0\0 trailing"
 else:
     raise SystemExit("unknown kind")
 open(out, "wb").write(data)
@@ -919,6 +952,45 @@ ctl_zip "zip -z comment" "$ART/cmt.zip"
 ditto -c -k --keepParent "$CASE/zs/Fake.app" "$ART/d1.zip"; ctl_zip "ditto --keepParent" "$ART/d1.zip"
 ditto -c -k --sequesterRsrc --keepParent "$CASE/zs/Fake.app" "$ART/d2.zip"; ctl_zip "ditto --sequesterRsrc" "$ART/d2.zip"
 python3 -I "$ROOT/mkzip.py" zip64_stream "$ART/z64.zip" "$SENT"; ctl_zip "zip64 streaming writer" "$ART/z64.zip"
+
+for K in zip64_local_lie zip64_csize_only comment_zip comment_local trailing_bytes; do
+    case $K in
+        zip64_local_lie) T="zip64 stored entry: local zip64 extra says a small size, directory covers a hidden deflated entry" ;;
+        zip64_csize_only) T="zip64 stored entry: local zip64 compressed size differs from the directory's" ;;
+        comment_local) T="a bare deflated local entry inside the archive comment (an extractor taking the first end record reads it)" ;;
+        comment_zip) T="a complete zip inside the archive comment: local entries after the central directory" ;;
+        trailing_bytes) T="bytes after the end-of-central-directory comment" ;;
+    esac
+    start "$T [$K] (archive_unreadable)"
+    new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
+    expect_fail "$K" "archive_unreadable"
+done
+
+start "walk budget: a scanner whose archive budget is nearly spent charges walk-decoded bytes to it (own 512 MiB walk budget ignored it)"
+python3 -I - "$AUDIT" <<'PY'
+import importlib.machinery, importlib.util, io, sys, zipfile
+ld = importlib.machinery.SourceFileLoader("ap", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("ap", ld)); ld.exec_module(m)
+b = io.BytesIO()
+with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("big.txt", b"a" * 200000)
+def run(budget):
+    f = m.Findings([]); s = m.Scanner(f, []); s.archive_budget = budget
+    s.scan_blob(b.getvalue(), "x.zip", "x.zip")
+    return {c for c, _ in f.items}, s.archive_budget
+ample, left = run(10**7)
+assert not ample, ample
+assert left == 10**7 - 200000, left  # decoded once, charged once (member scan only)
+tight, _ = run(100000)
+assert "too_large" in tight, tight  # walk hits the scanner budget itself, before the member loop
+PY
+assert_eq "walk budget probe" "$?" 0
+
+start "positive controls: real zip64 (stored + deflated, force_zip64), plain zip comment, PK local signature inside a directory name"
+new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
+python3 -I "$ROOT/mkzip.py" zip64_real "$ART/real64.zip" "$SENT"; ctl_zip "real zip64" "$ART/real64.zip"
+python3 -I "$ROOT/mkzip.py" plain_comment "$ART/pc.zip" "$SENT"; ctl_zip "plain comment" "$ART/pc.zip"
+python3 -I "$ROOT/mkzip.py" sig_in_cd_name "$ART/sig.zip" "$SENT"; ctl_zip "signature in name" "$ART/sig.zip"
 
 start "corrupt xz is archive_unreadable, not a LZMAError traceback"
 new_case; printf '\3757zXZ\000garbage' > "$ART/bad.xz"; prepare --artifact "$ART/bad.xz"

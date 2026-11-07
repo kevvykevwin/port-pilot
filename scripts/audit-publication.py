@@ -375,7 +375,7 @@ class Scanner:
             if len(infos) > MAX_ARCHIVE_MEMBERS:
                 self.f.add("archive_limit", loc)
                 return
-            consistent, bodies = _walk_zip(data, infos, zf.start_dir)
+            consistent, bodies = _walk_zip(data, infos, zf.start_dir, max(self.archive_budget, 0))
             if not consistent:
                 # zipfile trusts only the central directory; a stream extractor
                 # (bsdtar -xOf -) walks local headers and can read entries the
@@ -385,6 +385,8 @@ class Scanner:
                     if not self._take_budget(len(body), loc):
                         return
                     self.scan_bytes(body, f"{loc}!{name}#local-header")
+            # Release the walk's decoded bodies before the member loop.
+            bodies = None
             for info in infos:
                 mloc = f"{loc}!{info.filename}"
                 if not self._member_ok(info.filename, mloc) or info.is_dir():
@@ -478,16 +480,66 @@ def _data_descriptor_end(data, pos, crc, csize, usize, boundaries):
     return None
 
 
-def _walk_zip(data, infos, start_dir):
+_ZIP64_UNSET = 0xFFFFFFFF
+
+
+def _local_zip64_sizes(extra, need_usize, need_csize):
+    """Read (usize, csize) from the zip64 extra (id 0x0001) of a local header.
+    A local header carries both sizes in it. Returns None if missing/malformed."""
+    pos = 0
+    while pos + 4 <= len(extra):
+        hid, hlen = struct.unpack("<HH", extra[pos : pos + 4])
+        field = extra[pos + 4 : pos + 4 + hlen]
+        pos += 4 + hlen
+        if len(field) != hlen:
+            return None
+        if hid != 1:
+            continue
+        want = 8 * (bool(need_usize) + bool(need_csize))
+        if hlen < want:
+            return None
+        vals = list(struct.unpack("<" + "Q" * (want // 8), field[:want]))
+        usize = vals.pop(0) if need_usize else None
+        csize = vals.pop(0) if need_csize else None
+        return usize, csize
+    return None
+
+
+def _zip_tail_ok(data, start_dir):
+    """The central directory must be followed only by its end records, with the
+    end-record comment running exactly to end of data, and no local-header
+    signature after the directory outside the directory's own records."""
+    pos = start_dir
+    while data.startswith(b"PK\x01\x02", pos):
+        if len(data) < pos + 46:
+            return False
+        n, m, k = struct.unpack("<HHH", data[pos + 28 : pos + 34])
+        pos += 46 + n + m + k
+    if data.startswith(b"PK\x06\x06", pos):
+        if len(data) < pos + 12:
+            return False
+        pos += 12 + struct.unpack("<Q", data[pos + 4 : pos + 12])[0]
+    if data.startswith(b"PK\x06\x07", pos):
+        pos += 20
+    if not data.startswith(b"PK\x05\x06", pos) or len(data) < pos + 22:
+        return False
+    clen = struct.unpack("<H", data[pos + 20 : pos + 22])[0]
+    if pos + 22 + clen != len(data):
+        return False
+    return data.find(ZIP_LOCAL_SIG, pos) == -1
+
+
+def _walk_zip(data, infos, start_dir, budget=MAX_ARCHIVE_TOTAL_BYTES):
     """Walk local headers the way a streaming extractor does and compare with
     the central directory. Returns (consistent, bodies); bodies holds
     (name, decoded bytes) for entries whose local view differs from the
-    directory or that the directory does not list, so callers can scan them."""
+    directory or that the directory does not list, so callers can scan them.
+    Decoding is bounded by budget (the scanner's remaining archive budget);
+    exceeding it raises _TooLarge."""
     by_offset = {i.header_offset: i for i in infos}
     boundaries = set(by_offset) | {start_dir}
     consistent = len(by_offset) == len(infos)
     bodies, seen, cursor = [], set(), 0
-    budget = MAX_ARCHIVE_TOTAL_BYTES
     try:
         while cursor < start_dir and data.startswith(ZIP_LOCAL_SIG, cursor):
             if len(data) < cursor + 30:
@@ -497,6 +549,7 @@ def _walk_zip(data, infos, start_dir):
             )
             lname = data[cursor + 30 : cursor + 30 + nlen]
             body_start = cursor + 30 + nlen + elen
+            extra = data[cursor + 30 + nlen : body_start]
             info = by_offset.get(cursor)
             seen.add(cursor)
             entry_ok = info is not None
@@ -511,14 +564,26 @@ def _walk_zip(data, infos, start_dir):
                 consistent = False
                 raise _WalkStop  # encrypted / unsupported: cannot find the end
             has_dd = bool(flags & 0x8)
+            z64 = None
+            if _ZIP64_UNSET in (csize, usize):
+                z64 = _local_zip64_sizes(extra, usize == _ZIP64_UNSET, csize == _ZIP64_UNSET)
+                if z64 is None:
+                    consistent = False
+                    raise _WalkStop  # zip64 sizes promised but absent / malformed
+                if usize == _ZIP64_UNSET:
+                    usize = z64[0]
+                if csize == _ZIP64_UNSET:
+                    csize = z64[1]
+                if info is not None and not has_dd and (
+                    (usize, csize) != (info.file_size, info.compress_size)
+                ):
+                    entry_ok = False
             if method == 8:
                 body, end = _inflate_span(data, body_start, budget)
             else:
                 if has_dd:
                     raise _WalkStop  # stored + descriptor: end is not knowable
-                if csize == 0xFFFFFFFF and info is not None:
-                    csize = info.compress_size
-                if csize == 0xFFFFFFFF or body_start + csize > len(data):
+                if body_start + csize > len(data):
                     raise _WalkStop
                 body, end = data[body_start : body_start + csize], body_start + csize
             budget -= len(body)
@@ -544,7 +609,8 @@ def _walk_zip(data, infos, start_dir):
             cursor = end
     except _WalkStop:
         consistent = False
-    return (consistent and seen == set(by_offset) and cursor == start_dir), bodies
+    tail_ok = _zip_tail_ok(data, start_dir)
+    return (consistent and tail_ok and seen == set(by_offset) and cursor == start_dir), bodies
 
 
 class _TooLarge(Exception):
