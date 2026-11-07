@@ -496,17 +496,24 @@ def _local_zip64_sizes(extra, need_usize, need_csize):
             return None
         if hid != 1:
             continue
-        # APPNOTE 4.5.3: a local zip64 extra carries BOTH sizes (uncompressed,
-        # then compressed) when either field is unset. Only an extra of exactly
-        # 8 bytes is read as the single-field form.
-        if need_usize and need_csize or hlen >= 16:
+        if need_usize and need_csize:
             if hlen < 16:
                 return None
             return struct.unpack("<QQ", field[:16])
-        if hlen != 8:
+        # One size unset. APPNOTE 4.5.3 puts both sizes (uncompressed, then
+        # compressed) in a local extra, but libarchive reads only the unset
+        # field from the first 8 bytes. Accept only a reading both agree on:
+        # an extractor following the other reading would see different entries.
+        if hlen < 8:
             return None
-        (val,) = struct.unpack("<Q", field)
-        return (val, None) if need_usize else (None, val)
+        first = struct.unpack("<Q", field[:8])[0]
+        if need_usize:
+            return first, None
+        if hlen >= 16 and struct.unpack("<Q", field[8:16])[0] != first:
+            return None
+        if hlen != 8 and hlen < 16:
+            return None
+        return None, first
     return None
 
 
