@@ -434,6 +434,10 @@ if [ "$HELPER_ACTIVE" = true ]; then
     # and unpushed-work checks have already run. The clone is not the bundle the
     # helper runs from, so moving it is safe. Nothing is built or installed here.
     FF_FAILED=false
+    # Remember whether the clone was behind BEFORE fast-forwarding: a fast-forward
+    # sets BEHIND=0, and a fix commit that leaves VERSION unchanged must not then be
+    # mistaken for "installed == target and the clone is current".
+    PRE_FF_BEHIND="$BEHIND"
     if [ "$DRY_RUN" = false ] && [ "$BEHIND" -gt 0 ]; then
         if git merge --ff-only "origin/$BRANCH" >/dev/null 2>&1; then
             log "fast-forwarded ${LOCAL_SHA:0:7} -> $(git rev-parse --short=7 HEAD) (managed helper active; not building)"
@@ -447,7 +451,7 @@ if [ "$HELPER_ACTIVE" = true ]; then
     # successful upgrade the SHA check above still reports a pending update. The
     # installed version matching the target with the clone current means there is
     # nothing left to do.
-    if [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$BEHIND" -eq 0 ]; then
+    if [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$PRE_FF_BEHIND" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
         skip "managed helper is active; v$INST_VERSION is already installed and the clone is current (${LOCAL_SHA:0:7})"
     fi
     case "$INST_VERSION" in
@@ -465,7 +469,12 @@ if [ "$HELPER_ACTIVE" = true ]; then
             fi
             if [ "$FF_FAILED" = true ]; then
                 DEFER_STATE="$DEFER_STATE-noff"
-                DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded (local $BRANCH diverged, or a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
+                if [ "$AHEAD" -gt 0 ]; then
+                    # Diverged: git merge --ff-only can never succeed here.
+                    DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded: local $BRANCH has $AHEAD unpushed commit(s). Push them or rebase them onto origin/$BRANCH, then rerun the updater and it will give the build steps."
+                else
+                    DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded (a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
+                fi
             else
                 DEFER_MSG="$DEFER_MSG Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
             fi
@@ -476,7 +485,9 @@ if [ "$HELPER_ACTIVE" = true ]; then
         skip "DRY RUN: managed helper is active ($DEFER_STATE install); would notify about v$TARGET_VERSION and leave the installation alone"
     fi
     if [ "$(sed -n 1p "$HELPER_DEFER_MEMO" 2>/dev/null || true)" != "$DEFER_KEY" ]; then
-        notify "$DEFER_MSG"
+        # The notification text cannot be copied; the log keeps the full commands.
+        log "$DEFER_MSG"
+        notify "$DEFER_MSG Details: $LOG_FILE"
         printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
     fi
     skip "managed helper is active ($DEFER_STATE install); v$TARGET_VERSION pending; bundle replacement must go through: $UPGRADE_CMD; existing installation retained"

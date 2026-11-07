@@ -150,7 +150,18 @@ OPEN
 #!/bin/bash
 case "$*" in
     *"quit app"*)             [ "${QUIT_FAILS:-0}" = "1" ] || rm -f "$FAKE_RUNNING_MARKER" ;;
-    *"display notification"*) printf '%s\n' "$*" >> "$NOTIFY_LOG" ;;
+    *"display notification"*)
+        printf '%s\n' "$*" >> "$NOTIFY_LOG"
+        # Compile (never run) the script: unescaped quotes or backslashes in the
+        # message make it invalid AppleScript, which real osascript would reject.
+        script=""; prev=""
+        for a in "$@"; do [ "$prev" = "-e" ] && script="$a"; prev="$a"; done
+        if [ -x /usr/bin/osacompile ]; then
+            /usr/bin/osacompile -o /dev/null -e "$script" >/dev/null 2>&1 || echo "$script" >> "$NOTIFY_INVALID_LOG"
+        else
+            case "$script" in *'\"'*) ;; *) echo "$script" >> "$NOTIFY_INVALID_LOG" ;; esac
+        fi
+        ;;
 esac
 exit 0
 OSA
@@ -268,6 +279,7 @@ sandbox_env() {
         PORTPILOT_LAUNCH_SETTLE_SECS=1 \
         FAKE_RUNNING_MARKER="$ROOT/app-running" \
         NOTIFY_LOG="$ROOT/notifications" \
+        NOTIFY_INVALID_LOG="$ROOT/notifications-invalid" \
         "$@"
 }
 
@@ -324,6 +336,18 @@ push_origin_version() {
 # The updater escapes quotes for AppleScript, so undo that to read what the user
 # will actually see (and paste).
 notices() { [ -f "$ROOT/notifications" ] && sed 's/\\"/"/g' "$ROOT/notifications"; return 0; }
+invalid_notify_count() { [ -f "$ROOT/notifications-invalid" ] || { echo 0; return; }; wc -l < "$ROOT/notifications-invalid" | tr -d ' '; }
+# Pushes a non-VERSION commit (a Sources/ fix) to origin.
+push_origin_source_commit() {
+    local tmp="$ROOT/pusher"
+    /bin/rm -rf "$tmp"
+    git clone -q "$ORIGIN" "$tmp"
+    git -C "$tmp" config user.email test@example.com
+    git -C "$tmp" config user.name Test
+    printf '// upstream fix\n' >> "$tmp/Sources/Main.swift"
+    git -C "$tmp" commit -qam "fix: upstream source change"
+    git -C "$tmp" push -q origin main
+}
 origin_tip() { git -C "$ORIGIN" rev-parse main; }
 notify_count() { [ -f "$ROOT/notifications" ] || { echo 0; return; }; grep -c "display notification" "$ROOT/notifications" || true; }
 
@@ -401,11 +425,30 @@ test_helper_defer_fast_forwards_so_the_notice_builds_the_release() {
 }
 
 test_helper_defer_blocked_fast_forward_gives_merge_command() {
-    start "if the clone cannot be fast-forwarded the notice must give the merge command, not build steps that would rebuild old code"
+    start "a dirty file blocks the fast-forward: the notice gives the merge command, not build steps that would rebuild old code"
     setup
     install_app_version 0.0.1
     install_helper_agent
-    # Local main gets a commit origin never sees, then origin moves on: diverged.
+    push_origin_source_commit
+    # Local uncommitted edit to the file upstream changed: the merge is refused.
+    printf '// dirty\n' >> "$PROJECT/Sources/Main.swift"
+    local old_head; old_head="$(git -C "$PROJECT" rev-parse HEAD)"
+    # --force gets past the dirty-tree skip so the run reaches the helper gate.
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "clone untouched" "$(git -C "$PROJECT" rev-parse HEAD)" "$old_head"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "gives the exact merge command" "$(notices)" "git -C \"$PROJECT\" merge --ff-only origin/main"
+    case "$(notices)" in *"build-app.sh"*) bad "notice still gives build steps" ;; *) ok "notice does not give build steps" ;; esac
+    assert_absent "nothing built" "$PROJECT/build"
+    teardown
+}
+
+test_helper_defer_diverged_clone_says_push_or_rebase_not_merge() {
+    start "a diverged local main must be told to push or rebase its unpushed commits; git merge --ff-only can never work there"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
     printf '// local work\n' >> "$PROJECT/Sources/Main.swift"
     git -C "$PROJECT" commit -qam "local commit"
     push_origin_version 0.6.0
@@ -414,10 +457,59 @@ test_helper_defer_blocked_fast_forward_gives_merge_command() {
     assert_eq "exits 0" "$STATUS" "0"
     assert_eq "clone untouched" "$(git -C "$PROJECT" rev-parse HEAD)" "$old_head"
     assert_eq "one notice" "$(notify_count)" "1"
-    assert_contains "gives the exact merge command" "$(notices)" "git -C \"$PROJECT\" merge --ff-only origin/main"
-    case "$(notices)" in *"build-app.sh"*) bad "notice still gives build steps" ;; *) ok "notice does not give build steps" ;; esac
-    assert_absent "nothing built" "$PROJECT/build"
+    assert_contains "counts the unpushed commit" "$(notices)" "1 unpushed commit"
+    assert_contains "says push" "$(notices)" "push"
+    assert_contains "says rebase" "$(notices)" "rebase"
+    case "$(notices)" in *"merge --ff-only"*) bad "diverged notice still offers the failing merge" ;; *) ok "no failing merge command" ;; esac
+    case "$(notices)" in *"build-app.sh"*) bad "notice gives build steps" ;; *) ok "notice does not give build steps" ;; esac
     assert_eq "installed bundle untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_defer_without_version_bump_notifies_once() {
+    start "an upstream fix with VERSION unchanged is fast-forwarded and must still notify once (not be skipped as installed == target)"
+    setup
+    install_app_version 0.4.0
+    install_helper_agent
+    push_origin_source_commit
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "clone fast-forwarded" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "names the build steps" "$(notices)" "build-app.sh"
+    assert_contains "names the upgrade command" "$(notices)" "managed-helper.py"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "second run stays quiet via the memo" "$(notify_count)" "1"
+    teardown
+}
+
+test_helper_notice_is_logged_in_full_and_points_to_log() {
+    start "the notification text cannot be copied, so the full commands must be in the log and the notice must point at it"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    push_origin_version 0.6.0
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_contains "notice points to the log" "$(notices)" "Details: $LOGS/auto-update.log"
+    local logtxt; logtxt="$(cat "$LOGS/auto-update.log")"
+    assert_contains "log has the build command" "$logtxt" "\"$PROJECT/scripts/build-app.sh\""
+    assert_contains "log has the upgrade command" "$logtxt" "managed-helper.py\" upgrade --candidate"
+    teardown
+}
+
+test_notify_escapes_quotes_and_backslashes_for_applescript() {
+    start "a project path containing a double quote or backslash must still yield valid AppleScript (unescaped, the notification is silently dropped)"
+    setup
+    install_app_version 0.0.1
+    install_helper_agent
+    push_origin_version 0.6.0
+    local weird="$ROOT/we\"ird\\dir"
+    ln -s "$PROJECT" "$weird"
+    run_updater "PORTPILOT_PROJECT_DIR=$weird" "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "weird path made it into the notice" "$(cat "$ROOT/notifications")" 'we\"ird\\dir'
+    assert_eq "every notification script compiles" "$(invalid_notify_count)" "0"
     teardown
 }
 
@@ -431,11 +523,17 @@ test_helper_installed_equals_target_is_silent() {
     assert_contains "logs the skip" "$OUTPUT" "already installed"
     assert_eq "no notification" "$(notify_count)" "0"
     assert_absent "no memo" "$STATE/helper-defer-notified"
+    # Real flow: a release lands, the gate fast-forwards and notifies once, the
+    # user runs the managed upgrade (installed-sha is not updated), and later runs
+    # must stay silent because the installed version now equals the target.
     push_origin_version 0.6.0
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "release notified once" "$(notify_count)" "1"
+    assert_eq "clone at origin's tip" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
     install_app_version 0.6.0
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
-    assert_eq "still silent when installed == target after a fast-forward" "$(notify_count)" "0"
-    assert_eq "clone at origin's tip" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
+    assert_eq "silent after the managed upgrade" "$(notify_count)" "1"
+    assert_contains "logs already installed" "$OUTPUT" "already installed"
     teardown
 }
 
@@ -1284,6 +1382,10 @@ test_bundled_helper_without_agent_still_updates
 test_managed_helper_defers_even_force
 test_helper_defer_fast_forwards_so_the_notice_builds_the_release
 test_helper_defer_blocked_fast_forward_gives_merge_command
+test_helper_defer_diverged_clone_says_push_or_rebase_not_merge
+test_helper_defer_without_version_bump_notifies_once
+test_helper_notice_is_logged_in_full_and_points_to_log
+test_notify_escapes_quotes_and_backslashes_for_applescript
 test_helper_installed_equals_target_is_silent
 test_helper_agent_up_to_date_is_silent
 test_helper_loaded_without_plist_defers
