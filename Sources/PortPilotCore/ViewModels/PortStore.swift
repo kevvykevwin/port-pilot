@@ -46,14 +46,39 @@ public final class PortStore {
     private var previousSnapshot: PortSnapshot?
     @ObservationIgnored public private(set) var lastDiff: SnapshotDiff?
 
+    /// Tailscale Serve routes that have pointed at a dead loopback backend long enough to report.
+    public private(set) var serveFindings: [ServeRouteFinding] = []
+    /// Candidate routes beyond the per-evaluation probe cap, left unchecked.
+    public private(set) var uncheckedServeRouteCount = 0
+
+    private let serveReader: (any ServeStatusReading)?
+    private let backendProbe: BackendProbing
+    private let now: @Sendable () -> Date
+    private var serveAuditor = ServeRouteAuditor()
+    private var cachedServeRoutes: [ServeRoute] = []
+    private var serveRoutesReadAt: Date?
+    private var lastServeReadAttempt: Date?
+    private var serveTask: Task<Void, Never>?
+    private var serveEpoch: UInt64 = 0
+
+    private static let serveReadInterval: TimeInterval = 30
+    private static let serveRoutesTTL: TimeInterval = 300
+    private static let serveProbeLimit = 32
+
     public init(
         scanner: any PortScanning = ResilientPortScanner(),
         resolver: ProjectResolver = ProjectResolver(),
-        defaults: UserDefaults? = nil
+        defaults: UserDefaults? = nil,
+        serveReader: (any ServeStatusReading)? = nil,
+        backendProbe: @escaping BackendProbing = { await LoopbackProbe.probe(host: $0, port: $1) },
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.scanner = scanner
         self.resolver = resolver
         self.defaults = defaults
+        self.serveReader = serveReader
+        self.backendProbe = backendProbe
+        self.now = now
         self.preferences = ProcessPreferences.load(from: defaults)
     }
 
@@ -147,6 +172,12 @@ public final class PortStore {
             let keys = services.map(ProcessClassifier.serviceKey)
             return keys.contains { !expected.contains($0) } || Set(keys).count < keys.count
         })
+    }
+
+    /// Confirmed dead-backend findings for the Tailscale listener row on that selector port.
+    public func serveFindings(for entry: PortEntry) -> [ServeRouteFinding] {
+        guard !serveFindings.isEmpty, ProcessClassifier.isTailscaleServeListener(entry) else { return [] }
+        return serveFindings.filter { $0.route.port == entry.port }
     }
 
     public var conflictingRowIDs: Set<String> {
@@ -256,6 +287,9 @@ public final class PortStore {
         refreshTask?.cancel()
         refreshTask = nil
         isScanning = false
+        // Bumps serveEpoch so an in-flight evaluation is discarded; serveTask is deliberately not
+        // cancelled because it is bounded by the 5 s read deadline plus 0.5 s probes.
+        serveEpoch &+= 1
     }
 
     private func performRefresh(generation: UInt64) async {
@@ -298,6 +332,70 @@ public final class PortStore {
         lastDiff = previousSnapshot.map { snapshot.diff(from: $0) }
         previousSnapshot = snapshot
         onRefreshComplete?(lastDiff, conflicts)
+        serveEpoch &+= 1
+        startServeEvaluation(entries: scanned)
+    }
+
+    // MARK: - Serve route evaluation
+
+    /// Single-flight and off the refresh path. A publication while an evaluation runs
+    /// bumps the epoch, so that evaluation is discarded and the next publication starts fresh.
+    private func startServeEvaluation(entries: [PortEntry]) {
+        guard let reader = serveReader, serveTask == nil else { return }
+        let epoch = serveEpoch
+        serveTask = Task { [weak self] in
+            await self?.evaluateServeRoutes(reader: reader, entries: entries, epoch: epoch)
+        }
+    }
+
+    private func evaluateServeRoutes(
+        reader: any ServeStatusReading, entries: [PortEntry], epoch: UInt64
+    ) async {
+        defer { serveTask = nil }
+
+        // A negative elapsed time (clock set back) counts as due.
+        if lastServeReadAttempt.map({ let e = now().timeIntervalSince($0); return e < 0 || e >= Self.serveReadInterval }) ?? true {
+            lastServeReadAttempt = now()
+            if let data = try? await reader.read() {
+                cachedServeRoutes = ServeConfig.parse(data)
+                serveRoutesReadAt = now()
+            }
+        }
+
+        // A negative age (clock set back) counts as stale.
+        let fresh = serveRoutesReadAt.map { let age = now().timeIntervalSince($0); return age >= 0 && age <= Self.serveRoutesTTL } ?? false
+        let routes = fresh ? cachedServeRoutes : []
+
+        var results: [ServeRoute: BackendLiveness] = [:]
+        var candidates: [ServeRoute] = []
+        for route in routes {
+            guard case .loopback = route.backend else { continue }
+            if ServeRouteMatcher.isCandidate(route, entries: entries) {
+                candidates.append(route)
+            } else {
+                results[route] = .alive
+            }
+        }
+        let probed = Array(candidates.prefix(Self.serveProbeLimit))
+        let probe = backendProbe
+        await withTaskGroup(of: (ServeRoute, BackendLiveness).self) { group in
+            for route in probed {
+                guard case let .loopback(host, port) = route.backend else { continue }
+                group.addTask { (route, await probe(host, port)) }
+            }
+            for await (route, liveness) in group { results[route] = liveness }
+        }
+
+        guard epoch == serveEpoch else { return }
+        serveAuditor.record(routes: routes, results: results, at: now())
+        let confirmed = serveAuditor.confirmed
+        if confirmed != serveFindings { serveFindings = confirmed }
+        let unchecked = candidates.count - probed.count
+        if unchecked != uncheckedServeRouteCount { uncheckedServeRouteCount = unchecked }
+    }
+
+    func waitForServeEvaluation() async {
+        await serveTask?.value
     }
 
     // MARK: - Grouping

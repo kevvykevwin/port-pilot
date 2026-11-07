@@ -61,6 +61,30 @@ public enum ProcessClassifier {
         "dockerd", "com.docker.backend", "tailscaled", "portless",
     ]
 
+    /// Tailscale's networking extension, which owns every Serve selector listener.
+    public static func isTailscaleServeListener(_ entry: PortEntry) -> Bool {
+        entry.executablePath.contains("/Tailscale.app/")
+            && (entry.executablePath as NSString).lastPathComponent == "IPNExtension"
+    }
+
+    private static let controlCenterPath = "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+
+    /// Why the row offers no kill action, or nil when it may. These processes are
+    /// relaunched by macOS, so killing them never frees the port.
+    public static func terminationBlockReason(_ entry: PortEntry) -> String? {
+        if isTailscaleServeListener(entry) {
+            return "Part of Tailscale. Quit Tailscale from its own menu to stop it."
+        }
+        if entry.executablePath == controlCenterPath {
+            return "macOS AirPlay Receiver. Turn it off in System Settings → General → AirDrop & Handoff."
+        }
+        return nil
+    }
+
+    public static func allowsTermination(_ entry: PortEntry) -> Bool {
+        terminationBlockReason(entry) == nil
+    }
+
     static func isRuntimeExecutable(_ path: String) -> Bool {
         let name = (path as NSString).lastPathComponent
         return runtimes.contains(name) || name.hasPrefix("python3.")
@@ -91,7 +115,7 @@ public enum ProcessClassifier {
            script.contains("/node_modules/portless/") {
             return result(.infrastructure, .shared, "Portless runtime script")
         }
-        if path.contains("/Tailscale.app/"), executable == "IPNExtension" {
+        if isTailscaleServeListener(entry) {
             return result(.infrastructure, .app, "Tailscale app networking extension")
         }
         if infrastructure.contains(executable) {

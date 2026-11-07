@@ -29,6 +29,14 @@ struct MenuBarView: View {
 
             Divider()
 
+            if !store.serveFindings.isEmpty {
+                ServeFindingsBanner(
+                    findings: store.serveFindings,
+                    uncheckedCount: store.uncheckedServeRouteCount
+                )
+                Divider()
+            }
+
             // MARK: - Port List or Empty State
             if store.scanError != nil && !store.entries.isEmpty {
                 HStack(spacing: 8) {

@@ -8,6 +8,7 @@ struct PortRowView: View {
     var projectLabel: String? = nil
     let classification: ProcessClassification
     let bindingSummary: String
+    var serveFindings: [ServeRouteFinding] = []
     var onCategoryChange: (PortCategory?) -> Void
 
     private enum KillState: Equatable {
@@ -31,10 +32,7 @@ struct PortRowView: View {
 
     private static let killConfirmResetNs: UInt64 = 2_000_000_000  // 2s before button resets
 
-    private func copy(_ string: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-    }
+    private func copy(_ string: String) { Pasteboard.copy(string) }
 
     private var isInfrastructure: Bool {
         classification.category == .infrastructure || classification.ownership == .system
@@ -200,6 +198,16 @@ struct PortRowView: View {
             .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 
+    private var serveHelp: String {
+        let now = Date()
+        return serveFindings.map { $0.helpText(relativeTo: now) }.joined(separator: "\n")
+    }
+
+    private func removalMenuTitle(for route: ServeRoute) -> String {
+        guard serveFindings.count > 1 else { return "Copy Fix Command" }
+        return "Copy Fix Command (\(route.selectorLabel))"
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             // Port number
@@ -221,6 +229,15 @@ struct PortRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .help("Overlapping TCP listeners. This does not detect failed bind attempts.")
+            }
+
+            // Tailscale Serve route with no backend
+            if !serveFindings.isEmpty {
+                Image(systemName: "bolt.horizontal.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help(serveHelp)
+                    .accessibilityLabel("Tailscale link is broken")
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -260,15 +277,37 @@ struct PortRowView: View {
 
             Spacer()
 
-            // Kill button with confirmation
-            Button {
-                handleKillButton()
-            } label: {
-                killButtonLabel
+            if serveFindings.count > 1 {
+                // One port, several broken paths: one fix per path, never just the first.
+                Menu("Copy fix") {
+                    ForEach(serveFindings, id: \.route) { finding in
+                        Button(finding.route.selectorLabel) { copy(finding.route.removalCommand) }
+                    }
+                }
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+                .accessibilityLabel("Copy fix, \(serveFindings.count) broken links on port \(entry.port)")
+            } else if let first = serveFindings.first {
+                CopyFixButton(route: first.route)
+            } else if let reason = ProcessClassifier.terminationBlockReason(entry) {
+                Image(systemName: "lock")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .help(reason)
+                    .accessibilityLabel("Can't be stopped here. \(reason)")
+            } else {
+                // Kill button with confirmation
+                Button {
+                    handleKillButton()
+                } label: {
+                    killButtonLabel
+                }
+                .buttonStyle(.borderless)
+                .disabled(killState == .terminating || killState == .forceKilling)
+                .help(killHelp)
             }
-            .buttonStyle(.borderless)
-            .disabled(killState == .terminating || killState == .forceKilling)
-            .help(killHelp)
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 4)
@@ -292,7 +331,12 @@ struct PortRowView: View {
         .contextMenu {
             Button("Copy Port")         { copy(String(entry.port)) }
             Button("Copy PID")          { copy(String(entry.pid)) }
-            Button("Copy Terminate Command") { copy("kill -TERM \(entry.pid)") }
+            if ProcessClassifier.allowsTermination(entry) {
+                Button("Copy Terminate Command") { copy("kill -TERM \(entry.pid)") }
+            }
+            ForEach(serveFindings, id: \.route) { finding in
+                Button(removalMenuTitle(for: finding.route)) { copy(finding.route.removalCommand) }
+            }
             Divider()
             Text(classification.reason)
             Text(bindingSummary)

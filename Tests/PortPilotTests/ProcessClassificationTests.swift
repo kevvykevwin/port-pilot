@@ -26,6 +26,29 @@ final class ProcessClassificationTests: XCTestCase {
         XCTAssertEqual(PortCategory.categorize(editor), .editorServices)
     }
 
+    /// Catches the kill action reappearing on Tailscale's extension, or spreading to
+    /// look-alikes: a process merely named IPNExtension outside Tailscale.app stays killable.
+    func testTailscaleExtensionOffersNoKillButOthersDo() {
+        let tailscale = makeEntry(pid: 1, port: 4391, name: "IPNExtension",
+                                 executablePath: "/Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension")
+        XCTAssertFalse(ProcessClassifier.allowsTermination(tailscale))
+        let impostor = makeEntry(pid: 2, port: 4391, name: "IPNExtension", executablePath: "/tmp/IPNExtension")
+        XCTAssertTrue(ProcessClassifier.allowsTermination(impostor))
+        XCTAssertTrue(ProcessClassifier.allowsTermination(makeEntry(pid: 3, port: 55555, name: "cloudflared")))
+        XCTAssertTrue(ProcessClassifier.allowsTermination(makeEntry(pid: 4, port: 3000, name: "node")))
+    }
+
+    /// Catches the kill action reappearing on AirPlay Receiver (ControlCenter on 5000/7000),
+    /// which macOS relaunches at once, and checks the lock explains how to free the port.
+    func testControlCenterOffersNoKillAndPointsAtSettings() {
+        let airplay = makeEntry(pid: 778, port: 5000, name: "ControlCenter",
+                                executablePath: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter")
+        XCTAssertFalse(ProcessClassifier.allowsTermination(airplay))
+        XCTAssertTrue(ProcessClassifier.terminationBlockReason(airplay)?.contains("AirPlay Receiver") == true)
+        let impostor = makeEntry(pid: 9, port: 5000, name: "ControlCenter", executablePath: "/tmp/ControlCenter")
+        XCTAssertNil(ProcessClassifier.terminationBlockReason(impostor))
+    }
+
     func testNameAloneDoesNotOverrideExecutable() {
         let entry = makeEntry(pid: 1, port: 5432, name: "postgres", executablePath: "/opt/tools/custom")
         XCTAssertEqual(PortCategory.categorize(entry), .unknown)
