@@ -145,6 +145,8 @@ struct ManagedServicesView: View {
         } catch {
             guard generation == refreshGeneration, !Task.isCancelled else { return }
             available = false
+            // Stale associations must not keep disabling the port list's kill buttons.
+            onReports([])
         }
         loading = false
     }

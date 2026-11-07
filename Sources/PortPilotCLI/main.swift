@@ -51,6 +51,7 @@ do {
     if revisionText != nil && revision == nil { throw ManagedError.invalidInput }
     let requestId = try option("--request-id") ?? UUID().uuidString
     args.removeAll { $0 == "--json" }
+    guard !args.isEmpty else { throw ManagedError.invalidInput }
     let command = args.removeFirst()
     var payload: [String: ManagedJSON] = [:]
     let operation: String

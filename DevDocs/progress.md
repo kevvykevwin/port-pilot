@@ -11,7 +11,12 @@
   - a revocation whose tombstone and sidecar writes both fail stays revoked across a helper restart;
   - the updater no longer stops updating once the bundle contains the helper. It checks upstream first, defers only while the helper's launch agent is installed or loaded, and then notifies once per pending version with the supported `managed-helper.py upgrade` path.
 - **P4**: the owner signed the manual privacy review; the final audit of the release candidate passes and its receipt verifies.
-- Deferred review notes (non-blocking): sealed cursor length grows with global event count; retained reroute replacement children are not reaped; agent takeover treats a missing identity as exit; peer PID/start-time read window; some test rigs skip instead of fail; CLI option-only crash; persistence single read; `publishedBase` accepts any ref; build path remap uses the logical path.
+- **Release-branch review (2026-11-08)** found and fixed three blockers:
+  - the zip audit trusted the inflated stream instead of the local header size, so a deflate entry whose header size ran into the next entry could hide a file from the audit while `bsdtar` extracted it;
+  - a stopped service with a forked or restarted process tree ended in `needs_review` with no way out; it can now be run again once every recorded process is proven exited;
+  - one exited descendant made a live managed service impossible to stop; exited descendants are now pruned and skipped, while the root and any unproven process still fail closed.
+  - Also fixed: option-only CLI calls exit 2 instead of trapping, and a failed managed refresh clears stale associations so the port list's kill buttons work again.
+- Deferred review notes (non-blocking): sealed cursor length grows with global event count; retained reroute replacement children are not reaped; agent takeover treats a missing identity as exit; peer PID/start-time read window; some test rigs skip instead of fail; persistence single read; `publishedBase` accepts any ref; build path remap uses the logical path; helper file-descriptor limit under launchd; checkpoint copies of credentials are never pruned; updater checks helper activity only once before building.
 
 ## Known gaps closed; P4 dry run — 2026-11-06
 
