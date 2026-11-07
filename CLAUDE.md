@@ -36,6 +36,8 @@ Tests/
 
 - **Two targets**: `PortPilotCore` (library, all logic) + `PortPilot` (app, SwiftUI views). All core types are `public`.
 - **Scanner protocol**: `PortScanning` — `ResilientPortScanner` uses `LsofScanner` as primary and `PortScanner` (libproc) as fallback. Explicit scan failures retain the last healthy UI state. Mock via protocol for tests.
+- **Serve route findings**: `PortStore` reads `tailscale serve status --json` (≤1/30 s, only when a `serveReader` is injected — the app passes `TailscaleServeReader`, tests don't), matches loopback targets against the scan, connect-probes only unmatched ones (127.0.0.1/::1 only), and confirms a dead backend after ≥2 dead evaluations spanning ≥60 s. Port Pilot suggests the `serve … off` command; it never changes Tailscale config.
+- **No kill for relaunched processes**: `ProcessClassifier.terminationBlockReason` returns why a row offers no kill (Tailscale IPNExtension, macOS ControlCenter); matched by full executable path, never by name.
 - **Unsafe code isolation**: All `proc_*` C interop lives in `LibProc.swift`. Uses Array buffers, not manual allocate/deallocate.
 - **Concurrency**: `LsofScanner` uses `withCheckedThrowingContinuation` (not blocking `waitUntilExit`). `PortStore` polling uses `[weak self]` inside loop body with cancellation break.
 - **Refresh publication**: `PortStore` generations ensure only the newest overlapping scan can publish entries, snapshots, errors, and callbacks.
