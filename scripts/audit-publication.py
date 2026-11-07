@@ -327,6 +327,7 @@ class Scanner:
             ValueError,
             NotImplementedError,
             RuntimeError,
+            OverflowError,
         ):
             self.f.add("archive_unreadable", loc)
 
@@ -495,19 +496,23 @@ def _local_zip64_sizes(extra, need_usize, need_csize):
             return None
         if hid != 1:
             continue
-        want = 8 * (bool(need_usize) + bool(need_csize))
-        if hlen < want:
+        # APPNOTE 4.5.3: a local zip64 extra carries BOTH sizes (uncompressed,
+        # then compressed) when either field is unset. Only an extra of exactly
+        # 8 bytes is read as the single-field form.
+        if need_usize and need_csize or hlen >= 16:
+            if hlen < 16:
+                return None
+            return struct.unpack("<QQ", field[:16])
+        if hlen != 8:
             return None
-        vals = list(struct.unpack("<" + "Q" * (want // 8), field[:want]))
-        usize = vals.pop(0) if need_usize else None
-        csize = vals.pop(0) if need_csize else None
-        return usize, csize
+        (val,) = struct.unpack("<Q", field)
+        return (val, None) if need_usize else (None, val)
     return None
 
 
 def _zip_tail_ok(data, start_dir):
     """The central directory must be followed only by its end records, with the
-    end-record comment running exactly to end of data, and no local-header
+    end-record comment followed only by zero padding, and no local-header
     signature after the directory outside the directory's own records."""
     pos = start_dir
     while data.startswith(b"PK\x01\x02", pos):
@@ -524,7 +529,10 @@ def _zip_tail_ok(data, start_dir):
     if not data.startswith(b"PK\x05\x06", pos) or len(data) < pos + 22:
         return False
     clen = struct.unpack("<H", data[pos + 20 : pos + 22])[0]
-    if pos + 22 + clen != len(data):
+    # bsdtar zero-pads a zip written to a non-seekable output to a block size;
+    # extractors accept that, so only non-zero bytes after the comment are bad.
+    end = pos + 22 + clen
+    if end > len(data) or any(data[end:]):
         return False
     return data.find(ZIP_LOCAL_SIG, pos) == -1
 
