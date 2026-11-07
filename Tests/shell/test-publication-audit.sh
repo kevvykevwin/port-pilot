@@ -885,6 +885,28 @@ elif kind == "zip64_real":
         zi = zipfile.ZipInfo("df.txt"); zi.compress_type = zipfile.ZIP_DEFLATED
         with z.open(zi, "w", force_zip64=True) as w: w.write(b"deflated line\n" * 500)
     sys.exit(0)
+elif kind == "zero_pad":
+    # Synthetic stand-in for bsdtar's block padding: zeros after the end record.
+    data = plain_zip([("c.txt", clean)]) + b"\0" * (10240 - len(plain_zip([("c.txt", clean)])) % 10240)
+elif kind == "local_csize_only":
+    # Deflated entry, only the local compressed size unset: APPNOTE 4.5.3 puts
+    # BOTH sizes (uncompressed, compressed) in the 16-byte local zip64 extra.
+    ex = struct.pack("<HHQQ", 1, 16, len(clean), len(ad))
+    A = b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 45, 0, 8, 0, 0x21, crc(clean), 0xFFFFFFFF, len(clean), 5, len(ex)) + b"a.txt" + ex + ad
+    data = finish(A, [cdent(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), 0)])
+elif kind == "cd_offset_ff":
+    data = bytearray(plain_zip([("c.txt", clean)]))
+    # The 32-bit offset is 0xFFFFFFFF and the zip64 extra carries 0xFF..FF: zipfile
+    # then raises OverflowError (not BadZipFile) when it opens the member.
+    cd = data.rfind(b"PK\x01\x02")
+    nlen = struct.unpack("<H", data[cd + 28 : cd + 30])[0]
+    ex = struct.pack("<HHQ", 1, 8, 2**64 - 1)
+    data[cd + 30 : cd + 32] = struct.pack("<H", len(ex))
+    data[cd + 42 : cd + 46] = b"\xff\xff\xff\xff"
+    data[cd + 46 + nlen : cd + 46 + nlen] = ex
+    eo = data.rfind(b"PK\x05\x06")
+    data[eo + 12 : eo + 16] = struct.pack("<I", struct.unpack("<I", data[eo + 12 : eo + 16])[0] + len(ex))
+    data = bytes(data)
 elif kind in ("comment_zip", "comment_local", "trailing_bytes", "sig_in_cd_name", "plain_comment"):
     inner = plain_zip([("s.txt", hid)])
     if kind == "comment_local":
@@ -965,6 +987,30 @@ for K in zip64_local_lie zip64_csize_only comment_zip comment_local trailing_byt
     new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
     expect_fail "$K" "archive_unreadable"
 done
+
+start "bsdtar zero-pads a zip written to a non-seekable output to a 10240-byte block; valid archives must not be archive_unreadable"
+new_case; mkdir -p "$CASE/zs"; python3 -I -c 'print("line\n" * 300, end="")' > "$CASE/zs/f.txt"
+prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
+python3 -I "$ROOT/mkzip.py" zero_pad "$ART/pad.zip" "$SENT"; ctl_zip "synthetic zero padding" "$ART/pad.zip"
+if (cd "$CASE/zs" && tar -cf - --format zip f.txt > "$ART/tarpad.zip" 2>/dev/null) && [ -s "$ART/tarpad.zip" ]; then
+    ctl_zip "tar --format zip > file" "$ART/tarpad.zip"
+    (cd "$CASE/zs" && tar -cf - --format zip f.txt | cat > "$ART/catpad.zip")
+    ctl_zip "tar --format zip | cat" "$ART/catpad.zip"
+else
+    printf 'note: tar --format zip unavailable; only the synthetic padding control ran\n'
+fi
+start "non-zero bytes after the end record stay archive_unreadable even when a zero-padded zip is accepted"
+new_case; python3 -I "$ROOT/mkzip.py" zero_pad "$ART/padbad.zip" "$SENT"; printf 'X' >> "$ART/padbad.zip"; prepare --artifact "$ART/padbad.zip"
+expect_fail "padding then non-zero byte" "archive_unreadable"
+
+start "deflated entry with only the local compressed size unset and a 16-byte zip64 extra is accepted when consistent"
+new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
+python3 -I "$ROOT/mkzip.py" local_csize_only "$ART/lcs.zip" "$SENT"; ctl_zip "local csize only, 16-byte extra" "$ART/lcs.zip"
+
+start "corrupted central-directory header_offset is archive_unreadable, not an OverflowError traceback"
+new_case; python3 -I "$ROOT/mkzip.py" cd_offset_ff "$ART/off.zip" "$SENT"; prepare --artifact "$ART/off.zip"
+expect_fail "cd offset 0xFFFFFFFF" "archive_unreadable"
+assert_not_contains "cd offset: no traceback" "$OUT" "Traceback"
 
 start "walk budget: a scanner whose archive budget is nearly spent charges walk-decoded bytes to it (own 512 MiB walk budget ignored it)"
 python3 -I - "$AUDIT" <<'PY'
