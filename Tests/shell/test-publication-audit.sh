@@ -838,6 +838,19 @@ elif kind == "csize_cover_dd":
     dd = b"PK\x07\x08" + struct.pack("<III", crc(clean), len(ad), len(clean))
     A = local(b"a.txt", 8, 8, 0, 0, 0, ad + dd)
     data = finish(A + H, [cdent(b"a.txt", 8, 8, crc(clean), len(ad) + len(dd) + len(H), len(clean), 0)])
+elif kind == "local_csize_lie":
+    # Bug caught: a deflated entry (no descriptor) whose LOCAL csize runs past its
+    # real deflate stream. The directory and the inflated data agree, but a
+    # streaming extractor skips by the local csize and lands on the hidden
+    # complete local entry h.txt inside b.bin's stored data.
+    pad = b"pad"
+    B_data = pad + H
+    Bh = local(b"b.bin", 0, 0, crc(B_data), len(B_data), len(B_data), b"")
+    lie = len(ad) + len(Bh) + len(pad)
+    A = local(b"a.txt", 8, 0, crc(clean), lie, len(clean), ad)
+    B = Bh + B_data
+    data = finish(A + B, [cdent(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), 0),
+                          cdent(b"b.bin", 0, 0, crc(B_data), len(B_data), len(B_data), len(A))])
 elif kind == "stored_cover":
     A = local(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
     cov = clean + H
@@ -983,9 +996,10 @@ ditto -c -k --keepParent "$CASE/zs/Fake.app" "$ART/d1.zip"; ctl_zip "ditto --kee
 ditto -c -k --sequesterRsrc --keepParent "$CASE/zs/Fake.app" "$ART/d2.zip"; ctl_zip "ditto --sequesterRsrc" "$ART/d2.zip"
 python3 -I "$ROOT/mkzip.py" zip64_stream "$ART/z64.zip" "$SENT"; ctl_zip "zip64 streaming writer" "$ART/z64.zip"
 
-for K in zip64_local_lie zip64_csize_only comment_zip comment_local trailing_bytes; do
+for K in local_csize_lie  zip64_local_lie zip64_csize_only comment_zip comment_local trailing_bytes; do
     case $K in
         zip64_local_lie) T="zip64 stored entry: local zip64 extra says a small size, directory covers a hidden deflated entry" ;;
+        local_csize_lie) T="deflated entry whose local compressed size runs past its real stream into a hidden local entry (directory and data agree)" ;;
         zip64_csize_only) T="zip64 stored entry: local zip64 compressed size differs from the directory's" ;;
         comment_local) T="a bare deflated local entry inside the archive comment (an extractor taking the first end record reads it)" ;;
         comment_zip) T="a complete zip inside the archive comment: local entries after the central directory" ;;
