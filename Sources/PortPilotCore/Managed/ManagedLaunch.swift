@@ -213,7 +213,8 @@ public actor ManagedSupervisor {
             let workspace = try launch.workspace()
             let fingerprint = try launch.fingerprint(key: key, secret: secret)
             if let existing = current.first(where: { $0.workspace.filesystemIdentity == workspace.filesystemIdentity && $0.name == launch.service && $0.variant == launch.variant }) {
-                if existing.lifecycle == "stopped" {
+                // The registry decides whether needs_review is provably finished; otherwise it fails closed.
+                if existing.lifecycle == "stopped" || existing.lifecycle == "needs_review" {
                     guard existing.launchFingerprint == fingerprint else { throw ManagedError.incompatibleLaunch }
                     let backend = try ManagedProcess.availablePort(in: 30000...39999, excluding: Set(current.filter { $0.lifecycle != "stopped" }.compactMap(\.backendPort)))
                     try recipes?.save(launch, fingerprint: fingerprint)
