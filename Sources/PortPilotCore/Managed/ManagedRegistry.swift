@@ -25,6 +25,8 @@ public actor ManagedRegistry {
     var approvalDeadlines: [UUID: TimeInterval] = [:]
     let identity: @Sendable (Int32) -> ManagedIncarnation?
     private let sendSignal: @Sendable (ManagedIncarnation, Bool) -> Bool
+    /// True only when the OS confirms the PID no longer exists (ESRCH). Injectable for tests.
+    private let isGone: @Sendable (Int32) -> Bool
     private var lastWallTime: Date
 
     public init(persistence: ManagedPersistence, actors: [ManagedActor],
@@ -36,8 +38,9 @@ public actor ManagedRegistry {
                     let result = force ? ProcessKiller.forceKill(pid: target.pid, expectedStartTime: target.startTime)
                                        : ProcessKiller.terminate(pid: target.pid, expectedStartTime: target.startTime)
                     return result == .signalSent
-                }) {
-        self.persistence = persistence; self.actors = actors; self.uptime = uptime; self.now = now
+                },
+                isGone: @escaping @Sendable (Int32) -> Bool = { kill($0, 0) != 0 && errno == ESRCH }) {
+        self.persistence = persistence; self.actors = actors; self.uptime = uptime; self.now = now; self.isGone = isGone
         lastWallTime = now(); self.identity = identity; self.sendSignal = sendSignal
         do {
             state = try persistence.load()
@@ -201,10 +204,7 @@ public actor ManagedRegistry {
                     guard state.maintenance == nil, !state.services.contains(where: { $0.fence != nil }) else { throw ManagedError.operationInProgress }
                     // Active-child survival under launchd has not been accepted.
                     // A missing identity with a still-existing PID is uncertain.
-                    guard state.services.flatMap(\.incarnations).allSatisfy({ target in
-                        if let live = identity(target.pid) { return live != target }
-                        return kill(target.pid, 0) != 0 && errno == ESRCH
-                    }) else { throw ManagedError.needsDecision }
+                    guard state.services.flatMap(\.incarnations).allSatisfy(provenExited) else { throw ManagedError.needsDecision }
                     candidate.maintenance = request.requestId
                 } else {
                     guard let checkpoint = request.payload["checkpoint"]?.string,
@@ -331,12 +331,25 @@ public actor ManagedRegistry {
         }
         return value
     }
-    private func requireLiveIncarnations(_ service: ManagedService) throws {
+    /// The single exit rule: a different identity at the PID (reuse) or an OS-confirmed ESRCH.
+    /// A missing identity alone is never proof of exit.
+    private func provenExited(_ target: ManagedIncarnation) -> Bool {
+        if let live = identity(target.pid) { return live != target }
+        return isGone(target.pid)
+    }
+    /// The root (first) incarnation must be live and matching. A later descendant that is proven
+    /// exited is skipped; any other mismatch fails closed. Returns the targets that are live now.
+    @discardableResult
+    private func requireLiveIncarnations(_ service: ManagedService) throws -> [ManagedIncarnation] {
         guard !service.incarnations.isEmpty else { throw ManagedError.identityUnavailable }
-        for target in service.incarnations {
-            guard let live = identity(target.pid) else { throw ManagedError.identityUnavailable }
-            guard live == target else { throw ManagedError.staleIdentity }
+        var live: [ManagedIncarnation] = []
+        for (n, target) in service.incarnations.enumerated() {
+            if let current = identity(target.pid), current == target { live.append(target); continue }
+            if n > 0 && provenExited(target) { continue }
+            guard identity(target.pid) != nil else { throw ManagedError.identityUnavailable }
+            throw ManagedError.staleIdentity
         }
+        return live
     }
     private func mutate(_ request: ManagedRequest, actor: ManagedActor) throws -> ManagedResponse {
         let i = try serviceIndex(request)
@@ -472,12 +485,17 @@ public actor ManagedRegistry {
               let i = state.services.firstIndex(where: { $0.id == serviceId }) else { throw ManagedError.unauthorized }
         let service = state.services[i]
         try checkRevision(request, service)
-        guard service.lifecycle == "stopped", service.transition == nil, service.launchFingerprint == fingerprint,
+        // A needs_review service is restartable only once every process it ever recorded is proven gone.
+        let finished = service.lifecycle == "stopped" ? service.transition == nil
+            : service.lifecycle == "needs_review" && service.fence == nil && !service.incarnations.isEmpty
+                && (service.incarnations + (service.transition.map { $0.oldTargets + $0.newTargets } ?? [])).allSatisfy(provenExited)
+        guard finished, service.launchFingerprint == fingerprint,
               !state.services.contains(where: { $0.lifecycle != "stopped" && ($0.backendPort == backend || $0.transition?.newBackend == backend) }) else { throw ManagedError.incompatibleLaunch }
         var candidate = state
         let id = UUID()
         candidate.services[i].lifecycle = "starting"
         candidate.services[i].incarnations = []; candidate.services[i].treeComplete = false
+        candidate.services[i].transition = nil
         candidate.services[i].backendPort = backend; candidate.services[i].fence = id
         candidate.services[i].revision += 1
         if !service.activeClaims.contains(where: { $0.actor == request.actor }) {
@@ -637,10 +655,7 @@ public actor ManagedRegistry {
               let transition = state.services[i].transition, transition.operationId == operationId,
               transition.phase == "retiring_old", let o = state.operations.firstIndex(where: { $0.id == operationId }),
               transition.newTargets.allSatisfy({ identity($0.pid) == $0 }),
-              transition.oldTargets.allSatisfy({ target in
-                  if let live = identity(target.pid) { return live != target }
-                  return kill(target.pid, 0) != 0 && errno == ESRCH
-              }) else { throw ManagedError.needsDecision }
+              transition.oldTargets.allSatisfy(provenExited) else { throw ManagedError.needsDecision }
         var candidate = state
         candidate.services[i].incarnations = transition.newTargets
         candidate.services[i].treeComplete = newTreeVerified
@@ -684,10 +699,8 @@ public actor ManagedRegistry {
         // Forced termination ALWAYS needs a separately approved force operation.
         guard operation.approved else { throw ManagedError.needsDecision }
         guard !operation.targets.isEmpty else { throw ManagedError.identityUnavailable }
-        for target in operation.targets {
-            guard let current = identity(target.pid) else { throw ManagedError.identityUnavailable }
-            guard current == target else { throw ManagedError.staleIdentity }
-        }
+        // Proven-exited descendants are skipped; the root and anything uncertain still fail closed.
+        let liveTargets = try requireLiveIncarnations(service)
         var candidate = state
         candidate.services[i].fence = id; candidate.services[i].lifecycle = "stopping"
         candidate.operations[o].phase = "fenced"; candidate.operations[o].approved = false
@@ -697,7 +710,7 @@ public actor ManagedRegistry {
         try commit(candidate)
         // No suspension from the final check through each checked signal.
         var sent = true
-        for target in operation.targets {
+        for target in liveTargets {
             guard identity(target.pid) == target, sendSignal(target, operation.action == "force") else { sent = false; break }
         }
         candidate = state
@@ -714,10 +727,24 @@ public actor ManagedRegistry {
         guard state.maintenance == nil else { return }
         for i in state.services.indices where ["running", "release_pending"].contains(state.services[i].lifecycle) && state.services[i].fence == nil {
             let lostProof = state.services[i].treeComplete && !treeVerified(state.services[i].id)
-            guard lostProof || state.services[i].incarnations.contains(where: { identity($0.pid) != $0 }) else { continue }
+            // An exited descendant is pruned and the service stays running. The root exiting, or any
+            // recorded process neither live nor proven exited, needs review.
+            var kept: [ManagedIncarnation] = []; var needsReview = lostProof
+            for (n, target) in state.services[i].incarnations.enumerated() {
+                if identity(target.pid) == target { kept.append(target) }
+                else if n == 0 || !provenExited(target) { needsReview = true }
+            }
+            guard needsReview || kept.count != state.services[i].incarnations.count else { continue }
             var candidate = state
-            candidate.services[i].lifecycle = "needs_review"
-            if lostProof { candidate.services[i].treeComplete = false }
+            if needsReview {
+                candidate.services[i].lifecycle = "needs_review"
+                if lostProof { candidate.services[i].treeComplete = false }
+            } else {
+                candidate.services[i].incarnations = kept
+                for o in candidate.operations.indices where candidate.operations[o].serviceId == candidate.services[i].id {
+                    candidate.operations[o].approved = false
+                }
+            }
             candidate.services[i].revision += 1; candidate.revision += 1
             releaseTimes.removeValue(forKey: candidate.services[i].id)
             try commit(candidate)
@@ -726,11 +753,7 @@ public actor ManagedRegistry {
             guard let id = state.services[i].fence,
                   let o = state.operations.firstIndex(where: { $0.id == id }) else { continue }
             // nil identity alone is never evidence of exit. ESRCH is required.
-            let exited = state.services[i].incarnations.allSatisfy {
-                if let live = identity($0.pid) { return live != $0 }
-                return kill($0.pid, 0) != 0 && errno == ESRCH
-            }
-            guard exited else { continue }
+            guard state.services[i].incarnations.allSatisfy(provenExited) else { continue }
             var candidate = state
             candidate.services[i].treeComplete = candidate.services[i].treeComplete && treeVerified(candidate.services[i].id)
             candidate.services[i].fence = nil
@@ -793,7 +816,8 @@ public actor ManagedRegistry {
             guard s.treeComplete, !s.incarnations.isEmpty, treeVerified(s.id) else { continue }
             // Polling may not yet have observed exit, PID reuse or loss of
             // identity access. Validate the complete target set before fencing.
-            do { try requireLiveIncarnations(s) }
+            let liveTargets: [ManagedIncarnation]
+            do { liveTargets = try requireLiveIncarnations(s) }
             catch {
                 var candidate = state
                 candidate.services[i].lifecycle = "needs_review"
@@ -810,7 +834,7 @@ public actor ManagedRegistry {
                                                         phase: "fenced", expires: now()))
             candidate.revision += 1; try commit(candidate)
             var sent = true
-            for target in s.incarnations {
+            for target in liveTargets {
                 guard identity(target.pid) == target, signal(target) else { sent = false; break }
             }
             if sent { signalTimes[s.id] = uptime() }

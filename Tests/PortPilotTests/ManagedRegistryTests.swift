@@ -178,6 +178,115 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         let sent = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
         XCTAssertNil(sent.error); XCTAssertEqual(log.count, 2)
     }
+    // MARK: forked process trees (exited descendants, needs_review recovery)
+    private func tree(root: URL, clock: TestClock = TestClock()) async throws -> (ManagedRegistry, ManagedService, Procs) {
+        let procs = Procs()
+        let registry = ManagedRegistry(persistence: try ManagedPersistence(root: root), actors: actors,
+                                       uptime: { clock.time }, now: { clock.date }, identity: { procs.lookup($0) },
+                                       sendSignal: { identity, _ in procs.signal(identity) }, isGone: { procs.isGone($0) })
+        let req = ManagedRequest(operation: "service.run", actor: "a", credential: "token-a", expectedRevision: 0)
+        let service = try await registry.beginLaunch(req, workspace: ManagedWorkspace(id: UUID(), path: "/tmp/fixture", filesystemIdentity: "test"),
+                                                    name: "web", variant: "default", fingerprint: "private", backend: 30001, stable: 20001)
+        procs.start(Procs.root); procs.start(Procs.child)
+        try await registry.recordChild(serviceId: service.id, incarnation: Procs.root)
+        try await registry.finishLaunch(serviceId: service.id, ready: true, treeComplete: true)
+        let running = await registry.snapshot()[0]
+        try await registry.recordDescendants(serviceId: service.id, expectedRevision: running.revision, descendants: [Procs.child])
+        return (registry, await registry.snapshot()[0], procs)
+    }
+    private func approvedStop(_ r: ManagedRegistry, _ s: ManagedService) async throws -> [String: ManagedJSON] {
+        let proposal = await r.handle(request("operation.propose", actor: "user", revision: s.revision, service: s.id, payload: ["action": .string("stop")]))
+        let payload: [String: ManagedJSON] = ["operationId": .string(try XCTUnwrap(proposal.operationId).uuidString), "approved": .bool(true)]
+        let approved = await r.handle(request("decision.resolve", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertNil(approved.error)
+        return payload
+    }
+    private func rerun(_ s: ManagedService) -> ManagedRequest {
+        ManagedRequest(operation: "service.run", actor: "a", credential: "token-a", expectedRevision: s.revision)
+    }
+    func testExitedDescendantDoesNotMakeLiveServiceUnstoppable() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        XCTAssertEqual(s.incarnations.count, 2)
+        let payload = try await approvedStop(r, s)
+        procs.exit(Procs.child)
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertNil(executed.error)
+        XCTAssertEqual(procs.signaled, [Procs.root.pid])
+        let operation = await r.operation(id: try XCTUnwrap(executed.operationId))
+        XCTAssertEqual(operation?.phase, "signal_sent")
+    }
+    func testReusedDescendantPidIsSkippedNeverSignalled() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let payload = try await approvedStop(r, s)
+        procs.reuse(Procs.child)
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertNil(executed.error)
+        XCTAssertEqual(procs.signaled, [Procs.root.pid], "the unrelated process that reused the PID must not be signalled")
+    }
+    func testDescendantWithUnprovenExitStillFailsStopClosed() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let payload = try await approvedStop(r, s)
+        procs.hide(Procs.child)   // identity unreadable, but no ESRCH proof
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertEqual(executed.error, .identityUnavailable)
+        XCTAssertTrue(procs.signaled.isEmpty)
+    }
+    func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let payload = try await approvedStop(r, s)
+        procs.exit(Procs.child)
+        try await r.reconcileStops()
+        let after = await r.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "running")
+        XCTAssertEqual(after.incarnations, [Procs.root])
+        XCTAssertGreaterThan(after.revision, s.revision)
+        let stale = await r.handle(request("operation.execute", actor: "user", revision: after.revision, service: s.id, payload: payload))
+        XCTAssertNotNil(stale.error, "a pre-prune approval must not survive the target change")
+        XCTAssertTrue(procs.signaled.isEmpty)
+    }
+    func testReconcileFlagsReviewWhenRootExitedOrDescendantUnproven() async throws {
+        for rootGone in [true, false] {
+            let (r, _, procs) = try await tree(root: directory())
+            if rootGone { procs.exit(Procs.root) } else { procs.hide(Procs.child) }
+            try await r.reconcileStops()
+            let after = await r.snapshot()[0]
+            XCTAssertEqual(after.lifecycle, "needs_review")
+            XCTAssertEqual(after.incarnations.count, 2)
+        }
+    }
+    func testForkedTreeStopEndingInReviewCanBeRunAgainOnceEverythingIsGone() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let payload = try await approvedStop(r, s)
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertNil(executed.error)
+        procs.exit(Procs.root)   // child still alive: stop is not complete
+        try await r.reconcileStops()
+        var stuck = await r.snapshot()[0]
+        XCTAssertEqual(stuck.lifecycle, "stopping")
+        procs.exit(Procs.child)
+        try await r.reconcileStops()
+        stuck = await r.snapshot()[0]
+        XCTAssertEqual(stuck.lifecycle, "needs_review", "treeComplete was cleared by the recorded descendant")
+        let restarted = try await r.restartLaunch(rerun(stuck), serviceId: s.id, fingerprint: "private", backend: 30002)
+        XCTAssertEqual(restarted.lifecycle, "starting")
+        XCTAssertTrue(restarted.incarnations.isEmpty)
+        XCTAssertNil(restarted.transition)
+    }
+    func testNeedsReviewRestartRejectedWhileAnyRecordedProcessMayBeAlive() async throws {
+        for survivor in ["live", "unreadable"] {
+            let (r, _, procs) = try await tree(root: directory())
+            procs.exit(Procs.root)
+            if survivor == "unreadable" { procs.hide(Procs.child) }
+            try await r.reconcileStops()
+            let review = await r.snapshot()[0]
+            XCTAssertEqual(review.lifecycle, "needs_review")
+            do { _ = try await r.restartLaunch(rerun(review), serviceId: review.id, fingerprint: "private", backend: 30002); XCTFail("\(survivor) process") }
+            catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+            procs.exit(Procs.child)
+            let ok = try await r.restartLaunch(rerun(review), serviceId: review.id, fingerprint: "private", backend: 30002)
+            XCTAssertEqual(ok.lifecycle, "starting")
+        }
+    }
     func testClockRollbackInvalidatesApproval() async throws {
         let clock = TestClock(); let (r, s) = try await running(root: directory(), clock: clock)
         let proposed = await r.handle(request("operation.propose", actor: "user", revision: s.revision, service: s.id, payload: ["action": .string("stop")]))
@@ -367,4 +476,27 @@ private final class SignalLog: @unchecked Sendable {
     var identity: ManagedIncarnation? { get { lock.withLock { current } } set { lock.withLock { current = newValue } } }
     var count: Int { lock.withLock { signals } }
     func record(_ identity: ManagedIncarnation, force: Bool) { lock.withLock { signals += 1 } }
+}
+
+/// Fake process table: the identity/ESRCH/signal boundary for forked-tree tests.
+private final class Procs: @unchecked Sendable {
+    static let root = ManagedIncarnation(hostId: "host", bootId: "boot", pid: 999999, startTime: Date(timeIntervalSince1970: 1000))
+    static let child = ManagedIncarnation(hostId: "host", bootId: "boot", pid: 999998, startTime: Date(timeIntervalSince1970: 1001))
+    private let lock = NSLock()
+    private var table: [Int32: ManagedIncarnation] = [:]
+    private var gone: Set<Int32> = []
+    private var sent: [Int32] = []
+    var signaled: [Int32] { lock.withLock { sent } }
+    func start(_ i: ManagedIncarnation) { lock.withLock { table[i.pid] = i; gone.remove(i.pid) } }
+    /// Exited: no identity and the OS answers ESRCH.
+    func exit(_ i: ManagedIncarnation) { lock.withLock { table[i.pid] = nil; gone.insert(i.pid) } }
+    /// Identity unreadable but the PID is not confirmed gone.
+    func hide(_ i: ManagedIncarnation) { lock.withLock { table[i.pid] = nil } }
+    /// An unrelated process now owns the PID.
+    func reuse(_ i: ManagedIncarnation) {
+        lock.withLock { var other = i; other.startTime = i.startTime.addingTimeInterval(500); table[i.pid] = other }
+    }
+    func lookup(_ pid: Int32) -> ManagedIncarnation? { lock.withLock { table[pid] } }
+    func isGone(_ pid: Int32) -> Bool { lock.withLock { gone.contains(pid) } }
+    func signal(_ i: ManagedIncarnation) -> Bool { lock.withLock { sent.append(i.pid); return true } }
 }
