@@ -52,6 +52,7 @@ private struct CollapsibleSection: View {
                         projectLabel: root.flatMap { projectDisplayNames[$0] },
                         classification: store.classification(for: entry),
                         bindingSummary: store.bindingSummary(for: entry),
+                        serveFindings: store.serveFindings(for: entry),
                         onCategoryChange: { store.setCategory($0, for: entry) }
                     )
                 }
