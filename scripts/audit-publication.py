@@ -595,6 +595,11 @@ def _walk_zip(data, infos, start_dir, budget=MAX_ARCHIVE_TOTAL_BYTES):
                     entry_ok = False
             if method == 8:
                 body, end = _inflate_span(data, body_start, budget)
+                if not has_dd and (end - body_start != csize or len(body) != usize):
+                    # A streaming extractor skips by the local csize; if it is
+                    # not the real stream length it lands inside later bytes.
+                    consistent = False
+                    raise _WalkStop
             else:
                 if has_dd:
                     raise _WalkStop  # stored + descriptor: end is not knowable
