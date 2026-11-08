@@ -81,6 +81,63 @@ final class ManagedCleanupIntegrationTests: XCTestCase, @unchecked Sendable {
             }
         }
     }
+    func testSupervisorRunRestartsNeedsReviewServiceOnceItsProcessesAreGone() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pp-review-\(UUID().uuidString)")
+        let disk = try ManagedPersistence(root: root)
+        let actor = ManagedActor(id: "fixture", scope: .owner, credentialHash: ManagedDigest.hash(Data("fixture-token".utf8)))
+        let registry = ManagedRegistry(persistence: disk, actors: [actor])
+        let supervisor = ManagedSupervisor(registry: registry, key: Data("fixture-key".utf8), persistence: disk)
+        let script = root.appendingPathComponent("server.py")
+        try Data("""
+        import os,sys,http.server
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'ok')
+            def log_message(self, *args): pass
+        http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
+        """.utf8).write(to: script)
+        let launch = ManagedLaunch(service: "review", executable: "/usr/bin/python3", arguments: [script.path, "{port}"], cwd: root.path, configurationFiles: [script.path])
+        let request = ManagedRequest(operation: "service.run", actor: actor.id, credential: "fixture-token", expectedRevision: 0, payload: ["launch": try .value(launch)])
+        let accepted = await supervisor.handle(request)
+        XCTAssertEqual(accepted.status, "accepted")
+        for _ in 0..<100 {
+            if await registry.snapshot().first?.lifecycle == "running" { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let runningSnapshot = await registry.snapshot()
+        let running = try XCTUnwrap(runningSnapshot.first)
+        XCTAssertEqual(running.lifecycle, "running")
+        addTeardownBlock {
+            for identity in await registry.snapshot().flatMap(\.incarnations) { _ = ManagedProcess.signal(identity) }
+            try? FileManager.default.removeItem(at: root)
+        }
+        // The service dies behind the helper's back: reconcile flags needs_review.
+        for identity in running.incarnations { _ = ManagedProcess.signal(identity) }
+        var review = running
+        for _ in 0..<100 {
+            await supervisor.reconcile()
+            let snap = await registry.snapshot()
+            review = try XCTUnwrap(snap.first)
+            if review.lifecycle == "needs_review" { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(review.lifecycle, "needs_review")
+        for _ in 0..<100 {
+            if running.incarnations.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) != $0 }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        var again = request
+        again.requestId = UUID().uuidString; again.expectedRevision = review.revision
+        let restarted = await supervisor.handle(again)
+        XCTAssertNil(restarted.error, "needs_review with every process gone must route to restart, not incompatible_launch")
+        XCTAssertEqual(restarted.status, "accepted")
+        for _ in 0..<100 {
+            if await registry.snapshot()[0].lifecycle == "running" { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let after = await registry.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "running"); XCTAssertEqual(after.id, running.id)
+    }
 }
 
 private final class CleanupClock: @unchecked Sendable {

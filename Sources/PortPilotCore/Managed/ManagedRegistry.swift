@@ -337,15 +337,22 @@ public actor ManagedRegistry {
         if let live = identity(target.pid) { return live != target }
         return isGone(target.pid)
     }
-    /// The root (first) incarnation must be live and matching. A later descendant that is proven
-    /// exited is skipped; any other mismatch fails closed. Returns the targets that are live now.
+    /// A recorded descendant may be pruned or skipped once proven exited, but only for a service with
+    /// no route transition: a reroute leaves a second root (the new backend) at a later index, so
+    /// position no longer identifies roots. While a transition exists every mismatch fails closed.
+    private func canPrune(_ service: ManagedService, at index: Int) -> Bool {
+        index > 0 && service.transition == nil
+    }
+    /// Every recorded target must be live and matching (strict), or, when `tolerant`, a prunable
+    /// descendant that is proven exited is skipped. Any other mismatch fails closed.
+    /// Returns the targets that are live now.
     @discardableResult
-    private func requireLiveIncarnations(_ service: ManagedService) throws -> [ManagedIncarnation] {
+    private func requireLiveIncarnations(_ service: ManagedService, tolerant: Bool = true) throws -> [ManagedIncarnation] {
         guard !service.incarnations.isEmpty else { throw ManagedError.identityUnavailable }
         var live: [ManagedIncarnation] = []
         for (n, target) in service.incarnations.enumerated() {
             if let current = identity(target.pid), current == target { live.append(target); continue }
-            if n > 0 && provenExited(target) { continue }
+            if tolerant && canPrune(service, at: n) && provenExited(target) { continue }
             guard identity(target.pid) != nil else { throw ManagedError.identityUnavailable }
             throw ManagedError.staleIdentity
         }
@@ -557,7 +564,7 @@ public actor ManagedRegistry {
               ["proposed", "authorized"].contains(operation.phase), operation.expires > now(),
               (approvalDeadlines[id] ?? 0) > uptime() else { throw ManagedError.staleRevision }
         guard operation.approved || (!service.activeClaims.isEmpty && service.activeClaims.allSatisfy({ operation.acknowledgements.contains($0.actor) })) else { throw ManagedError.needsDecision }
-        try requireLiveIncarnations(service)
+        try requireLiveIncarnations(service, tolerant: false)
         var candidate = state
         candidate.services[i].transition = ManagedRouteTransition(operationId: id, oldBackend: old, newBackend: backend,
             oldGeneration: service.routeGeneration, oldTargets: service.incarnations, newTargets: [], phase: "preparing")
@@ -732,13 +739,14 @@ public actor ManagedRegistry {
             var kept: [ManagedIncarnation] = []; var needsReview = lostProof
             for (n, target) in state.services[i].incarnations.enumerated() {
                 if identity(target.pid) == target { kept.append(target) }
-                else if n == 0 || !provenExited(target) { needsReview = true }
+                else if !canPrune(state.services[i], at: n) || !provenExited(target) { needsReview = true }
             }
             guard needsReview || kept.count != state.services[i].incarnations.count else { continue }
             var candidate = state
             if needsReview {
                 candidate.services[i].lifecycle = "needs_review"
                 if lostProof { candidate.services[i].treeComplete = false }
+                releaseTimes.removeValue(forKey: candidate.services[i].id)
             } else {
                 candidate.services[i].incarnations = kept
                 for o in candidate.operations.indices where candidate.operations[o].serviceId == candidate.services[i].id {
@@ -746,7 +754,6 @@ public actor ManagedRegistry {
                 }
             }
             candidate.services[i].revision += 1; candidate.revision += 1
-            releaseTimes.removeValue(forKey: candidate.services[i].id)
             try commit(candidate)
         }
         for i in state.services.indices where state.services[i].lifecycle == "stopping" {

@@ -241,7 +241,10 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(after.incarnations, [Procs.root])
         XCTAssertGreaterThan(after.revision, s.revision)
         let stale = await r.handle(request("operation.execute", actor: "user", revision: after.revision, service: s.id, payload: payload))
-        XCTAssertNotNil(stale.error, "a pre-prune approval must not survive the target change")
+        XCTAssertEqual(stale.error, .staleRevision, "a pre-prune approval must not survive the target change")
+        let operationId = try XCTUnwrap(payload["operationId"]?.string.flatMap(UUID.init(uuidString:)))
+        let afterPrune = await r.operation(id: operationId)
+        XCTAssertEqual(afterPrune?.approved, false)
         XCTAssertTrue(procs.signaled.isEmpty)
     }
     func testReconcileFlagsReviewWhenRootExitedOrDescendantUnproven() async throws {
@@ -286,6 +289,64 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
             let ok = try await r.restartLaunch(rerun(review), serviceId: review.id, fingerprint: "private", backend: 30002)
             XCTAssertEqual(ok.lifecycle, "starting")
         }
+    }
+    func testRestartFromNeedsReviewRejectedWhileFenceRemainsOrNothingWasRecorded() async throws {
+        // Fence still set (stop never resolved): every process is gone, yet the stop is unresolved.
+        var fencedService = service(); fencedService.fence = UUID(); fencedService.treeComplete = false
+        let fencedRegistry = ManagedRegistry(persistence: try seed(fencedService, root: directory()), actors: actors,
+                                             identity: { _ in nil }, isGone: { _ in true })
+        let fenced = await fencedRegistry.snapshot()[0]
+        XCTAssertEqual(fenced.lifecycle, "needs_review"); XCTAssertNotNil(fenced.fence)
+        do { _ = try await fencedRegistry.restartLaunch(rerun(fenced), serviceId: fenced.id, fingerprint: "private", backend: 30002); XCTFail("fence set") }
+        catch { XCTAssertEqual(error as? ManagedError, .operationInProgress, "checkRevision rejects a fenced service before the restart guard") }
+        // Nothing recorded: vacuous "all exited" must not count as proof.
+        var empty = service(); empty.incarnations = []
+        let emptyRegistry = ManagedRegistry(persistence: try seed(empty, root: directory()), actors: actors, identity: { _ in nil }, isGone: { _ in true })
+        let seeded = await emptyRegistry.snapshot()[0]
+        XCTAssertEqual(seeded.lifecycle, "needs_review"); XCTAssertTrue(seeded.incarnations.isEmpty)
+        do { _ = try await emptyRegistry.restartLaunch(rerun(seeded), serviceId: seeded.id, fingerprint: "private", backend: 30002); XCTFail("empty") }
+        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+    }
+    func testRerouteRefusedWhileRecordedDescendantIsDead() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let proposal = await r.handle(request("operation.propose", actor: "user", revision: s.revision, service: s.id, payload: ["action": .string("reroute")]))
+        let id = try XCTUnwrap(proposal.operationId)
+        let payload: [String: ManagedJSON] = ["operationId": .string(id.uuidString), "approved": .bool(true)]
+        let approved = await r.handle(request("decision.resolve", actor: "user", revision: s.revision, service: s.id, payload: payload))
+        XCTAssertNil(approved.error)
+        procs.exit(Procs.child)
+        do { _ = try await r.beginReroute(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload), backend: 30002); XCTFail("doomed reroute accepted") }
+        catch { XCTAssertEqual(error as? ManagedError, .identityUnavailable) }
+        let after = await r.snapshot()[0]
+        XCTAssertNil(after.transition)
+    }
+    func testPruneKeepsReleaseTimerSoReleasePendingServiceStillCleansUp() async throws {
+        // Descendant recorded while starting, so the tree is complete and cleanup is eligible.
+        let clock = TestClock(); let procs = Procs()
+        let r = ManagedRegistry(persistence: try ManagedPersistence(root: directory()), actors: actors,
+                                uptime: { clock.time }, now: { clock.date }, identity: { procs.lookup($0) },
+                                sendSignal: { identity, _ in procs.signal(identity) }, isGone: { procs.isGone($0) })
+        let req = ManagedRequest(operation: "service.run", actor: "a", credential: "token-a", expectedRevision: 0)
+        let started = try await r.beginLaunch(req, workspace: ManagedWorkspace(id: UUID(), path: "/tmp/fixture", filesystemIdentity: "test"),
+                                              name: "web", variant: "default", fingerprint: "private", backend: 30001, stable: 20001)
+        procs.start(Procs.root); procs.start(Procs.child)
+        try await r.recordChild(serviceId: started.id, incarnation: Procs.root)
+        let starting = await r.snapshot()[0]
+        try await r.recordDescendants(serviceId: started.id, expectedRevision: starting.revision, descendants: [Procs.child])
+        try await r.finishLaunch(serviceId: started.id, ready: true, treeComplete: true)
+        let s = await r.snapshot()[0]
+        XCTAssertTrue(s.treeComplete)
+        let release = await r.handle(request("claim.release", revision: s.revision, service: s.id, payload: ["claimId": .string(s.claims[0].id.uuidString)]))
+        XCTAssertNil(release.error)
+        procs.exit(Procs.child)
+        try await r.reconcileStops()
+        let pruned = await r.snapshot()[0]
+        XCTAssertEqual(pruned.lifecycle, "release_pending"); XCTAssertEqual(pruned.incarnations, [Procs.root])
+        clock.advance(60)
+        try await r.cleanup { procs.signal($0) }
+        XCTAssertEqual(procs.signaled, [Procs.root.pid], "prune must not drop the release timer")
+        let after = await r.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "stopping")
     }
     func testClockRollbackInvalidatesApproval() async throws {
         let clock = TestClock(); let (r, s) = try await running(root: directory(), clock: clock)
@@ -460,7 +521,7 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
     }
 }
 
-private final class TestClock: @unchecked Sendable {
+final class TestClock: @unchecked Sendable {
     private let lock = NSLock()
     private var elapsed: TimeInterval = 0
     private var offset: TimeInterval = 0
@@ -479,9 +540,10 @@ private final class SignalLog: @unchecked Sendable {
 }
 
 /// Fake process table: the identity/ESRCH/signal boundary for forked-tree tests.
-private final class Procs: @unchecked Sendable {
+final class Procs: @unchecked Sendable {
     static let root = ManagedIncarnation(hostId: "host", bootId: "boot", pid: 999999, startTime: Date(timeIntervalSince1970: 1000))
     static let child = ManagedIncarnation(hostId: "host", bootId: "boot", pid: 999998, startTime: Date(timeIntervalSince1970: 1001))
+    static let extra = ManagedIncarnation(hostId: "host", bootId: "boot", pid: 999997, startTime: Date(timeIntervalSince1970: 1002))
     private let lock = NSLock()
     private var table: [Int32: ManagedIncarnation] = [:]
     private var gone: Set<Int32> = []
