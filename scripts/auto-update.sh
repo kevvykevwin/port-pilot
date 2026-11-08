@@ -284,12 +284,22 @@ fi
 # health-checked and rolled back by `scripts/managed-helper.py upgrade
 # --candidate <built app>`. "Active" means the plist exists OR launchd has the
 # service loaded (a deleted plist does not unload a running agent). Both checks
-# are read-only. The deferral itself happens after the read-only fetch, once we
-# know whether an update is actually pending (see helper_gate below).
+# are read-only and recorded separately: a plist alone (for example left behind
+# by a failed bootstrap or unload) still holds updates, because it has
+# RunAtLoad/KeepAlive and launchd would start the helper from a replaced bundle
+# at next login, skipping the checkpoint and compatibility checks. But `upgrade`
+# talks to a RUNNING helper over its socket, so in that state the notice must
+# give load-or-remove steps instead of the upgrade command. The deferral itself
+# happens after the read-only fetch, once we know whether an update is actually
+# pending (see helper_gate below).
+HELPER_PLIST_PRESENT=false
+HELPER_LOADED=false
+[ -f "$HELPER_PLIST" ] && HELPER_PLIST_PRESENT=true
+if "$HELPER_LAUNCHCTL" print "gui/$(id -u)/$HELPER_LABEL" >/dev/null 2>&1; then
+    HELPER_LOADED=true
+fi
 HELPER_ACTIVE=false
-if [ -f "$HELPER_PLIST" ]; then
-    HELPER_ACTIVE=true
-elif "$HELPER_LAUNCHCTL" print "gui/$(id -u)/$HELPER_LABEL" >/dev/null 2>&1; then
+if [ "$HELPER_PLIST_PRESENT" = true ] || [ "$HELPER_LOADED" = true ]; then
     HELPER_ACTIVE=true
 fi
 if [ "$HELPER_ACTIVE" = false ] && [ -f "$HELPER_DEFER_MEMO" ] && [ "$DRY_RUN" = false ]; then
@@ -480,6 +490,16 @@ if [ "$HELPER_ACTIVE" = true ]; then
             fi
             ;;
     esac
+    # Plist present but nothing loaded: no instruction above works until the agent
+    # is loaded or the plist removed (`upgrade` and `uninstall` both need the
+    # running helper), so this recovery replaces the state-specific steps. The
+    # fast-forward above still ran, and a failed one stays visible in the key.
+    if [ "$HELPER_LOADED" = false ]; then
+        DEFER_STATE="unloaded"
+        [ "$FF_FAILED" = true ] && DEFER_STATE="unloaded-noff"
+        DEFER_MSG="Port Pilot v$TARGET_VERSION is available, but the managed helper's launch agent is installed and not loaded, so updates are held. Either load it with launchctl bootstrap gui/\$(id -u) \"$HELPER_PLIST\" and rerun the updater, which will then give the upgrade steps, or, if managed services are no longer used, remove the plist with rm \"$HELPER_PLIST\" and rerun the updater, which will then update normally."
+        UPGRADE_CMD="(not available until the helper's launch agent is loaded)"
+    fi
     DEFER_KEY="$DEFER_STATE:$TARGET_VERSION:$TARGET_SHA"
     if [ "$DRY_RUN" = true ]; then
         skip "DRY RUN: managed helper is active ($DEFER_STATE install); would notify about v$TARGET_VERSION and leave the installation alone"
