@@ -12,6 +12,9 @@ swift run PortPilot      # launch menu bar app (GUI)
 ./scripts/build-app.sh   # build .app bundle with ad-hoc signing
 
 ./Tests/shell/test-auto-update.sh   # tests for the unattended installer (sandboxed, no Swift build)
+./Tests/shell/test-cli-arguments.sh  # CLI argument edge cases (needs `swift build` first; runs .build/debug/PortPilotCLI)
+sh Tests/shell/test-publication-audit.sh  # publication audit (zip walker, secrets, receipts)
+sh Tests/shell/test-publication-final-candidate.sh  # final-candidate publication gate
 ./scripts/auto-update.sh --dry-run  # what the updater would do right now
 ./scripts/release.sh --dry-run      # validate a release without tagging
 ```
