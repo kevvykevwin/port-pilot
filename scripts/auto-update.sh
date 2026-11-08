@@ -369,6 +369,12 @@ installed_version() {
     plutil -extract CFBundleShortVersionString raw -o - "$INSTALLED_APP/Contents/Info.plist" 2>/dev/null || echo "unknown"
 }
 
+installed_commit() {
+    # The commit build-app.sh stamped into the bundle. Empty when the bundle was
+    # built by an older version (or without git), i.e. provenance unknown.
+    sed -n 1p "$INSTALLED_APP/Contents/Resources/COMMIT" 2>/dev/null | tr -d ' \t\r' || true
+}
+
 SRC_VERSION="$(source_version)"
 [ -n "$SRC_VERSION" ] || [ "$HELPER_ACTIVE" = true ] || die "could not parse VERSION= from $PROJECT_DIR/VERSION"
 INST_VERSION="$(installed_version)"
@@ -459,9 +465,22 @@ if [ "$HELPER_ACTIVE" = true ]; then
     fi
     # `managed-helper.py upgrade` does not record installed-sha, so after a
     # successful upgrade the SHA check above still reports a pending update. The
-    # installed version matching the target with the clone current means there is
-    # nothing left to do.
-    if [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$PRE_FF_BEHIND" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
+    # commit stamped into the bundle by build-app.sh is the authoritative record:
+    # the release is installed only when it equals the target. A dirty build
+    # carries a "-dirty" suffix and so never matches.
+    # Bundles built before COMMIT existed have none; for those fall back to
+    # version equality with a current clone, so existing installs are not nagged
+    # forever (they pick up COMMIT on their next managed upgrade).
+    INST_COMMIT="$(installed_commit)"
+    ALREADY_INSTALLED=false
+    if [ -n "$INST_COMMIT" ]; then
+        [ "$INST_COMMIT" = "$TARGET_SHA" ] && ALREADY_INSTALLED=true
+    elif [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$PRE_FF_BEHIND" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
+        ALREADY_INSTALLED=true
+    fi
+    # A missing or broken app is never "already installed", whatever COMMIT says.
+    case "$INST_VERSION" in none|broken) ALREADY_INSTALLED=false ;; esac
+    if [ "$ALREADY_INSTALLED" = true ]; then
         skip "managed helper is active; v$INST_VERSION is already installed and the clone is current (${LOCAL_SHA:0:7})"
     fi
     case "$INST_VERSION" in
@@ -469,7 +488,7 @@ if [ "$HELPER_ACTIVE" = true ]; then
             DEFER_STATE="missing"
             DEFER_LEAD="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically."
             DEFER_FF_NOTE=""
-            DEFER_MSG="$DEFER_LEAD Run python3 \"$PROJECT_DIR/scripts/managed-helper.py\" uninstall, then rerun the updater. If the helper is not running that command fails; instead run launchctl bootout gui/\$(id -u)/$HELPER_LABEL then remove $HELPER_PLIST, then rerun the updater."
+            DEFER_MSG="$DEFER_LEAD Run python3 \"$PROJECT_DIR/scripts/managed-helper.py\" uninstall, then rerun the updater. If the helper is not running that command fails; instead run launchctl bootout gui/\$(id -u)/$HELPER_LABEL then run rm \"$HELPER_PLIST\", then rerun the updater."
             ;;
         *)
             if [ "$INST_VERSION" = "broken" ]; then
@@ -481,20 +500,24 @@ if [ "$HELPER_ACTIVE" = true ]; then
             fi
             DEFER_FF_NOTE=""
             DEFER_MSG="$DEFER_LEAD"
-            if [ "$FF_FAILED" = true ]; then
-                DEFER_STATE="$DEFER_STATE-noff"
-                if [ "$AHEAD" -gt 0 ]; then
-                    # Diverged: git merge --ff-only can never succeed here.
-                    DEFER_FF_NOTE="The clone could not be fast-forwarded: local $BRANCH has $AHEAD unpushed commit(s). Push them or rebase them onto origin/$BRANCH, then rerun the updater and it will give the build steps."
-                else
-                    DEFER_FF_NOTE="The clone could not be fast-forwarded (a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
-                fi
-                DEFER_MSG="$DEFER_MSG $DEFER_FF_NOTE"
-            else
+            if [ "$FF_FAILED" = false ]; then
                 DEFER_MSG="$DEFER_MSG Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
             fi
             ;;
     esac
+    # A blocked fast-forward is reported in every state, including a missing app.
+    # The note ends "then rerun the updater" because from a blocked clone the next
+    # run may give build steps, load-or-remove steps or uninstall steps.
+    if [ "$FF_FAILED" = true ]; then
+        DEFER_STATE="$DEFER_STATE-noff"
+        if [ "$AHEAD" -gt 0 ]; then
+            # Diverged: git merge --ff-only can never succeed here.
+            DEFER_FF_NOTE="The clone could not be fast-forwarded: local $BRANCH has $AHEAD unpushed commit(s). Push them or rebase them onto origin/$BRANCH, then rerun the updater."
+        else
+            DEFER_FF_NOTE="The clone could not be fast-forwarded (a dirty file blocks it). Run $MERGE_CMD, then rerun the updater."
+        fi
+        DEFER_MSG="$DEFER_MSG $DEFER_FF_NOTE"
+    fi
     # Plist present but nothing loaded: no instruction above works until the agent
     # is loaded or the plist removed (`upgrade` and `uninstall` both need the
     # running helper), so this recovery replaces the state-specific steps. The
@@ -511,7 +534,11 @@ if [ "$HELPER_ACTIVE" = true ]; then
         else
             DEFER_MSG="$DEFER_MSG Either load it with launchctl bootstrap gui/\$(id -u) \"$HELPER_PLIST\" and rerun the updater, which will then give the next steps, or, if managed services are no longer used, remove the plist with rm \"$HELPER_PLIST\" and rerun the updater, which will then update normally."
         fi
-        UPGRADE_CMD="(not available until the helper's launch agent is loaded)"
+        if [ "$INST_VERSION" = "none" ]; then
+            UPGRADE_CMD="(remove the plist, then rerun the updater)"
+        else
+            UPGRADE_CMD="(not available until the helper's launch agent is loaded)"
+        fi
     fi
     DEFER_KEY="$DEFER_STATE:$TARGET_VERSION:$TARGET_SHA"
     if [ "$HELPER_LOADED" = false ]; then
