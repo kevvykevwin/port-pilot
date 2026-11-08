@@ -215,6 +215,7 @@ GITSHIM
 #!/bin/bash
 echo "$*" >> "${LAUNCHCTL_LOG:-/dev/null}"
 [ "$1" = "print" ] && [ "${FAKE_LAUNCHCTL_LOADED:-0}" = "1" ] && exit 0
+[ "$1" = "print" ] && [ -e "$(dirname "${LAUNCHCTL_LOG:-/nonexistent/x}")/agent-loaded" ] && exit 0
 exit 1
 LAUNCHCTL
 
@@ -317,9 +318,15 @@ add_bundled_helper() {
 }
 HELPER_PLIST_NAME="com.portpilot.managed-helper.plist"
 helper_plist() { echo "$ROOT/LaunchAgents/$HELPER_PLIST_NAME"; }
-install_helper_agent() {
+# Plist only: a launch agent left behind by a failed bootstrap/unload, not loaded.
+install_unloaded_helper_agent() {
     mkdir -p "$ROOT/LaunchAgents"
     printf '<plist/>\n' > "$(helper_plist)"
+}
+# Plist plus launchd reporting the service loaded (the healthy managed setup).
+install_helper_agent() {
+    install_unloaded_helper_agent
+    : > "$ROOT/agent-loaded"
 }
 # Pushes a new VERSION to origin from a throwaway clone, so the sandbox clone
 # under test stays behind and must discover it by fetching.
@@ -565,6 +572,74 @@ test_helper_loaded_without_plist_defers() {
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "updates once the helper is gone" "$(installed_version_of)" "0.4.0"
     assert_absent "memo cleared" "$STATE/helper-defer-notified"
+    teardown
+}
+
+# A plist left behind after a failed bootstrap/unload is not a running helper:
+# `upgrade` talks to it over its socket, so the upgrade notice cannot work. The
+# bundle is still held (RunAtLoad would start the helper from a replaced bundle
+# at next login), but the notice must give recovery steps that can succeed.
+test_helper_plist_without_loaded_agent_says_load_or_remove_not_upgrade() {
+    start "a plist left behind with no loaded agent must not be told to run upgrade (it cannot work without a running helper)"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "installed app untouched" "$(installed_version_of)" "0.0.1"
+    assert_eq "notified once" "$(notify_count)" "1"
+    local logtxt
+    logtxt="$(cat "$LOGS/auto-update.log" 2>/dev/null)"
+    assert_contains "says launch agent is not loaded" "$logtxt" "not loaded"
+    assert_contains "bootstrap recovery, quoted" "$logtxt" "launchctl bootstrap gui/\$(id -u) \"$(helper_plist)\""
+    assert_contains "remove-plist recovery, quoted" "$logtxt" "rm \"$(helper_plist)\""
+    case "$logtxt$(notices)" in
+        *"upgrade --candidate"*) bad "unloaded notice must not print the upgrade command" ;;
+        *) ok "unloaded notice does not print the upgrade command" ;;
+    esac
+    teardown
+}
+
+test_helper_unloaded_state_notifies_once() {
+    start "the unloaded notice must be memoized like the other defer states, not repeat every run"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "first run notifies" "$(notify_count)" "1"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "second run stays quiet" "$(notify_count)" "1"
+    assert_eq "installed app still untouched" "$(installed_version_of)" "0.0.1"
+    assert_contains "skip is logged" "$OUTPUT" "managed helper is active"
+    teardown
+}
+
+test_helper_loaded_after_unloaded_gives_upgrade_steps() {
+    start "loading the agent after an unloaded notice changes the state, so the upgrade steps must be sent"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "unloaded notice" "$(notify_count)" "1"
+    install_helper_agent   # now loaded
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "new notice after state change" "$(notify_count)" "2"
+    assert_contains "now names the upgrade command" "$(notices)" "upgrade --candidate"
+    assert_eq "installed app still untouched" "$(installed_version_of)" "0.0.1"
+    teardown
+}
+
+test_helper_loaded_without_plist_still_gives_upgrade_steps() {
+    start "regression guard: loaded agent with no plist keeps the upgrade-steps notice"
+    setup
+    install_app_version 0.0.1
+    run_updater --force FAKE_LAUNCHCTL_LOADED=1 "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "installed app untouched" "$(installed_version_of)" "0.0.1"
+    assert_contains "upgrade command present" "$(notices)" "upgrade --candidate"
+    case "$(notices)" in
+        *"not loaded"*) bad "loaded agent must not get the unloaded notice" ;;
+        *) ok "no unloaded wording when the agent is loaded" ;;
+    esac
     teardown
 }
 
@@ -1389,6 +1464,10 @@ test_notify_escapes_quotes_and_backslashes_for_applescript
 test_helper_installed_equals_target_is_silent
 test_helper_agent_up_to_date_is_silent
 test_helper_loaded_without_plist_defers
+test_helper_plist_without_loaded_agent_says_load_or_remove_not_upgrade
+test_helper_unloaded_state_notifies_once
+test_helper_loaded_after_unloaded_gives_upgrade_steps
+test_helper_loaded_without_plist_still_gives_upgrade_steps
 test_helper_dry_run_is_silent
 test_helper_agent_missing_version_logs_skip
 test_helper_agent_committed_missing_version_reaches_gate
