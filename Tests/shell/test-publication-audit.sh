@@ -851,6 +851,23 @@ elif kind == "local_csize_lie":
     B = Bh + B_data
     data = finish(A + B, [cdent(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), 0),
                           cdent(b"b.bin", 0, 0, crc(B_data), len(B_data), len(B_data), len(A))])
+elif kind == "local_csize_small":
+    # Bug caught: a deflated entry (no descriptor) whose LOCAL csize is too SMALL.
+    # The real stream is one final stored block holding padding and then a complete
+    # hidden local entry; the directory has the true size, but a streaming extractor
+    # skips by the short local csize and lands on the hidden entry inside the block.
+    pad = b"pad"
+    payload = pad + H
+    n = len(payload)
+    stream = b"\x01" + struct.pack("<HH", n, n ^ 0xFFFF) + payload
+    short = len(stream) - len(H)
+    A = local(b"a.bin", 8, 0, crc(payload), short, n, stream)
+    data = finish(A, [cdent(b"a.bin", 8, 0, crc(payload), len(stream), n, 0)])
+elif kind == "local_usize_lie":
+    # Bug caught: an honest deflated entry whose only lie is the LOCAL uncompressed
+    # size (+7); dropping the len(body) == usize comparison would accept it.
+    A = local(b"a.txt", 8, 0, crc(clean), len(ad), len(clean) + 7, ad)
+    data = finish(A, [cdent(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), 0)])
 elif kind == "stored_cover":
     A = local(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
     cov = clean + H
@@ -996,10 +1013,12 @@ ditto -c -k --keepParent "$CASE/zs/Fake.app" "$ART/d1.zip"; ctl_zip "ditto --kee
 ditto -c -k --sequesterRsrc --keepParent "$CASE/zs/Fake.app" "$ART/d2.zip"; ctl_zip "ditto --sequesterRsrc" "$ART/d2.zip"
 python3 -I "$ROOT/mkzip.py" zip64_stream "$ART/z64.zip" "$SENT"; ctl_zip "zip64 streaming writer" "$ART/z64.zip"
 
-for K in local_csize_lie  zip64_local_lie zip64_csize_only comment_zip comment_local trailing_bytes; do
+for K in local_csize_lie local_csize_small local_usize_lie zip64_local_lie zip64_csize_only comment_zip comment_local trailing_bytes; do
     case $K in
         zip64_local_lie) T="zip64 stored entry: local zip64 extra says a small size, directory covers a hidden deflated entry" ;;
         local_csize_lie) T="deflated entry whose local compressed size runs past its real stream into a hidden local entry (directory and data agree)" ;;
+        local_csize_small) T="deflated entry whose local compressed size stops short of its real stream, so a hidden local entry inside the final block is read" ;;
+        local_usize_lie) T="deflated entry whose local uncompressed size differs from the real inflated length (directory honest)" ;;
         zip64_csize_only) T="zip64 stored entry: local zip64 compressed size differs from the directory's" ;;
         comment_local) T="a bare deflated local entry inside the archive comment (an extractor taking the first end record reads it)" ;;
         comment_zip) T="a complete zip inside the archive comment: local entries after the central directory" ;;
