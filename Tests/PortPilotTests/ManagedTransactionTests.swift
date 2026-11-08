@@ -85,6 +85,79 @@ final class ManagedTransactionTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(operation?.outcome, "rolled_back_replacement_retained_for_review")
         XCTAssertEqual(operation?.phase, "needs_review")
     }
+    /// Reaches switched -> finishReroute(retained) where the new backend root sits at index 1.
+    private func retainedReroute(identities: Ident) async throws -> (ManagedRegistry, ManagedService, UUID) {
+        let old = live(999991), new = live(999992)
+        let registry = ManagedRegistry(persistence: try disk(), actors: actors, identity: { identities.lookup($0) },
+                                       isGone: { identities.isGone($0) })
+        identities.start(old); identities.start(new)
+        let service = try await registry.beginLaunch(request("service.run", actor: "owner"), workspace: ManagedWorkspace(id: UUID(), path: "/tmp", filesystemIdentity: "fixture"),
+            name: "web", variant: "default", fingerprint: "private", backend: 30001, stable: 20001)
+        try await registry.recordChild(serviceId: service.id, incarnation: old)
+        try await registry.finishLaunch(serviceId: service.id, ready: true, treeComplete: false)
+        let running = await registry.snapshot()[0]
+        let id = try await proposed(registry, running)
+        let approve = await registry.handle(request("decision.resolve", service: running, payload: ["operationId": .string(id.uuidString), "approved": .bool(true)]))
+        XCTAssertNil(approve.error)
+        _ = try await registry.beginReroute(request("operation.execute", service: running, payload: ["operationId": .string(id.uuidString)]), backend: 30002)
+        try await registry.recordReplacement(serviceId: running.id, operationId: id, targets: [new])
+        try await registry.switchReroute(serviceId: running.id, operationId: id) { _, _ in }
+        try await registry.finishReroute(serviceId: running.id, operationId: id, outcome: "route_verified_old_tree_retained_for_review")
+        return (registry, await registry.snapshot()[0], id)
+    }
+    func testNewBackendRootExitAfterRetainedRerouteIsNeedsReviewNotPruned() async throws {
+        let ids = Ident()
+        let (registry, service, _) = try await retainedReroute(identities: ids)
+        XCTAssertEqual(service.lifecycle, "running"); XCTAssertNotNil(service.transition); XCTAssertNil(service.fence)
+        XCTAssertEqual(service.incarnations, [live(999991), live(999992)])
+        ids.exit(live(999992))   // the new backend root crashes
+        try await registry.reconcileStops()
+        let after = await registry.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "needs_review")
+        XCTAssertEqual(after.incarnations, [live(999991), live(999992)], "the dead new root must not be pruned")
+    }
+    func testRestartFromNeedsReviewWithTransitionRequiresOldAndNewTargetsGone() async throws {
+        let ids = Ident()
+        let (registry, service, _) = try await retainedReroute(identities: ids)
+        ids.exit(live(999992))
+        try await registry.reconcileStops()
+        let review = await registry.snapshot()[0]
+        XCTAssertEqual(review.lifecycle, "needs_review")
+        let rerun = ManagedRequest(operation: "service.run", actor: "owner", credential: "secret", expectedRevision: review.revision)
+        // old backend still alive
+        do { _ = try await registry.restartLaunch(rerun, serviceId: service.id, fingerprint: "private", backend: 30003); XCTFail("old target alive") }
+        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+        ids.exit(live(999991))
+        let restarted = try await registry.restartLaunch(rerun, serviceId: service.id, fingerprint: "private", backend: 30003)
+        XCTAssertEqual(restarted.lifecycle, "starting")
+        XCTAssertNil(restarted.transition, "the stale route transition must be cleared on restart")
+    }
+    func testRestartFromNeedsReviewRejectedWhileNewTargetAliveInTransitionOnly() async throws {
+        // A transition target that is not in incarnations (preparing-phase leftover) still blocks restart.
+        let ids = Ident()
+        let old = live(999991), new = live(999992)
+        let registry = ManagedRegistry(persistence: try disk(), actors: actors, identity: { ids.lookup($0) }, isGone: { ids.isGone($0) })
+        ids.start(old); ids.start(new)
+        let service = try await registry.beginLaunch(request("service.run", actor: "owner"), workspace: ManagedWorkspace(id: UUID(), path: "/tmp", filesystemIdentity: "fixture"),
+            name: "web", variant: "default", fingerprint: "private", backend: 30001, stable: 20001)
+        try await registry.recordChild(serviceId: service.id, incarnation: old)
+        try await registry.finishLaunch(serviceId: service.id, ready: true, treeComplete: false)
+        let running = await registry.snapshot()[0]
+        let id = try await proposed(registry, running)
+        _ = await registry.handle(request("decision.resolve", service: running, payload: ["operationId": .string(id.uuidString), "approved": .bool(true)]))
+        _ = try await registry.beginReroute(request("operation.execute", service: running, payload: ["operationId": .string(id.uuidString)]), backend: 30002)
+        try await registry.recordReplacement(serviceId: running.id, operationId: id, targets: [new])
+        // Preparation failed: finishReroute retains the replacement in incarnations; drop old, keep new alive.
+        try await registry.finishReroute(serviceId: running.id, operationId: id, outcome: "replacement_not_ready")
+        ids.exit(old)
+        let rerun = ManagedRequest(operation: "service.run", actor: "owner", credential: "secret", expectedRevision: await registry.snapshot()[0].revision)
+        try await registry.reconcileStops()
+        let review = await registry.snapshot()[0]
+        XCTAssertEqual(review.lifecycle, "needs_review")
+        var request = rerun; request.expectedRevision = review.revision
+        do { _ = try await registry.restartLaunch(request, serviceId: service.id, fingerprint: "private", backend: 30003); XCTFail("new target alive") }
+        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+    }
     func testQuiescenceRequiresNoLiveChildrenAndSurvivesRestart() async throws {
         let (active, _) = try await running()
         let deferred = await active.handle(request("lifecycle.quiesce"))
@@ -127,4 +200,14 @@ private final class RouteSwitches: @unchecked Sendable {
     private var storage: [(UInt16, Int)] = []
     var values: [(UInt16, Int)] { lock.withLock { storage } }
     func append(_ port: UInt16, _ generation: Int) { lock.withLock { storage.append((port, generation)) } }
+}
+
+private final class Ident: @unchecked Sendable {
+    private let lock = NSLock()
+    private var table: [Int32: ManagedIncarnation] = [:]
+    private var gone: Set<Int32> = []
+    func start(_ i: ManagedIncarnation) { lock.withLock { table[i.pid] = i; gone.remove(i.pid) } }
+    func exit(_ i: ManagedIncarnation) { lock.withLock { table[i.pid] = nil; gone.insert(i.pid) } }
+    func lookup(_ pid: Int32) -> ManagedIncarnation? { lock.withLock { table[pid] } }
+    func isGone(_ pid: Int32) -> Bool { lock.withLock { gone.contains(pid) } }
 }

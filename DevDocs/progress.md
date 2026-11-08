@@ -15,6 +15,7 @@
   - the zip audit trusted the inflated stream instead of the local header size, so a deflate entry whose header size ran into the next entry could hide a file from the audit while `bsdtar` extracted it;
   - a stopped service with a forked or restarted process tree ended in `needs_review` with no way out; it can now be run again once every recorded process is proven exited;
   - one exited descendant made a live managed service impossible to stop; exited descendants are now pruned and skipped, while the root and any unproven process still fail closed.
+  - A second review pass found that pruning used list position to find the root, which is wrong after a reroute; pruning is now off while a route transition exists, a pruned descendant no longer cancels the release timer, and a reroute still requires every recorded process to be live.
   - Also fixed: option-only CLI calls exit 2 instead of trapping, and a failed managed refresh clears stale associations so the port list's kill buttons work again.
 - Deferred review notes (non-blocking): sealed cursor length grows with global event count; retained reroute replacement children are not reaped; agent takeover treats a missing identity as exit; peer PID/start-time read window; some test rigs skip instead of fail; persistence single read; `publishedBase` accepts any ref; build path remap uses the logical path; helper file-descriptor limit under launchd; checkpoint copies of credentials are never pruned; updater checks helper activity only once before building.
 
