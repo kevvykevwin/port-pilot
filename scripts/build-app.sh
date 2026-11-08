@@ -37,6 +37,18 @@ cp .build/release/PortPilotCLI "$APP_DIR/Contents/Resources/bin/portpilot"
 cp "$VERSION_FILE" "$APP_DIR/Contents/Resources/VERSION"
 cp scripts/managed-helper.py "$APP_DIR/Contents/Resources/bin/managed-helper.py"
 cp Assets/icon.svg "$APP_DIR/Contents/Resources/"
+# Record the commit this bundle was built from, so the updater can tell whether
+# an installed bundle is the release it is looking at even when VERSION did not
+# change. A dirty tree gets a "-dirty" marker so it can never equal a clean
+# commit. Without git (or outside a repo) nothing is written and the build
+# still succeeds. Written before signing so the signature covers it.
+BUILD_COMMIT="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$BUILD_COMMIT" ]; then
+    if [ -n "$(git -C "$PROJECT_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+        BUILD_COMMIT="$BUILD_COMMIT-dirty"
+    fi
+    printf '%s\n' "$BUILD_COMMIT" > "$APP_DIR/Contents/Resources/COMMIT"
+fi
 for binary in "$APP_DIR/Contents/MacOS/PortPilot" "$APP_DIR/Contents/Helpers/PortPilotHelper" "$APP_DIR/Contents/Resources/bin/portpilot"; do
     strip -S "$binary"
 done

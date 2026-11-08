@@ -224,10 +224,16 @@ LAUNCHCTL
 }
 
 # Installs a fake already-present app at the given version.
+# An optional second argument stamps Contents/Resources/COMMIT, the way a
+# current build-app.sh does; without it the bundle looks like an older build.
 install_app_version() {
-    local ver="$1" app="$INSTALL/PortPilot.app"
+    local ver="$1" commit="${2:-}" app="$INSTALL/PortPilot.app"
     rm -rf "$app"
     mkdir -p "$app/Contents/MacOS"
+    if [ -n "$commit" ]; then
+        mkdir -p "$app/Contents/Resources"
+        printf '%s\n' "$commit" > "$app/Contents/Resources/COMMIT"
+    fi
     printf '#!/bin/bash\nsleep 100\n' > "$app/Contents/MacOS/PortPilot"
     chmod +x "$app/Contents/MacOS/PortPilot"
     cat > "$app/Contents/Info.plist" << PLIST
@@ -683,6 +689,99 @@ test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key() {
     teardown
 }
 
+test_helper_same_version_stale_commit_still_notifies() {
+    start "a code-only upstream fix (VERSION unchanged) with the clone already current must notify once when the installed bundle's COMMIT is older (version equality hid it forever)"
+    setup
+    local old_sha; old_sha="$(git -C "$PROJECT" rev-parse HEAD)"
+    install_app_version 0.4.0 "$old_sha"
+    install_helper_agent
+    push_origin_source_commit
+    git -C "$PROJECT" pull -q --ff-only origin main   # user pulled by hand: clone is current
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    case "$OUTPUT" in *"already installed"*) bad "claimed the stale build was already installed" ;; *) ok "does not claim already installed" ;; esac
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "names the build steps" "$(notices)" "build-app.sh"
+    assert_contains "names the upgrade command" "$(notices)" "upgrade --candidate"
+    assert_eq "installed bundle untouched" "$(installed_version_of)" "0.4.0"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "second run silent via the memo" "$(notify_count)" "1"
+    teardown
+}
+
+test_helper_matching_commit_is_installed_even_if_clone_was_behind() {
+    start "an installed bundle whose COMMIT equals the target is already installed, even when the clone had to be fast-forwarded to reach it (no false nag)"
+    setup
+    install_helper_agent
+    push_origin_source_commit
+    install_app_version 0.4.0 "$(origin_tip)"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs already installed" "$OUTPUT" "already installed"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "no memo" "$STATE/helper-defer-notified"
+    teardown
+}
+
+test_helper_bundle_without_commit_keeps_version_equality() {
+    start "regression guard: a bundle built before COMMIT existed falls back to version equality plus a current clone, so existing installs are not nagged forever"
+    setup
+    install_app_version 0.4.0
+    install_helper_agent
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_contains "logs already installed" "$OUTPUT" "already installed"
+    assert_eq "no notification" "$(notify_count)" "0"
+    teardown
+}
+
+test_helper_unloaded_blocked_ff_does_not_promise_build_steps() {
+    start "in the not-loaded state a failed fast-forward note must say to rerun the updater, not promise build steps (the next run gives load-or-remove steps)"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    push_origin_source_commit
+    printf '// dirty\n' >> "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "says rerun the updater" "$(notices)" "then rerun the updater"
+    case "$(notices)" in *"give the build steps"*) bad "promises build steps" ;; *) ok "does not promise build steps" ;; esac
+    teardown
+}
+
+test_helper_missing_app_blocked_ff_is_reported() {
+    start "a missing app must not hide a blocked fast-forward: the notice mentions it and the memo key carries -noff"
+    setup
+    install_helper_agent
+    push_origin_source_commit
+    printf '// dirty\n' >> "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "still gives the uninstall step" "$(notices)" "managed-helper.py\" uninstall"
+    assert_contains "mentions the blocked fast-forward" "$(notices)" "could not be fast-forwarded"
+    local state; state="$(sed -n 1p "$STATE/helper-defer-notified" | cut -d: -f1)"
+    assert_eq "key is missing-noff" "$state" "missing-noff"
+    git -C "$PROJECT" show HEAD:Sources/Main.swift > "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "clearing the block sends a new notice" "$(notify_count)" "2"
+    teardown
+}
+
+test_helper_unloaded_missing_app_blocked_ff_and_placeholder() {
+    start "unloaded + missing app: key is unloaded-missing-noff, and the skip line says remove the plist (not load the agent)"
+    setup
+    install_unloaded_helper_agent
+    push_origin_source_commit
+    printf '// dirty\n' >> "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_eq "key" "$(sed -n 1p "$STATE/helper-defer-notified" | cut -d: -f1)" "unloaded-missing-noff"
+    assert_contains "notice mentions the blocked fast-forward" "$(notices)" "could not be fast-forwarded"
+    assert_contains "skip line placeholder" "$OUTPUT" "(remove the plist, then rerun the updater)"
+    case "$OUTPUT" in *"until the helper's launch agent is loaded"*) bad "skip line still says to load the agent" ;; *) ok "skip line does not say to load the agent" ;; esac
+    teardown
+}
+
 test_helper_unloaded_dry_run_is_silent() {
     start "--dry-run with an unloaded plist must not notify, write the memo or touch the app"
     setup
@@ -798,7 +897,7 @@ test_helper_agent_with_missing_install_points_to_uninstall() {
     assert_eq "notified once" "$(notify_count)" "1"
     assert_contains "points to uninstall" "$(notices)" "managed-helper.py\" uninstall"
     assert_contains "falls back to a manual bootout when the helper is not running" "$(notices)" "launchctl bootout gui/\$(id -u)/com.portpilot.managed-helper"
-    assert_contains "and removing the plist" "$(notices)" "remove $(helper_plist)"
+    assert_contains "and removing the plist, quoted" "$(notices)" "rm \"$(helper_plist)\""
     assert_absent "nothing installed" "$INSTALL/PortPilot.app"
     teardown
 }
@@ -1523,6 +1622,12 @@ test_helper_loaded_after_unloaded_gives_upgrade_steps
 test_helper_loaded_without_plist_still_gives_upgrade_steps
 test_helper_unloaded_with_missing_app_offers_only_plist_removal
 test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key
+test_helper_same_version_stale_commit_still_notifies
+test_helper_matching_commit_is_installed_even_if_clone_was_behind
+test_helper_bundle_without_commit_keeps_version_equality
+test_helper_unloaded_blocked_ff_does_not_promise_build_steps
+test_helper_missing_app_blocked_ff_is_reported
+test_helper_unloaded_missing_app_blocked_ff_and_placeholder
 test_helper_unloaded_dry_run_is_silent
 test_helper_dry_run_is_silent
 test_helper_agent_missing_version_logs_skip
