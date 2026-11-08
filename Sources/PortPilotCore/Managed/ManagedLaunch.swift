@@ -162,8 +162,9 @@ public actor ManagedSupervisor {
     private var replacements: [UUID: ManagedTrackedChild] = [:]
     private var scheduledReroutes: Set<UUID> = []
     private let treeEvidence = ManagedTreeEvidence()
-    public init(registry: ManagedRegistry, key: Data, persistence: ManagedPersistence? = nil) {
-        self.registry = registry; self.key = key
+    private let readinessTimeout: TimeInterval
+    public init(registry: ManagedRegistry, key: Data, persistence: ManagedPersistence? = nil, readinessTimeout: TimeInterval = 30) {
+        self.registry = registry; self.key = key; self.readinessTimeout = readinessTimeout
         recipes = persistence.map { ManagedRecipes(persistence: $0, key: key) }
     }
     private func secret(_ name: String) throws -> String {
@@ -348,6 +349,7 @@ public actor ManagedSupervisor {
         let session = URLSession(configuration: configuration, delegate: NoReadinessRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         var switched = false
+        var replacementTargets: [ManagedIncarnation] = []
         do {
             guard try launch.fingerprint(key: key, secret: secret) == service.launchFingerprint,
                   let stable = service.stablePort, service.backendPort != nil else { throw ManagedError.incompatibleLaunch }
@@ -355,13 +357,15 @@ public actor ManagedSupervisor {
             replacements[operationId] = process
             let root = process.identity
             var targets = [root]
+            replacementTargets = targets
             try await registry.recordReplacement(serviceId: service.id, operationId: operationId, targets: targets)
             try process.resume()
-            let deadline = ProcessInfo.processInfo.systemUptime + 30
+            let deadline = ProcessInfo.processInfo.systemUptime + readinessTimeout
             var successes = 0
             while ProcessInfo.processInfo.systemUptime < deadline {
                 guard ManagedProcess.incarnation(pid: root.pid) == root else { throw ManagedError.staleIdentity }
                 targets += ManagedAncestry.discover(known: targets)
+                replacementTargets = targets
                 try await registry.recordReplacement(serviceId: service.id, operationId: operationId, targets: targets)
                 let pids = targets.map(\.pid)
                 let scan = await PortScanner(pidProvider: { pids }).scan()
@@ -416,7 +420,12 @@ public actor ManagedSupervisor {
             let outcome = forwarder.connectionCount(generation: service.routeGeneration) > 0 ? "drain_timeout_old_backend_retained" : "route_verified_old_tree_retained_for_review"
             try await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: outcome)
         } catch {
-            replacements[operationId]?.discardUnstarted()
+            if !switched, let replacement = replacements[operationId] {
+                // Only the replacement's own processes; the old backend keeps serving.
+                _ = await terminateStarted(replacementTargets, child: replacement)
+            } else {
+                replacements[operationId]?.discardUnstarted()
+            }
             if switched, let old = service.backendPort, await healthy(launch, port: old, session: session) {
                 do {
                     try await registry.rollbackReroute(serviceId: service.id, operationId: operationId) { port, generation in
@@ -444,7 +453,7 @@ public actor ManagedSupervisor {
             let forwarder = try forwarders[service.id] ?? ManagedForwarder(stablePort: stable, backendPort: backend)
             forwarder.switchBackend(to: backend, generation: service.routeGeneration + 1)
             forwarders[service.id] = forwarder
-            let deadline = ProcessInfo.processInfo.systemUptime + 30
+            let deadline = ProcessInfo.processInfo.systemUptime + readinessTimeout
             var successes = 0
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 1; configuration.timeoutIntervalForResource = 1
@@ -478,9 +487,38 @@ public actor ManagedSupervisor {
             }
             throw ManagedError.readinessFailed
         } catch {
-            processes[service.id]?.discardUnstarted()
             forwarders.removeValue(forKey: service.id)?.stop()
-            try? await registry.finishLaunch(serviceId: service.id, ready: false, treeComplete: false)
+            var treeComplete = false
+            if let child = processes[service.id] {
+                let recorded = await registry.snapshot().first(where: { $0.id == service.id })?.incarnations ?? []
+                treeComplete = await terminateStarted(recorded + [child.identity], child: child)
+            }
+            try? await registry.finishLaunch(serviceId: service.id, ready: false, treeComplete: treeComplete)
+        }
+    }
+    /// Terminates what a failed launch started. Every signal is identity-checked
+    /// (PID + start time); SIGTERM first, bounded grace, then SIGKILL. Returns true
+    /// only when every target is proven exited and the kernel watch saw no untracked fork.
+    private func terminateStarted(_ initial: [ManagedIncarnation], child: ManagedTrackedChild) async -> Bool {
+        child.discardUnstarted()
+        var seen: [ManagedIncarnation] = []
+        for target in initial + ManagedAncestry.discover(known: initial) where !seen.contains(target) { seen.append(target) }
+        let targets = seen
+        for target in targets { _ = ManagedProcess.signal(target) }
+        await Self.waitForExit(targets, child: child, seconds: 2)
+        for target in targets where ManagedProcess.incarnation(pid: target.pid) == target {
+            _ = ProcessKiller.forceKill(pid: target.pid, expectedStartTime: target.startTime)
+        }
+        await Self.waitForExit(targets, child: child, seconds: 2)
+        let treeKnown = child.treeVerified() // also reaps the direct child once it exits
+        return treeKnown && targets.allSatisfy(ManagedProcess.exitVerified)
+    }
+    private static func waitForExit(_ targets: [ManagedIncarnation], child: ManagedTrackedChild, seconds: TimeInterval) async {
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            _ = child.treeVerified()
+            if targets.allSatisfy(ManagedProcess.exitVerified) { return }
+            try? await Task.sleep(for: .milliseconds(20))
         }
     }
 }
