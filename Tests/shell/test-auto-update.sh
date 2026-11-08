@@ -210,12 +210,13 @@ exec "$REAL_GIT" "\$@"
 GITSHIM
 
     # launchctl: the real launchd is never queried. `print` succeeds only when
-    # FAKE_LAUNCHCTL_LOADED=1, simulating an agent that is loaded in the session.
+    # FAKE_LAUNCHCTL_LOADED=1, or when the file named by FAKE_LAUNCHCTL_LOADED_MARKER
+    # exists, simulating an agent that is loaded in the session.
     cat > "$SHIM/launchctl" << 'LAUNCHCTL'
 #!/bin/bash
 echo "$*" >> "${LAUNCHCTL_LOG:-/dev/null}"
 [ "$1" = "print" ] && [ "${FAKE_LAUNCHCTL_LOADED:-0}" = "1" ] && exit 0
-[ "$1" = "print" ] && [ -e "$(dirname "${LAUNCHCTL_LOG:-/nonexistent/x}")/agent-loaded" ] && exit 0
+[ "$1" = "print" ] && [ -e "${FAKE_LAUNCHCTL_LOADED_MARKER:-/nonexistent}" ] && exit 0
 exit 1
 LAUNCHCTL
 
@@ -276,6 +277,7 @@ sandbox_env() {
         PORTPILOT_LOG_DIR="$LOGS" \
         PORTPILOT_LAUNCHCTL="$SHIM/launchctl" \
         LAUNCHCTL_LOG="$ROOT/launchctl.log" \
+        FAKE_LAUNCHCTL_LOADED_MARKER="$ROOT/agent-loaded" \
         PORTPILOT_POLL_SECS=1 \
         PORTPILOT_LAUNCH_SETTLE_SECS=1 \
         FAKE_RUNNING_MARKER="$ROOT/app-running" \
@@ -610,7 +612,7 @@ test_helper_unloaded_state_notifies_once() {
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "second run stays quiet" "$(notify_count)" "1"
     assert_eq "installed app still untouched" "$(installed_version_of)" "0.0.1"
-    assert_contains "skip is logged" "$OUTPUT" "managed helper is active"
+    assert_contains "skip line says installed but not loaded, with the underlying state" "$OUTPUT" "launch agent is installed but not loaded (healthy install)"
     teardown
 }
 
@@ -640,6 +642,57 @@ test_helper_loaded_without_plist_still_gives_upgrade_steps() {
         *"not loaded"*) bad "loaded agent must not get the unloaded notice" ;;
         *) ok "no unloaded wording when the agent is loaded" ;;
     esac
+    teardown
+}
+
+test_helper_unloaded_with_missing_app_offers_only_plist_removal() {
+    start "an unloaded plist with no installed app must say the app is missing and not suggest launchctl bootstrap (the plist points into the missing bundle)"
+    setup
+    install_unloaded_helper_agent
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_absent "nothing installed" "$INSTALL/PortPilot.app"
+    assert_eq "exactly one notice" "$(notify_count)" "1"
+    local logtxt; logtxt="$(cat "$LOGS/auto-update.log" 2>/dev/null)"
+    assert_contains "says the app is missing" "$logtxt" "Port Pilot is missing"
+    assert_contains "says not loaded" "$logtxt" "not loaded"
+    assert_contains "remove-plist recovery" "$logtxt" "rm \"$(helper_plist)\""
+    case "$logtxt$(notices)" in
+        *"launchctl bootstrap"*) bad "missing app must not be told to bootstrap" ;;
+        *) ok "no bootstrap suggestion when the app is missing" ;;
+    esac
+    assert_eq "memo key names the missing state" "$(sed -n 1p "$STATE/helper-defer-notified" | cut -d: -f1)" "unloaded-missing"
+    teardown
+}
+
+test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key() {
+    start "an unloaded plist must not hide a blocked fast-forward: the memo key keeps -noff so clearing the dirty file sends a new notice"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    push_origin_source_commit
+    printf '// dirty\n' >> "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "one notice" "$(notify_count)" "1"
+    local state; state="$(sed -n 1p "$STATE/helper-defer-notified" | cut -d: -f1)"
+    case "$state" in unloaded-*-noff) ok "key is unloaded-<state>-noff ($state)" ;; *) bad "key should be unloaded-*-noff, got '$state'" ;; esac
+    assert_contains "notice still says clone could not be fast-forwarded" "$(notices)" "could not be fast-forwarded"
+    git -C "$PROJECT" show HEAD:Sources/Main.swift > "$PROJECT/Sources/Main.swift"
+    run_updater --force "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "state change sends a second notice" "$(notify_count)" "2"
+    teardown
+}
+
+test_helper_unloaded_dry_run_is_silent() {
+    start "--dry-run with an unloaded plist must not notify, write the memo or touch the app"
+    setup
+    install_app_version 0.0.1
+    install_unloaded_helper_agent
+    run_updater --dry-run "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0" "$STATUS" "0"
+    assert_eq "no notification" "$(notify_count)" "0"
+    assert_absent "no memo written" "$STATE/helper-defer-notified"
+    assert_eq "installed app retained" "$(installed_version_of)" "0.0.1"
     teardown
 }
 
@@ -1468,6 +1521,9 @@ test_helper_plist_without_loaded_agent_says_load_or_remove_not_upgrade
 test_helper_unloaded_state_notifies_once
 test_helper_loaded_after_unloaded_gives_upgrade_steps
 test_helper_loaded_without_plist_still_gives_upgrade_steps
+test_helper_unloaded_with_missing_app_offers_only_plist_removal
+test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key
+test_helper_unloaded_dry_run_is_silent
 test_helper_dry_run_is_silent
 test_helper_agent_missing_version_logs_skip
 test_helper_agent_committed_missing_version_reaches_gate

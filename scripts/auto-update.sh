@@ -467,24 +467,29 @@ if [ "$HELPER_ACTIVE" = true ]; then
     case "$INST_VERSION" in
         none)
             DEFER_STATE="missing"
-            DEFER_MSG="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically. Run python3 \"$PROJECT_DIR/scripts/managed-helper.py\" uninstall, then rerun the updater. If the helper is not running that command fails; instead run launchctl bootout gui/\$(id -u)/$HELPER_LABEL then remove $HELPER_PLIST, then rerun the updater."
+            DEFER_LEAD="Port Pilot is missing and v$TARGET_VERSION is available, but the managed helper is active so it cannot be reinstalled automatically."
+            DEFER_FF_NOTE=""
+            DEFER_MSG="$DEFER_LEAD Run python3 \"$PROJECT_DIR/scripts/managed-helper.py\" uninstall, then rerun the updater. If the helper is not running that command fails; instead run launchctl bootout gui/\$(id -u)/$HELPER_LABEL then remove $HELPER_PLIST, then rerun the updater."
             ;;
         *)
             if [ "$INST_VERSION" = "broken" ]; then
                 DEFER_STATE="broken"
-                DEFER_MSG="Port Pilot is broken and v$TARGET_VERSION is available, but the managed helper is active so it cannot repair automatically."
+                DEFER_LEAD="Port Pilot is broken and v$TARGET_VERSION is available, but the managed helper is active so it cannot repair automatically."
             else
                 DEFER_STATE="healthy"
-                DEFER_MSG="Port Pilot v$TARGET_VERSION is available but the managed helper is active, so it was not installed."
+                DEFER_LEAD="Port Pilot v$TARGET_VERSION is available but the managed helper is active, so it was not installed."
             fi
+            DEFER_FF_NOTE=""
+            DEFER_MSG="$DEFER_LEAD"
             if [ "$FF_FAILED" = true ]; then
                 DEFER_STATE="$DEFER_STATE-noff"
                 if [ "$AHEAD" -gt 0 ]; then
                     # Diverged: git merge --ff-only can never succeed here.
-                    DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded: local $BRANCH has $AHEAD unpushed commit(s). Push them or rebase them onto origin/$BRANCH, then rerun the updater and it will give the build steps."
+                    DEFER_FF_NOTE="The clone could not be fast-forwarded: local $BRANCH has $AHEAD unpushed commit(s). Push them or rebase them onto origin/$BRANCH, then rerun the updater and it will give the build steps."
                 else
-                    DEFER_MSG="$DEFER_MSG The clone could not be fast-forwarded (a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
+                    DEFER_FF_NOTE="The clone could not be fast-forwarded (a dirty file blocks it). Run $MERGE_CMD and the updater will then give the build steps."
                 fi
+                DEFER_MSG="$DEFER_MSG $DEFER_FF_NOTE"
             else
                 DEFER_MSG="$DEFER_MSG Build $BUILT_APP with $BUILD_CMD, then run $UPGRADE_CMD"
             fi
@@ -493,16 +498,29 @@ if [ "$HELPER_ACTIVE" = true ]; then
     # Plist present but nothing loaded: no instruction above works until the agent
     # is loaded or the plist removed (`upgrade` and `uninstall` both need the
     # running helper), so this recovery replaces the state-specific steps. The
-    # fast-forward above still ran, and a failed one stays visible in the key.
+    # underlying state stays in the key and the text so a missing or broken app,
+    # or a blocked fast-forward, is not hidden behind the generic notice.
     if [ "$HELPER_LOADED" = false ]; then
-        DEFER_STATE="unloaded"
-        [ "$FF_FAILED" = true ] && DEFER_STATE="unloaded-noff"
-        DEFER_MSG="Port Pilot v$TARGET_VERSION is available, but the managed helper's launch agent is installed and not loaded, so updates are held. Either load it with launchctl bootstrap gui/\$(id -u) \"$HELPER_PLIST\" and rerun the updater, which will then give the upgrade steps, or, if managed services are no longer used, remove the plist with rm \"$HELPER_PLIST\" and rerun the updater, which will then update normally."
+        DEFER_STATE="unloaded-$DEFER_STATE"
+        DEFER_MSG="$DEFER_LEAD"
+        [ -n "$DEFER_FF_NOTE" ] && DEFER_MSG="$DEFER_MSG $DEFER_FF_NOTE"
+        DEFER_MSG="$DEFER_MSG The helper's launch agent is installed but not loaded, so updates are held."
+        if [ "$INST_VERSION" = "none" ]; then
+            # The plist's program lives inside the missing bundle, so loading it cannot work.
+            DEFER_MSG="$DEFER_MSG Remove the plist with rm \"$HELPER_PLIST\" and rerun the updater, which will then reinstall normally."
+        else
+            DEFER_MSG="$DEFER_MSG Either load it with launchctl bootstrap gui/\$(id -u) \"$HELPER_PLIST\" and rerun the updater, which will then give the next steps, or, if managed services are no longer used, remove the plist with rm \"$HELPER_PLIST\" and rerun the updater, which will then update normally."
+        fi
         UPGRADE_CMD="(not available until the helper's launch agent is loaded)"
     fi
     DEFER_KEY="$DEFER_STATE:$TARGET_VERSION:$TARGET_SHA"
+    if [ "$HELPER_LOADED" = false ]; then
+        DEFER_SKIP_DESC="managed helper's launch agent is installed but not loaded (${DEFER_STATE#unloaded-} install)"
+    else
+        DEFER_SKIP_DESC="managed helper is active ($DEFER_STATE install)"
+    fi
     if [ "$DRY_RUN" = true ]; then
-        skip "DRY RUN: managed helper is active ($DEFER_STATE install); would notify about v$TARGET_VERSION and leave the installation alone"
+        skip "DRY RUN: $DEFER_SKIP_DESC; would notify about v$TARGET_VERSION and leave the installation alone"
     fi
     if [ "$(sed -n 1p "$HELPER_DEFER_MEMO" 2>/dev/null || true)" != "$DEFER_KEY" ]; then
         # The notification text cannot be copied; the log keeps the full commands.
@@ -510,7 +528,7 @@ if [ "$HELPER_ACTIVE" = true ]; then
         notify "$DEFER_MSG Details: $LOG_FILE"
         printf '%s\n' "$DEFER_KEY" > "$HELPER_DEFER_MEMO" 2>/dev/null || true
     fi
-    skip "managed helper is active ($DEFER_STATE install); v$TARGET_VERSION pending; bundle replacement must go through: $UPGRADE_CMD; existing installation retained"
+    skip "$DEFER_SKIP_DESC; v$TARGET_VERSION pending; bundle replacement must go through: $UPGRADE_CMD; existing installation retained"
 fi
 
 # A commit that builds and passes tests can still crash on launch. Without this
