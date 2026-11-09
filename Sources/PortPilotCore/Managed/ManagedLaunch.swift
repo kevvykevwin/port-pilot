@@ -301,6 +301,7 @@ public actor ManagedSupervisor {
         let evidence = treeEvidence
         try? await registry.reconcileStops(treeVerified: { evidence.verified($0) })
         try? await registry.cleanup(treeVerified: { evidence.verified($0) }, signal: ManagedProcess.signal)
+        await dropOrphanedForwarders()
         if ProcessInfo.processInfo.systemUptime >= nextTailnetCheck, services.contains(where: { $0.tailnet != nil }) {
             nextTailnetCheck = ProcessInfo.processInfo.systemUptime + 60
             let data = try? await ManagedTailnet.readStatus()
@@ -309,6 +310,21 @@ public actor ManagedSupervisor {
                 let observed = data.flatMap { try? ManagedTailnet.inspect($0, selector: route.selector, stablePort: route.stablePort) }
                 try? await registry.observeTailnet(serviceId: service.id, expectedFingerprint: route.fingerprint, observed: observed)
             }
+        }
+    }
+    /// A relay must never outlive the backend it was built for: once that port is free, an unrelated
+    /// process could bind it and the stable URL (and any Tailscale Serve route on it) would serve that
+    /// process. Stop relays whose service is gone, stopped, or has no live matching incarnation. Services
+    /// that are starting or fenced (reroute) are skipped because launch/reroute code owns their relay.
+    private func dropOrphanedForwarders() async {
+        let services = await registry.snapshot()
+        for id in Array(forwarders.keys) {
+            if let service = services.first(where: { $0.id == id }) {
+                if service.lifecycle == "starting" || service.fence != nil || service.transition != nil { continue }
+                if service.lifecycle != "stopped",
+                   service.incarnations.contains(where: { ManagedProcess.incarnation(pid: $0.pid) == $0 }) { continue }
+            }
+            forwarders.removeValue(forKey: id)?.stop()
         }
     }
     private func boundedReadiness(_ session: URLSession, url: URL) async throws -> (Data, URLResponse) {
