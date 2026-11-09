@@ -696,8 +696,10 @@ extension ManagedRegistry {
         var takeover = false
         if !sameInstance {
             if e.state != .active, e.registeredInstance != nil {
-                guard e.state == .revoked, let recorded = e.registeredProcess, let peer,
-                      identity(recorded.pid) != recorded else { throw ManagedError.unauthorized }
+                // Exit proof is the registry's single rule: a different identity at the PID, or ESRCH.
+                // A failed identity lookup alone never proves the predecessor is gone.
+                guard e.state == .revoked, let recorded = e.registeredProcess, peer != nil,
+                      provenExited(recorded) else { throw ManagedError.unauthorized }
                 takeover = true
             }
         }

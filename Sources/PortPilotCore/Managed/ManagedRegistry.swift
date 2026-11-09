@@ -333,7 +333,7 @@ public actor ManagedRegistry {
     }
     /// The single exit rule: a different identity at the PID (reuse) or an OS-confirmed ESRCH.
     /// A missing identity alone is never proof of exit.
-    private func provenExited(_ target: ManagedIncarnation) -> Bool {
+    func provenExited(_ target: ManagedIncarnation) -> Bool {
         if let live = identity(target.pid) { return live != target }
         return isGone(target.pid)
     }
