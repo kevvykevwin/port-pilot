@@ -420,9 +420,10 @@ public actor ManagedSupervisor {
             let outcome = forwarder.connectionCount(generation: service.routeGeneration) > 0 ? "drain_timeout_old_backend_retained" : "route_verified_old_tree_retained_for_review"
             try await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: outcome)
         } catch {
+            var replacementStopped = false
             if !switched, let replacement = replacements[operationId] {
                 // Only the replacement's own processes; the old backend keeps serving.
-                _ = await terminateStarted(replacementTargets, child: replacement)
+                replacementStopped = await terminateStarted(replacementTargets, child: replacement)
             } else {
                 replacements[operationId]?.discardUnstarted()
             }
@@ -434,9 +435,16 @@ public actor ManagedSupervisor {
                 } catch {
                     try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "no_healthy_backend")
                 }
+            } else if !switched && replacementStopped {
+                // Replacement proven exited: leave only the old backend recorded so it stays stoppable.
+                do {
+                    try await registry.abandonReplacement(serviceId: service.id, operationId: operationId, outcome: "preparation_failed_replacement_stopped")
+                } catch {
+                    try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "preparation_failed_replacement_exit_unverified")
+                }
             } else {
                 try? await registry.finishReroute(serviceId: service.id, operationId: operationId,
-                                                outcome: switched ? "no_healthy_backend" : "preparation_failed_old_route_retained")
+                                                outcome: switched ? "no_healthy_backend" : "preparation_failed_replacement_exit_unverified")
             }
         }
     }
