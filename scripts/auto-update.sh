@@ -478,8 +478,9 @@ if [ "$HELPER_ACTIVE" = true ]; then
     elif [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$PRE_FF_BEHIND" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
         ALREADY_INSTALLED=true
     fi
-    # A missing or broken app is never "already installed", whatever COMMIT says.
-    case "$INST_VERSION" in none|broken) ALREADY_INSTALLED=false ;; esac
+    # A missing, broken or unreadable (no parseable Info.plist) app is never
+    # "already installed", whatever COMMIT says: none of them can be launched.
+    case "$INST_VERSION" in none|broken|unknown) ALREADY_INSTALLED=false ;; esac
     if [ "$ALREADY_INSTALLED" = true ]; then
         skip "managed helper is active; v$INST_VERSION is already installed and the clone is current (${LOCAL_SHA:0:7})"
     fi
