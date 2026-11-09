@@ -723,6 +723,30 @@ test_helper_matching_commit_is_installed_even_if_clone_was_behind() {
     teardown
 }
 
+test_helper_matching_commit_on_unlaunchable_bundle_is_not_installed() {
+    start "a bundle stamped with the target commit but missing its executable or Info.plist is not already installed (an unlaunchable app must not silence the notice)"
+    setup
+    install_helper_agent
+    push_origin_source_commit
+    install_app_version 0.4.0 "$(origin_tip)"
+    rm -f "$INSTALL/PortPilot.app/Contents/MacOS/PortPilot"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0 (missing executable)" "$STATUS" "0"
+    case "$OUTPUT" in *"already installed"*) bad "claimed an unlaunchable bundle was already installed (missing executable)" ;; *) ok "not already installed (missing executable)" ;; esac
+    assert_eq "one notice (missing executable)" "$(notify_count)" "1"
+    teardown
+    setup
+    install_helper_agent
+    push_origin_source_commit
+    install_app_version 0.4.0 "$(origin_tip)"
+    rm -f "$INSTALL/PortPilot.app/Contents/Info.plist"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "exits 0 (unreadable Info.plist)" "$STATUS" "0"
+    case "$OUTPUT" in *"already installed"*) bad "claimed an unlaunchable bundle was already installed (unreadable Info.plist)" ;; *) ok "not already installed (unreadable Info.plist)" ;; esac
+    assert_eq "one notice (unreadable Info.plist)" "$(notify_count)" "1"
+    teardown
+}
+
 test_helper_bundle_without_commit_keeps_version_equality() {
     start "regression guard: a bundle built before COMMIT existed falls back to version equality plus a current clone, so existing installs are not nagged forever"
     setup
@@ -1624,6 +1648,7 @@ test_helper_unloaded_with_missing_app_offers_only_plist_removal
 test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key
 test_helper_same_version_stale_commit_still_notifies
 test_helper_matching_commit_is_installed_even_if_clone_was_behind
+test_helper_matching_commit_on_unlaunchable_bundle_is_not_installed
 test_helper_bundle_without_commit_keeps_version_equality
 test_helper_unloaded_blocked_ff_does_not_promise_build_steps
 test_helper_missing_app_blocked_ff_is_reported
