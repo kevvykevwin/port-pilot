@@ -22,6 +22,19 @@ final class ManagedForwarderTests: XCTestCase {
         XCTAssertEqual(proxy.connectionCount(generation: 1), 1)
         XCTAssertEqual(proxy.connectionCount(generation: 2), 1)
     }
+    /// Bug caught: an unverified relay still connected to the backend port and served whatever listened there.
+    func testUnverifiedBackendGateClosesConnectionsUntilReverified() throws {
+        let backend = try EchoBackend(marker: "bak"); defer { backend.stop() }
+        let port = try ManagedProcess.availablePort(in: 40000...49000, excluding: [backend.port])
+        let proxy = try ManagedForwarder(stablePort: port, backendPort: backend.port); defer { proxy.stop() }
+        proxy.setBackendVerified(false)
+        let gated = try connect(port); defer { close(gated) }
+        XCTAssertThrowsError(try read(gated, count: 3), "no backend bytes while unverified")
+        XCTAssertEqual(proxy.connectionCount(generation: 1), 0)
+        proxy.setBackendVerified(true)
+        let open = try connect(port); defer { close(open) }
+        XCTAssertEqual(try read(open, count: 3), "bak")
+    }
     func testSocketWriteDeadlineWithStalledReader() throws {
         var fds: [Int32] = [0, 0]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)

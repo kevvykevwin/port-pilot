@@ -10,6 +10,8 @@ public final class ManagedForwarder: @unchecked Sendable {
     private let listenerFD: Int32
     private let listener: DispatchSourceRead
     private var stopped = false
+    /// While false the relay keeps the stable port reserved but never connects to the backend.
+    private var backendVerified = true
     private var backend: UInt16
     private var generation = 1
     private var pairs: [UUID: Pair] = [:]
@@ -93,6 +95,11 @@ public final class ManagedForwarder: @unchecked Sendable {
     public func switchBackend(to port: UInt16, generation: Int) {
         serialized { backend = port; self.generation = generation }
     }
+    /// Gate for forwarding. An unverified relay accepts and immediately closes every connection, so the
+    /// stable port stays reserved while no traffic reaches a backend port nobody is known to own.
+    public func setBackendVerified(_ verified: Bool) {
+        serialized { backendVerified = verified }
+    }
     public func connectionCount(generation: Int) -> Int {
         var count = 0
         serialized { count = pairs.values.filter { $0.generation == generation }.count }
@@ -117,6 +124,7 @@ public final class ManagedForwarder: @unchecked Sendable {
         for _ in 0..<32 {
             let client = Darwin.accept(listenerFD, nil, nil)
             if client < 0 { return }
+            guard backendVerified else { Darwin.close(client); continue }
             guard ManagedConnectionBudget.shared.acquire() else { Darwin.close(client); continue }
             ManagedSocket.configure(client)
             let server = socket(AF_INET, SOCK_STREAM, 0)
