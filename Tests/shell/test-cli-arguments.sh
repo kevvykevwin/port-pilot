@@ -118,6 +118,12 @@ wire "run forwards --revision" 7 run --service svc --port-env PORT --revision 7 
 # Bug caught: run/adopt must default to revision 0 (create-if-absent) when --revision is omitted.
 wire "run defaults to revision 0" 0 run --service svc --port-env PORT -- /bin/echo hi
 wire "adopt defaults to revision 0" 0 adopt --service svc --pid $$ --port 8080
+# Bug caught: the documented `run --port-arg=--port -- /abs/exe args` form must be accepted and
+# append exactly one `--port {port}` pair, with no placeholder required in the child argv.
+wire "run accepts --port-arg=--port" 0 run --service svc --port-arg=--port -- /bin/echo hi
+got_args="$(python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["payload"]["launch"]["arguments"]))' "$SOCKDIR/req.json" 2>/dev/null)"
+if [ "$got_args" = '["hi", "--port", "{port}"]' ]; then PASSED=$((PASSED+1)); printf 'ok: --port-arg appends one port pair (%s)\n' "$got_args"
+else printf 'FAIL: --port-arg arguments: %s\n' "$got_args" >&2; FAILED=$((FAILED+1)); fi
 # Control (current behaviour): a mutation without --revision sends no expectedRevision key (null).
 wire "claim without --revision sends no expectedRevision" "<absent>" claim "$SID"
 
