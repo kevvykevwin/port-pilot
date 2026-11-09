@@ -225,4 +225,63 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
         let again = await fetch(stable)
         XCTAssertEqual(again, "ok")
     }
+
+    /// Bug caught: start() opened the relay right after resume(), before any scan proved the child owns the backend
+    /// port, so while the service was still `starting` the stable URL served whatever else listened on that port.
+    /// Construction: the child sleeps before binding (never owns the port during the check); once the registry
+    /// publishes the backend port an unrelated listener takes it; the stable port must never relay its marker.
+    func testStartingServiceNeverRelaysSquatterOnBackendPort() async throws {
+        let rig = try rig()
+        let slow = rig.root.appendingPathComponent("slow.py")
+        try Data("import sys, time\ntime.sleep(40)\n".utf8).write(to: slow)
+        let launch = ManagedLaunch(service: "relay", executable: "/usr/bin/python3", arguments: [slow.path, "{port}"], cwd: rig.root.path, configurationFiles: [slow.path])
+        let response = await rig.supervisor.handle(rig.request("service.run", revision: 0, payload: ["launch": try .value(launch)]))
+        XCTAssertEqual(response.status, "accepted")
+        try await waitUntil { await rig.registry.snapshot().first?.backendPort != nil }
+        let starting = try await current(rig)
+        let stable = try XCTUnwrap(starting.stablePort), backend = try XCTUnwrap(starting.backendPort)
+        try listenUnrelated(on: backend, marker: "SQUATTER")
+        try await waitUntil(10) { await self.fetch(backend) == "SQUATTER" }
+        for _ in 0..<8 {
+            let lifecycle = await rig.registry.snapshot().first?.lifecycle
+            XCTAssertEqual(lifecycle, "starting", "the check must run while readiness is still pending")
+            let viaStable = await fetch(stable)
+            XCTAssertNotEqual(viaStable, "SQUATTER", "stable port must not relay a process the child does not own")
+            try await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    /// Bug caught: a gated relay that never reopens. A launcher respawns its server on the same port; after the sweep
+    /// gated the relay (listener dead) and ownership returned (new recorded incarnation listens), reconcile must reopen it.
+    func testGatedRelayReopensWhenLauncherRespawnsListener() async throws {
+        let rig = try rig()
+        let server = rig.root.appendingPathComponent("server.py")
+        let respawner = rig.root.appendingPathComponent("respawn.py")
+        try Data("""
+        import os, sys, subprocess, time, threading
+        threading.Timer(90, lambda: os._exit(0)).start()
+        child = None
+        while True:
+            if child is None or child.poll() is not None:
+                if child is not None: time.sleep(1.5)
+                child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+            time.sleep(0.1)
+        """.utf8).write(to: respawner)
+        let launch = ManagedLaunch(service: "relay", executable: "/usr/bin/python3", arguments: [respawner.path, server.path, "{port}"], cwd: rig.root.path, configurationFiles: [server.path, respawner.path])
+        let response = await rig.supervisor.handle(rig.request("service.run", revision: 0, payload: ["launch": try .value(launch)]))
+        XCTAssertEqual(response.status, "accepted")
+        try await waitUntil { await rig.registry.snapshot().first?.lifecycle == "running" }
+        let svc = try await current(rig)
+        let stable = try XCTUnwrap(svc.stablePort)
+        let live = await fetch(stable)
+        XCTAssertEqual(live, "ok")
+        try await waitUntil { await rig.registry.snapshot().first?.incarnations.count ?? 0 >= 2 }
+        let first = try await current(rig).incarnations.dropFirst()
+        for child in first { _ = ManagedProcess.signal(child) }
+        try await waitUntil { first.allSatisfy(ManagedProcess.exitVerified) }
+        await rig.supervisor.reconcile()
+        let gated = await fetch(stable)
+        XCTAssertNil(gated, "relay must be closed while no recorded process listens")
+        try await waitUntil(20) { await rig.supervisor.reconcile(); return await self.fetch(stable) == "ok" }
+    }
 }
