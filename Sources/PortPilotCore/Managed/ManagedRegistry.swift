@@ -640,6 +640,25 @@ public actor ManagedRegistry {
         candidate.operations[o].approved = false
         candidate.revision += 1; try commit(candidate)
     }
+    /// A failed preparation whose replacement was proven exited: drop the transition and keep only the old
+    /// backend's incarnations. Never merges the dead replacement into `incarnations`, so the still-serving
+    /// old backend stays running and stoppable. Refuses while any replacement target is not proven exited.
+    public func abandonReplacement(serviceId: UUID, operationId: UUID, outcome: String) throws {
+        guard !recoveryRequired,
+              let i = state.services.firstIndex(where: { $0.id == serviceId }),
+              let transition = state.services[i].transition, transition.operationId == operationId,
+              transition.phase == "preparing",
+              let o = state.operations.firstIndex(where: { $0.id == operationId }) else { throw ManagedError.staleRevision }
+        guard state.services[i].fence == nil || state.services[i].fence == operationId else { throw ManagedError.operationInProgress }
+        guard transition.newTargets.allSatisfy(provenExited) else { throw ManagedError.needsDecision }
+        var candidate = state
+        candidate.services[i].transition = nil
+        candidate.services[i].fence = nil
+        candidate.services[i].revision += 1
+        candidate.operations[o].phase = "needs_review"; candidate.operations[o].outcome = outcome
+        candidate.operations[o].approved = false
+        candidate.revision += 1; try commit(candidate)
+    }
     public func retireOldRoute(serviceId: UUID, operationId: UUID, treeVerified: @Sendable () -> Bool) throws {
         guard !recoveryRequired, let i = state.services.firstIndex(where: { $0.id == serviceId }),
               state.services[i].fence == operationId, let transition = state.services[i].transition,

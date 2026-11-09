@@ -158,6 +158,43 @@ final class ManagedTransactionTests: XCTestCase, @unchecked Sendable {
         do { _ = try await registry.restartLaunch(request, serviceId: service.id, fingerprint: "private", backend: 30003); XCTFail("new target alive") }
         catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
     }
+    /// Bug caught: abandoning a failed replacement merged its (dead) root into incarnations or left the transition open,
+    /// and accepting it while the replacement still runs would orphan a live process.
+    func testAbandonReplacementRequiresNewTargetsProvenExitedAndKeepsOldIncarnations() async throws {
+        let ids = Ident()
+        let old = live(999991), new = live(999992)
+        let registry = ManagedRegistry(persistence: try disk(), actors: actors, identity: { ids.lookup($0) }, isGone: { ids.isGone($0) })
+        ids.start(old); ids.start(new)
+        let service = try await registry.beginLaunch(request("service.run", actor: "owner"), workspace: ManagedWorkspace(id: UUID(), path: "/tmp", filesystemIdentity: "fixture"),
+            name: "web", variant: "default", fingerprint: "private", backend: 30001, stable: 20001)
+        try await registry.recordChild(serviceId: service.id, incarnation: old)
+        try await registry.finishLaunch(serviceId: service.id, ready: true, treeComplete: false)
+        let running = await registry.snapshot()[0]
+        let id = try await proposed(registry, running)
+        _ = await registry.handle(request("decision.resolve", service: running, payload: ["operationId": .string(id.uuidString), "approved": .bool(true)]))
+        _ = try await registry.beginReroute(request("operation.execute", service: running, payload: ["operationId": .string(id.uuidString)]), backend: 30002)
+        try await registry.recordReplacement(serviceId: running.id, operationId: id, targets: [new])
+        do { try await registry.abandonReplacement(serviceId: running.id, operationId: id, outcome: "preparation_failed_replacement_stopped"); XCTFail("replacement still alive") }
+        catch { XCTAssertEqual(error as? ManagedError, .needsDecision) }
+        let untouched = await registry.snapshot()[0]
+        XCTAssertNotNil(untouched.transition)
+        ids.exit(new)
+        try await registry.abandonReplacement(serviceId: running.id, operationId: id, outcome: "preparation_failed_replacement_stopped")
+        let after = await registry.snapshot()[0]
+        XCTAssertNil(after.transition); XCTAssertNil(after.fence)
+        XCTAssertEqual(after.lifecycle, "running")
+        XCTAssertEqual(after.incarnations, [old])
+        XCTAssertEqual(after.backendPort, 30001)
+        XCTAssertGreaterThan(after.revision, running.revision)
+        let operation = await registry.operation(id: id)
+        XCTAssertEqual(operation?.phase, "needs_review")
+        XCTAssertEqual(operation?.outcome, "preparation_failed_replacement_stopped")
+        try await registry.reconcileStops()
+        let reconciled = await registry.snapshot()[0]
+        XCTAssertEqual(reconciled.lifecycle, "running", "reconcile must leave the old backend alone")
+        do { try await registry.abandonReplacement(serviceId: running.id, operationId: id, outcome: "x"); XCTFail("transition already cleared") }
+        catch { XCTAssertEqual(error as? ManagedError, .staleRevision) }
+    }
     func testQuiescenceRequiresNoLiveChildrenAndSurvivesRestart() async throws {
         let (active, _) = try await running()
         let deferred = await active.handle(request("lifecycle.quiesce"))
