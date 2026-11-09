@@ -421,12 +421,16 @@ public actor ManagedSupervisor {
             try await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: outcome)
         } catch {
             var replacementStopped = false
+            var replacementSpawned = false
             if !switched, let replacement = replacements[operationId] {
                 // Only the replacement's own processes; the old backend keeps serving.
+                replacementSpawned = true
                 replacementStopped = await terminateStarted(replacementTargets, child: replacement)
             } else {
                 replacements[operationId]?.discardUnstarted()
             }
+            // Drop the child (and its kqueue fd) once it has been terminated or discarded.
+            replacements.removeValue(forKey: operationId)
             if switched, let old = service.backendPort, await healthy(launch, port: old, session: session) {
                 do {
                     try await registry.rollbackReroute(serviceId: service.id, operationId: operationId) { port, generation in
@@ -435,16 +439,21 @@ public actor ManagedSupervisor {
                 } catch {
                     try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "no_healthy_backend")
                 }
-            } else if !switched && replacementStopped {
-                // Replacement proven exited: leave only the old backend recorded so it stays stoppable.
+            } else if !switched {
+                // A forked replacement never verifies its tree, so let the registry decide from the
+                // recorded targets whether every one is proven exited. A target we know of but cannot
+                // prove exited blocks the abandon even when the registry never recorded it.
+                let outcome = replacementStopped ? "preparation_failed_replacement_stopped"
+                    : replacementSpawned ? "preparation_failed_replacement_tree_unverified"
+                    : "preparation_failed_before_replacement_started"
                 do {
-                    try await registry.abandonReplacement(serviceId: service.id, operationId: operationId, outcome: "preparation_failed_replacement_stopped")
+                    guard replacementTargets.allSatisfy(ManagedProcess.exitVerified) else { throw ManagedError.needsDecision }
+                    try await registry.abandonReplacement(serviceId: service.id, operationId: operationId, outcome: outcome)
                 } catch {
                     try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "preparation_failed_replacement_exit_unverified")
                 }
             } else {
-                try? await registry.finishReroute(serviceId: service.id, operationId: operationId,
-                                                outcome: switched ? "no_healthy_backend" : "preparation_failed_replacement_exit_unverified")
+                try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "no_healthy_backend")
             }
         }
     }

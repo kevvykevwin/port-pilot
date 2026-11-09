@@ -759,7 +759,9 @@ final class ManagedNotificationTests: XCTestCase, @unchecked Sendable {
             (nil, .none), ("exit_verified", .verified), ("route_verified_old_exit_verified", .verified),
             ("exit_not_yet_verified", .unverified), ("rolled_back_replacement_retained_for_review", .unverified),
             ("old_tree_exit_unverified", .unverified), ("identity_or_signal_failed", .failed), ("no_healthy_backend", .failed),
-            ("preparation_failed_port", .failed), (homeRoot + "/someone/secret", .unverified),
+            ("preparation_failed_port", .failed),
+            ("preparation_failed_replacement_stopped", .failed), ("preparation_failed_replacement_tree_unverified", .unverified),
+            ("preparation_failed_before_replacement_started", .failed), ("preparation_failed_replacement_exit_unverified", .unverified), (homeRoot + "/someone/secret", .unverified),
         ]
         for (raw, expected) in pairs { XCTAssertEqual(ManagedRegistry.notificationOutcome(raw), expected, raw ?? "nil") }
     }

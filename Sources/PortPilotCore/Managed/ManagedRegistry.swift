@@ -606,8 +606,19 @@ public actor ManagedRegistry {
         candidate.services[i].fence = operationId
         candidate.services[i].transition?.phase = "ready"
         candidate.operations[o].phase = "fenced"; candidate.operations[o].approved = false
+        let priorOperationPhase = state.operations[o].phase, priorApproved = state.operations[o].approved
         candidate.revision += 1; try commit(candidate)
-        guard targets.allSatisfy({ identity($0.pid) == $0 }) else { throw ManagedError.staleIdentity }
+        guard targets.allSatisfy({ identity($0.pid) == $0 }) else {
+            // Nothing was switched yet: undo exactly what the first commit changed so the
+            // transition is "preparing" again and abandonReplacement can still apply.
+            var revert = state
+            revert.services[i].fence = nil
+            revert.services[i].transition?.phase = "preparing"
+            revert.operations[o].phase = priorOperationPhase; revert.operations[o].approved = priorApproved
+            revert.revision += 1
+            try? commit(revert)
+            throw ManagedError.staleIdentity
+        }
         switchRoute(transition.newBackend, transition.oldGeneration + 1)
         candidate = state
         candidate.services[i].backendPort = transition.newBackend
