@@ -531,7 +531,7 @@ test_notify_escapes_quotes_and_backslashes_for_applescript() {
 test_helper_installed_equals_target_is_silent() {
     start "after a successful managed upgrade (installed-sha never updated) the installed version equals the target: no notice, no memo"
     setup
-    install_app_version 0.4.0
+    install_app_version 0.4.0 "$(origin_tip)"
     install_helper_agent
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
@@ -545,7 +545,7 @@ test_helper_installed_equals_target_is_silent() {
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "release notified once" "$(notify_count)" "1"
     assert_eq "clone at origin's tip" "$(git -C "$PROJECT" rev-parse HEAD)" "$(origin_tip)"
-    install_app_version 0.6.0
+    install_app_version 0.6.0 "$(origin_tip)"
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "silent after the managed upgrade" "$(notify_count)" "1"
     assert_contains "logs already installed" "$OUTPUT" "already installed"
@@ -747,15 +747,26 @@ test_helper_matching_commit_on_unlaunchable_bundle_is_not_installed() {
     teardown
 }
 
-test_helper_bundle_without_commit_keeps_version_equality() {
-    start "regression guard: a bundle built before COMMIT existed falls back to version equality plus a current clone, so existing installs are not nagged forever"
+test_helper_unstamped_bundle_is_pending_once_not_installed() {
+    start "a bundle with no COMMIT stamp at the target's VERSION is pending (one notice per target commit), not installed: missing provenance is not proof of being current, so a same-version fix must not be hidden forever"
     setup
     install_app_version 0.4.0
     install_helper_agent
     run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
     assert_eq "exits 0" "$STATUS" "0"
-    assert_contains "logs already installed" "$OUTPUT" "already installed"
-    assert_eq "no notification" "$(notify_count)" "0"
+    case "$OUTPUT" in *"already installed"*) bad "claimed an unstamped bundle was already installed" ;; *) ok "does not claim already installed" ;; esac
+    assert_eq "one notice" "$(notify_count)" "1"
+    assert_contains "names the build steps" "$(notices)" "build-app.sh"
+    assert_contains "names the upgrade command" "$(notices)" "upgrade --candidate"
+    assert_eq "installed bundle untouched" "$(installed_version_of)" "0.4.0"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_eq "second run silent via the memo" "$(notify_count)" "1"
+    case "$OUTPUT" in *"already installed"*) bad "second run claimed already installed" ;; *) ok "still not installed on the second run" ;; esac
+    # The user follows the notice: the rebuilt bundle carries the target commit.
+    install_app_version 0.4.0 "$(origin_tip)"
+    run_updater "PORTPILOT_HELPER_PLIST=$(helper_plist)"
+    assert_contains "stamped bundle is already installed" "$OUTPUT" "already installed"
+    assert_eq "no further notice" "$(notify_count)" "1"
     teardown
 }
 
@@ -1649,7 +1660,7 @@ test_helper_unloaded_blocked_fast_forward_keeps_noff_in_key
 test_helper_same_version_stale_commit_still_notifies
 test_helper_matching_commit_is_installed_even_if_clone_was_behind
 test_helper_matching_commit_on_unlaunchable_bundle_is_not_installed
-test_helper_bundle_without_commit_keeps_version_equality
+test_helper_unstamped_bundle_is_pending_once_not_installed
 test_helper_unloaded_blocked_ff_does_not_promise_build_steps
 test_helper_missing_app_blocked_ff_is_reported
 test_helper_unloaded_missing_app_blocked_ff_and_placeholder

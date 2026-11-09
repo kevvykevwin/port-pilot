@@ -468,14 +468,17 @@ if [ "$HELPER_ACTIVE" = true ]; then
     # commit stamped into the bundle by build-app.sh is the authoritative record:
     # the release is installed only when it equals the target. A dirty build
     # carries a "-dirty" suffix and so never matches.
-    # Bundles built before COMMIT existed have none; for those fall back to
-    # version equality with a current clone, so existing installs are not nagged
-    # forever (they pick up COMMIT on their next managed upgrade).
+    # A bundle without COMMIT (built before the stamp existed) has no provenance,
+    # and missing provenance is not proof of being current. The old fallback
+    # (same VERSION plus a current clone) was unsafe: a same-version commit that
+    # changed the app was hidden forever, so such a bundle never got the fix or
+    # the stamp. Treat it as pending whenever there is a target commit. The memo
+    # (state:version:sha) limits this to one notice per target commit, so it
+    # cannot nag every run; once the user builds and runs the managed upgrade the
+    # new bundle carries COMMIT and the gate goes quiet.
     INST_COMMIT="$(installed_commit)"
     ALREADY_INSTALLED=false
-    if [ -n "$INST_COMMIT" ]; then
-        [ "$INST_COMMIT" = "$TARGET_SHA" ] && ALREADY_INSTALLED=true
-    elif [ "$INST_VERSION" = "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "unknown" ] && [ "$PRE_FF_BEHIND" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
+    if [ -n "$INST_COMMIT" ] && [ "$INST_COMMIT" = "$TARGET_SHA" ]; then
         ALREADY_INSTALLED=true
     fi
     # A missing, broken or unreadable (no parseable Info.plist) app is never
