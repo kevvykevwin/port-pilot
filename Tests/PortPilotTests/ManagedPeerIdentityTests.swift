@@ -5,10 +5,14 @@ import Foundation
 /// Helper-verified agent takeover of the export shutdown fence. Only process liveness (the injected identity
 /// closure) and the clock are faked; the registry, sidecar and socket server are real.
 final class ManagedPeerIdentityTests: XCTestCase, @unchecked Sendable {
+    /// The fake process table. `set(nil)` means the PID is gone (the OS would report ESRCH);
+    /// `unreadable` means the identity lookup fails while the process may still exist.
     private final class Live: @unchecked Sendable {
-        private let lock = NSLock(); private var table: [Int32: ManagedIncarnation] = [:]
-        func set(_ i: ManagedIncarnation?, pid: Int32) { lock.withLock { table[pid] = i } }
+        private let lock = NSLock(); private var table: [Int32: ManagedIncarnation] = [:]; private var unreadableSet: Set<Int32> = []
+        func set(_ i: ManagedIncarnation?, pid: Int32) { lock.withLock { table[pid] = i; unreadableSet.remove(pid) } }
+        func unreadable(pid: Int32) { lock.withLock { table[pid] = nil; unreadableSet.insert(pid) } }
         func lookup(_ pid: Int32) -> ManagedIncarnation? { lock.withLock { table[pid] } }
+        func gone(_ pid: Int32) -> Bool { lock.withLock { table[pid] == nil && !unreadableSet.contains(pid) } }
     }
 
     private struct Rig {
@@ -34,7 +38,7 @@ final class ManagedPeerIdentityTests: XCTestCase, @unchecked Sendable {
                                name: "alpha", variant: "default", launchFingerprint: "fp")
         s.lifecycle = "running"; state.services = [s]; try disk.commit(state)
         let live = Live()
-        let registry = ManagedRegistry(persistence: disk, actors: actors, identity: { live.lookup($0) })
+        let registry = ManagedRegistry(persistence: disk, actors: actors, identity: { live.lookup($0) }, isGone: { live.gone($0) })
         let r = await registry.handle(ManagedRequest(operation: "export.enroll", actor: "user", credential: "token-user", payload: [
             "services": .array([.string(s.id.uuidString)]), "destination": .string("Inbox"),
             "exportedFields": .array(ManagedNotificationContract.allowedFields.map { .string($0) }), "consent": .bool(true)]))
@@ -107,6 +111,23 @@ final class ManagedPeerIdentityTests: XCTestCase, @unchecked Sendable {
         ok(await poll(r, a, peer: x))
         await disable(r)
         r.live.set(proc(500, start: 999), pid: 500)
+        ok(await poll(r, b, peer: proc(600)))
+    }
+
+    func testUnreadableIdentityOfLiveAgentBlocksTakeover() async throws {
+        // Bug caught: a failed identity lookup (nil) treated as proof the registered agent exited, letting a
+        // successor confirm shutdown while the predecessor may still be sending. Only a different identity at
+        // the PID or an OS-confirmed ESRCH proves exit.
+        let r = try await rig(); let x = proc(500)
+        r.live.set(x, pid: 500)
+        ok(await poll(r, a, peer: x))
+        await disable(r)
+        r.live.unreadable(pid: 500)
+        let denied = await poll(r, b, peer: proc(600))
+        XCTAssertEqual(denied.error, .unauthorized)
+        let s = await status(r)
+        XCTAssertEqual(s["shutdownConfirmed"], .bool(false)); XCTAssertEqual(s["agentTakeover"], .bool(false))
+        r.live.set(nil, pid: 500)
         ok(await poll(r, b, peer: proc(600)))
     }
 
