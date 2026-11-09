@@ -161,6 +161,10 @@ public actor ManagedSupervisor {
     private var nextTailnetCheck: TimeInterval = 0
     private var replacements: [UUID: ManagedTrackedChild] = [:]
     private var scheduledReroutes: Set<UUID> = []
+    /// Services whose start() or reroute task is running; those tasks own the relay, so the orphan sweep skips them.
+    private var activeOperations: Set<UUID> = [] { didSet { operationEpoch &+= 1 } }
+    /// Bumped whenever an operation starts or ends, so a sweep can tell its snapshot went stale across an await.
+    private var operationEpoch = 0
     private let treeEvidence = ManagedTreeEvidence()
     private let readinessTimeout: TimeInterval
     public init(registry: ManagedRegistry, key: Data, persistence: ManagedPersistence? = nil, readinessTimeout: TimeInterval = 30) {
@@ -221,7 +225,7 @@ public actor ManagedSupervisor {
                     try recipes?.save(launch, fingerprint: fingerprint)
                     let restarted = try await registry.restartLaunch(request, serviceId: existing.id, fingerprint: fingerprint, backend: backend)
                     launches[existing.id] = launch
-                    Task { await self.start(service: restarted, launch: launch) }
+                    launchInBackground(service: restarted, launch: launch)
                     return await registry.handle(request)
                 }
                 guard existing.launchFingerprint == fingerprint, !launch.configurationFiles.isEmpty,
@@ -253,7 +257,7 @@ public actor ManagedSupervisor {
             launches[service.id] = launch
             // Long startup returns a durable operation immediately. Connection loss
             // does not cancel this task or release the claim.
-            Task { await self.start(service: service, launch: launch) }
+            launchInBackground(service: service, launch: launch)
             return await registry.handle(request)
         } catch {
             // Another connection may have committed this request while an async
@@ -273,10 +277,7 @@ public actor ManagedSupervisor {
             guard let stable = service.stablePort, let backend = service.backendPort,
                   !service.incarnations.isEmpty,
                   service.incarnations.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }),
-                  entries.contains(where: { entry in
-                      entry.port == backend && entry.state == .listen && entry.localAddress == "127.0.0.1" &&
-                      service.incarnations.contains(where: { $0.pid == entry.pid && $0.startTime == entry.processStartTime })
-                  }) else { continue }
+                  Self.ownsBackend(service, entries: entries) else { continue }
             // Retain the published allocation; a collision never chooses a new URL.
             do {
                 let forwarder = try ManagedForwarder(stablePort: stable, backendPort: backend)
@@ -312,19 +313,38 @@ public actor ManagedSupervisor {
             }
         }
     }
-    /// A relay must never outlive the backend it was built for: once that port is free, an unrelated
-    /// process could bind it and the stable URL (and any Tailscale Serve route on it) would serve that
-    /// process. Stop relays whose service is gone, stopped, or has no live matching incarnation. Services
-    /// that are starting or fenced (reroute) are skipped because launch/reroute code owns their relay.
+    /// True when a live recorded incarnation of the service is LISTENing on its backend port at 127.0.0.1.
+    private static func ownsBackend(_ service: ManagedService, entries: [PortEntry]) -> Bool {
+        guard let backend = service.backendPort else { return false }
+        return entries.contains { entry in
+            entry.port == backend && entry.state == .listen && entry.localAddress == "127.0.0.1" &&
+            service.incarnations.contains { $0.pid == entry.pid && $0.startTime == entry.processStartTime && ManagedProcess.incarnation(pid: $0.pid) == $0 }
+        }
+    }
+    /// A relay must never forward to a port nobody owns: once the listener is gone, an unrelated process
+    /// could bind it and the stable URL (and any Tailscale Serve route on it) would serve that process.
+    /// Relays of gone or stopped services are stopped. Every other relay is open only while a live recorded
+    /// incarnation listens on the backend port; otherwise it stays bound (so the stable port stays reserved)
+    /// but closes connections. A live launcher or other recorded process is not ownership. Services with a
+    /// running start() or reroute task are skipped, and that is re-checked after each await.
     private func dropOrphanedForwarders() async {
+        let candidates = Set(forwarders.keys).subtracting(activeOperations)
+        guard !candidates.isEmpty else { return }
+        let epoch = operationEpoch
         let services = await registry.snapshot()
-        for id in Array(forwarders.keys) {
-            if let service = services.first(where: { $0.id == id }) {
-                if service.lifecycle == "starting" || service.fence != nil || service.transition != nil { continue }
-                if service.lifecycle != "stopped",
-                   service.incarnations.contains(where: { ManagedProcess.incarnation(pid: $0.pid) == $0 }) { continue }
+        let relayed = services.filter { candidates.contains($0.id) && $0.lifecycle != "stopped" }
+        let pids = Array(Set(relayed.flatMap { $0.incarnations.map(\.pid) }))
+        var entries: [PortEntry]?
+        if !relayed.isEmpty, case .success(let scanned, _) = await PortScanner(pidProvider: { pids }).scan() { entries = scanned }
+        // No awaits below. If any start/reroute began or ended meanwhile the snapshot may be stale; skip this sweep.
+        guard epoch == operationEpoch else { return }
+        for id in candidates where !activeOperations.contains(id) {
+            guard let forwarder = forwarders[id] else { continue }
+            guard let service = services.first(where: { $0.id == id }), service.lifecycle != "stopped" else {
+                forwarders.removeValue(forKey: id)?.stop()
+                continue
             }
-            forwarders.removeValue(forKey: id)?.stop()
+            forwarder.setBackendVerified(entries.map { Self.ownsBackend(service, entries: $0) } ?? false)
         }
     }
     private func boundedReadiness(_ session: URLSession, url: URL) async throws -> (Data, URLResponse) {
@@ -349,6 +369,7 @@ public actor ManagedSupervisor {
             let response = try await registry.beginReroute(request, backend: port)
             guard response.error == nil else { return response }
             guard scheduledReroutes.insert(operation.id).inserted else { return response }
+            activeOperations.insert(service.id)
             Task { await self.prepareReplacement(service: service, operationId: operation.id, launch: launch, port: port, forwarder: forwarder) }
             return response
         } catch { return ManagedResponse(requestId: request.requestId, error: error as? ManagedError ?? .dependencyUnavailable) }
@@ -362,6 +383,7 @@ public actor ManagedSupervisor {
     private func prepareReplacement(service: ManagedService, operationId: UUID, launch: ManagedLaunch, port: UInt16, forwarder: ManagedForwarder) async {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 1; configuration.timeoutIntervalForResource = 1
+        defer { activeOperations.remove(service.id) }
         let session = URLSession(configuration: configuration, delegate: NoReadinessRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         var switched = false
@@ -397,6 +419,8 @@ public actor ManagedSupervisor {
             guard successes == 3, try launch.fingerprint(key: key, secret: secret) == service.launchFingerprint else { throw ManagedError.readinessFailed }
             try await registry.switchReroute(serviceId: service.id, operationId: operationId) { port, generation in
                 forwarder.switchBackend(to: port, generation: generation)
+                // The replacement's listener was proven owned by scan before this switch.
+                forwarder.setBackendVerified(true)
             }
             switched = true
             let observationDeadline = ProcessInfo.processInfo.systemUptime + 30
@@ -473,7 +497,13 @@ public actor ManagedSupervisor {
             }
         }
     }
+    /// Marks the service as owning its relay before the task runs, so no sweep can interleave.
+    private func launchInBackground(service: ManagedService, launch: ManagedLaunch) {
+        activeOperations.insert(service.id)
+        Task { await self.start(service: service, launch: launch) }
+    }
     private func start(service: ManagedService, launch: ManagedLaunch) async {
+        defer { activeOperations.remove(service.id) }
         do {
             guard let backend = service.backendPort, let stable = service.stablePort else { throw ManagedError.invalidInput }
             guard try launch.fingerprint(key: key, secret: secret) == service.launchFingerprint else { throw ManagedError.incompatibleLaunch }
@@ -485,6 +515,10 @@ public actor ManagedSupervisor {
             try process.resume()
             let forwarder = try forwarders[service.id] ?? ManagedForwarder(stablePort: stable, backendPort: backend)
             forwarder.switchBackend(to: backend, generation: service.routeGeneration + 1)
+            // start() owns the relay until it finishes: readiness probes go through the stable port and each
+            // success requires a scan proving the child tree listens on `backend`. A reused relay that an
+            // earlier sweep gated is therefore reopened here; the sweep re-verifies it after start ends.
+            forwarder.setBackendVerified(true)
             forwarders[service.id] = forwarder
             let deadline = ProcessInfo.processInfo.systemUptime + readinessTimeout
             var successes = 0
