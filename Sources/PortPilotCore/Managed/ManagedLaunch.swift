@@ -431,6 +431,8 @@ public actor ManagedSupervisor {
             }
             let drainDeadline = ProcessInfo.processInfo.systemUptime + 60
             while forwarder.connectionCount(generation: service.routeGeneration) > 0 && ProcessInfo.processInfo.systemUptime < drainDeadline {
+                // A replacement that dies during the drain must roll back, not keep receiving traffic.
+                guard targets.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }) else { throw ManagedError.readinessFailed }
                 try await Task.sleep(for: .seconds(1))
             }
             if forwarder.connectionCount(generation: service.routeGeneration) == 0,
@@ -515,10 +517,11 @@ public actor ManagedSupervisor {
             try process.resume()
             let forwarder = try forwarders[service.id] ?? ManagedForwarder(stablePort: stable, backendPort: backend)
             forwarder.switchBackend(to: backend, generation: service.routeGeneration + 1)
-            // start() owns the relay until it finishes: readiness probes go through the stable port and each
-            // success requires a scan proving the child tree listens on `backend`. A reused relay that an
-            // earlier sweep gated is therefore reopened here; the sweep re-verifies it after start ends.
-            forwarder.setBackendVerified(true)
+            // Gate the relay until a scan proves this child owns `backend`: until then another process may hold
+            // that port (grabbed between availablePort() and the child's bind). A reused relay that an earlier
+            // sweep or run left open is closed here too. The readiness loop opens it per scan; the sweep
+            // re-verifies it after start ends.
+            forwarder.setBackendVerified(false)
             forwarders[service.id] = forwarder
             let deadline = ProcessInfo.processInfo.systemUptime + readinessTimeout
             var successes = 0
@@ -540,6 +543,7 @@ public actor ManagedSupervisor {
                         known.contains { $0.pid == entry.pid && $0.startTime == entry.processStartTime && ManagedProcess.incarnation(pid: $0.pid) == $0 }
                     }
                 } else { owns = false }
+                forwarder.setBackendVerified(owns)
                 let url = URL(string: "http://127.0.0.1:\(stable)\(launch.readinessPath)")!
                 if owns, let (bytes, response) = try? await boundedReadiness(session, url: url),
                    (response as? HTTPURLResponse)?.statusCode == launch.readinessStatus,
