@@ -47,6 +47,8 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         let fd = kqueue()
         guard fd >= 0 else {
             _ = ProcessKiller.forceKill(pid: pid, expectedStartTime: identity.startTime)
+            var status: Int32 = 0
+            _ = waitpid(pid, &status, 0)
             throw ManagedError.dependencyUnavailable
         }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
@@ -56,6 +58,8 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         guard kevent64(fd, &watch, 1, nil, 0, 0, nil) == 0 else {
             close(fd)
             _ = ProcessKiller.forceKill(pid: pid, expectedStartTime: identity.startTime)
+            var status: Int32 = 0
+            _ = waitpid(pid, &status, 0)   // our unreaped child: reap it so no zombie blocks exit proof
             throw ManagedError.dependencyUnavailable
         }
         events = fd

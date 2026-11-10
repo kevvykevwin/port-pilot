@@ -782,7 +782,9 @@ public actor ManagedRegistry {
         if sent { signalTimes[service.id] = uptime() }
         candidate.operations[o].phase = sent ? "signal_sent" : "needs_review"
         candidate.operations[o].outcome = sent ? "exit_not_yet_verified" : "identity_or_signal_failed"
-        if !sent { candidate.services[i].lifecycle = "needs_review" }
+        // A failed signal ends this operation; nothing would ever release its fence. Restart still
+        // requires every recorded process proven exited, so releasing it cannot hide a live one.
+        if !sent { candidate.services[i].lifecycle = "needs_review"; candidate.services[i].fence = nil }
         candidate.revision += 1; try commit(candidate)
         return response
     }
@@ -907,8 +909,8 @@ public actor ManagedRegistry {
             if let o = candidate.operations.firstIndex(where: { $0.id == operation }) {
                 candidate.operations[o].phase = sent ? "signal_sent" : "needs_review"
             }
-            if !sent { candidate.services[i].lifecycle = "needs_review" }
-            // Signal delivery is not exit evidence; fence remains until reconciled.
+            if !sent { candidate.services[i].lifecycle = "needs_review"; candidate.services[i].fence = nil }
+            // Signal delivery is not exit evidence; after a sent signal the fence remains until reconciled.
             candidate.revision += 1; try commit(candidate)
         }
     }
