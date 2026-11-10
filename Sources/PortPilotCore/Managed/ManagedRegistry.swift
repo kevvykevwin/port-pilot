@@ -367,13 +367,16 @@ public actor ManagedRegistry {
     /// Every recorded target must be live and matching (strict), or, when `tolerant`, a prunable
     /// descendant that is proven exited is skipped. Any other mismatch fails closed.
     /// Returns the targets that are live now.
+    /// `skipAnyExited` (stop/force only) skips a proven-exited target at any position, root included: skipping
+    /// never signals anything, and after a failed move the record can hold a dead root that must not make the
+    /// live old backend unstoppable. It never prunes the record.
     @discardableResult
-    private func requireLiveIncarnations(_ service: ManagedService, tolerant: Bool = true) throws -> [ManagedIncarnation] {
+    private func requireLiveIncarnations(_ service: ManagedService, tolerant: Bool = true, skipAnyExited: Bool = false) throws -> [ManagedIncarnation] {
         guard !service.incarnations.isEmpty else { throw ManagedError.identityUnavailable }
         var live: [ManagedIncarnation] = []
         for (n, target) in service.incarnations.enumerated() {
             if let current = identity(target.pid), current == target { live.append(target); continue }
-            if tolerant && canPrune(service, at: n) && provenExited(target) { continue }
+            if (skipAnyExited || (tolerant && canPrune(service, at: n))) && provenExited(target) { continue }
             guard identity(target.pid) != nil else { throw ManagedError.identityUnavailable }
             throw ManagedError.staleIdentity
         }
@@ -514,8 +517,10 @@ public actor ManagedRegistry {
         let service = state.services[i]
         try checkRevision(request, service)
         // A needs_review service is restartable only once every process it ever recorded is proven gone.
+        // An empty record counts as finished: a launch records its child before resuming it, so a launch
+        // that recorded nothing (spawn failed, or the helper died first) never ran any user code.
         let finished = service.lifecycle == "stopped" ? service.transition == nil
-            : service.lifecycle == "needs_review" && service.fence == nil && !service.incarnations.isEmpty
+            : service.lifecycle == "needs_review" && service.fence == nil
                 && (service.incarnations + (service.transition.map { $0.oldTargets + $0.newTargets } ?? [])).allSatisfy(provenExited)
         guard finished, service.launchFingerprint == fingerprint,
               !state.services.contains(where: { $0.lifecycle != "stopped" && ($0.backendPort == backend || $0.transition?.newBackend == backend) }) else { throw ManagedError.incompatibleLaunch }
@@ -757,8 +762,10 @@ public actor ManagedRegistry {
         // Forced termination ALWAYS needs a separately approved force operation.
         guard operation.approved else { throw ManagedError.needsDecision }
         guard !operation.targets.isEmpty else { throw ManagedError.identityUnavailable }
-        // Proven-exited descendants are skipped; the root and anything uncertain still fail closed.
-        let liveTargets = try requireLiveIncarnations(service)
+        // Proven-exited targets are skipped; anything uncertain still fails closed.
+        let liveTargets = try requireLiveIncarnations(service, skipAnyExited: true)
+        // Nothing left to signal means the recorded set changed under this approval; reconcile decides.
+        guard !liveTargets.isEmpty else { throw ManagedError.staleIdentity }
         var candidate = state
         candidate.services[i].fence = id; candidate.services[i].lifecycle = "stopping"
         candidate.operations[o].phase = "fenced"; candidate.operations[o].approved = false

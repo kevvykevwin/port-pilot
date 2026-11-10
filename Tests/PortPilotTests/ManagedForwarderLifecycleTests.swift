@@ -340,5 +340,81 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(after.backendPort, old, "the stable port must point back at the old backend")
         let served = await fetch(stable)
         XCTAssertEqual(served, "ready-\(old)")
+        // The rolled-back service must still be stoppable, and the dead replacement must be reaped so its
+        // exit can be proven (an unreaped zombie has no identity and no ESRCH).
+        try await waitUntil(10) { await rig.supervisor.reconcile(); return replacement.allSatisfy(ManagedProcess.exitVerified) }
+        XCTAssertTrue(replacement.allSatisfy(ManagedProcess.exitVerified), "the helper must reap the replacement it spawned")
+        await rig.supervisor.reconcile()
+        let review = try await current(rig)
+        var stop: [String: ManagedJSON] = ["serviceId": .string(review.id.uuidString), "action": .string("stop")]
+        let stopProposal = await rig.supervisor.handle(rig.request("operation.propose", revision: review.revision, payload: stop))
+        stop["operationId"] = .string(try XCTUnwrap(stopProposal.operationId).uuidString); stop["approved"] = .bool(true)
+        let stopApproval = await rig.supervisor.handle(rig.request("decision.resolve", revision: review.revision, payload: stop))
+        XCTAssertNil(stopApproval.error)
+        let stopped = await rig.supervisor.handle(rig.request("operation.execute", revision: review.revision, payload: stop))
+        XCTAssertNil(stopped.error, "a rolled-back service must stay stoppable")
+        try await waitUntil(15) { await rig.supervisor.reconcile(); return await rig.registry.snapshot().first?.fence == nil }
+        let final = try await current(rig)
+        XCTAssertTrue(["stopped", "needs_review"].contains(final.lifecycle), final.lifecycle)
+        XCTAssertTrue(before.incarnations.allSatisfy(ManagedProcess.exitVerified), "the old backend must have exited")
+    }
+
+    /// Bug caught: during a move's observation and drain only process liveness was checked, so a replacement
+    /// that closed its listener but stayed alive kept the relay pointed at a port anyone could then bind.
+    func testReplacementLosingItsListenerDuringDrainRollsBack() async throws {
+        let rig = try rig(observationWindow: 0)
+        let script = rig.root.appendingPathComponent("closing.py")
+        let marker = rig.root.appendingPathComponent("close-now")
+        try Data("""
+        import os, sys, http.server, threading, time
+        threading.Timer(90, lambda: os._exit(0)).start()
+        port = sys.argv[1]
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = ('ready-' + port).encode()
+                self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+            def log_message(self, *args): pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', int(port)), Handler)
+        def watch():
+            while not os.path.exists(sys.argv[2] + '.' + port): time.sleep(0.1)
+            server.shutdown(); server.server_close()
+        threading.Thread(target=watch, daemon=True).start()
+        server.serve_forever()
+        while True: time.sleep(1)
+        """.utf8).write(to: script)
+        let launch = ManagedLaunch(service: "relay", executable: "/usr/bin/python3", arguments: [script.path, "{port}", marker.path], cwd: rig.root.path,
+                                   readinessMarker: "ready-", configurationFiles: [script.path], parallelSafe: true)
+        let started = await rig.supervisor.handle(rig.request("service.run", revision: 0, payload: ["launch": try .value(launch)]))
+        XCTAssertEqual(started.status, "accepted")
+        try await waitUntil { await rig.registry.snapshot().first?.lifecycle == "running" }
+        let before = try await current(rig)
+        let stable = try XCTUnwrap(before.stablePort), old = try XCTUnwrap(before.backendPort)
+        let held = socket(AF_INET, SOCK_STREAM, 0); XCTAssertGreaterThanOrEqual(held, 0)
+        defer { close(held) }
+        var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = stable.bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(held, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        XCTAssertEqual(connected, 0)
+        var payload: [String: ManagedJSON] = ["serviceId": .string(before.id.uuidString), "action": .string("reroute")]
+        let proposed = await rig.supervisor.handle(rig.request("operation.propose", revision: before.revision, payload: payload))
+        let id = try XCTUnwrap(proposed.operationId)
+        payload["operationId"] = .string(id.uuidString); payload["approved"] = .bool(true)
+        let resolved = await rig.supervisor.handle(rig.request("decision.resolve", revision: before.revision, payload: payload))
+        XCTAssertNil(resolved.error)
+        _ = await rig.supervisor.handle(rig.request("operation.execute", revision: before.revision, payload: payload))
+        try await waitUntil(40) { await rig.registry.snapshot().first?.transition?.phase == "switched" }
+        let moving = try await current(rig)
+        let newBackend = try XCTUnwrap(moving.transition?.newBackend)
+        // The replacement closes its listener but its process stays alive.
+        FileManager.default.createFile(atPath: marker.path + ".\(newBackend)", contents: Data())
+        try await waitUntil(20) { await rig.registry.operation(id: id)?.phase == "needs_review" }
+        let outcome = await rig.registry.operation(id: id)?.outcome
+        XCTAssertEqual(outcome, "rolled_back_replacement_retained_for_review")
+        let after = try await current(rig)
+        XCTAssertEqual(after.backendPort, old)
+        let served = await fetch(stable)
+        XCTAssertEqual(served, "ready-\(old)")
     }
 }
