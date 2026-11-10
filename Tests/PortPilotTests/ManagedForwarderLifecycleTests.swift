@@ -15,12 +15,12 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
         }
     }
     private var extras: [Process] = []
-    private func rig(launcher: Bool = false) throws -> Rig {
+    private func rig(launcher: Bool = false, observationWindow: TimeInterval = 30) throws -> Rig {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pp-fwd-\(UUID().uuidString)")
         let disk = try ManagedPersistence(root: root)
         let actor = ManagedActor(id: "fixture", scope: .user, credentialHash: ManagedDigest.hash(Data("fixture-token".utf8)))
         let registry = ManagedRegistry(persistence: disk, actors: [actor])
-        let supervisor = ManagedSupervisor(registry: registry, key: Data("fixture-key".utf8), persistence: disk)
+        let supervisor = ManagedSupervisor(registry: registry, key: Data("fixture-key".utf8), persistence: disk, observationWindow: observationWindow)
         let script = root.appendingPathComponent("server.py")
         try Data("""
         import os, sys, http.server, threading
@@ -46,7 +46,7 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
             : ManagedLaunch(service: "relay", executable: "/usr/bin/python3", arguments: [script.path, "{port}"], cwd: root.path, configurationFiles: [script.path])
         addTeardownBlock { [self] in
             for p in extras where p.isRunning { p.terminate() }
-            for target in await registry.snapshot().flatMap({ $0.incarnations }) { _ = ManagedProcess.signal(target) }
+            for target in await registry.snapshot().flatMap({ $0.incarnations + ($0.transition?.newTargets ?? []) }) { _ = ManagedProcess.signal(target) }
             try? FileManager.default.removeItem(at: root)
         }
         return Rig(root: root, registry: registry, supervisor: supervisor, actor: actor, launch: launch)
@@ -283,5 +283,62 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
         let gated = await fetch(stable)
         XCTAssertNil(gated, "relay must be closed while no recorded process listens")
         try await waitUntil(20) { await rig.supervisor.reconcile(); return await self.fetch(stable) == "ok" }
+    }
+
+    /// Bug caught: a move's new backend dying while an old connection drains kept the stable port pointed at the
+    /// dead backend for up to a minute (ending "drain_timeout"), instead of rolling back to the healthy old one.
+    func testReplacementDyingDuringDrainRollsBackToOldBackend() async throws {
+        let rig = try rig(observationWindow: 0)
+        let script = rig.root.appendingPathComponent("named.py")
+        try Data("""
+        import os, sys, http.server, threading
+        threading.Timer(90, lambda: os._exit(0)).start()
+        port = sys.argv[1]
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = ('ready-' + port).encode()
+                self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+            def log_message(self, *args): pass
+        http.server.ThreadingHTTPServer(('127.0.0.1', int(port)), Handler).serve_forever()
+        """.utf8).write(to: script)
+        let launch = ManagedLaunch(service: "relay", executable: "/usr/bin/python3", arguments: [script.path, "{port}"], cwd: rig.root.path,
+                                   readinessMarker: "ready-", configurationFiles: [script.path], parallelSafe: true)
+        let started = await rig.supervisor.handle(rig.request("service.run", revision: 0, payload: ["launch": try .value(launch)]))
+        XCTAssertEqual(started.status, "accepted")
+        try await waitUntil { await rig.registry.snapshot().first?.lifecycle == "running" }
+        let before = try await current(rig)
+        let stable = try XCTUnwrap(before.stablePort), old = try XCTUnwrap(before.backendPort)
+        let first = await fetch(stable)
+        XCTAssertEqual(first, "ready-\(old)")
+        // An idle connection on the old route keeps the drain waiting.
+        let held = socket(AF_INET, SOCK_STREAM, 0); XCTAssertGreaterThanOrEqual(held, 0)
+        defer { close(held) }
+        var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = stable.bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(held, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        XCTAssertEqual(connected, 0)
+        var payload: [String: ManagedJSON] = ["serviceId": .string(before.id.uuidString), "action": .string("reroute")]
+        let proposed = await rig.supervisor.handle(rig.request("operation.propose", revision: before.revision, payload: payload))
+        let id = try XCTUnwrap(proposed.operationId)
+        payload["operationId"] = .string(id.uuidString); payload["approved"] = .bool(true)
+        let resolved = await rig.supervisor.handle(rig.request("decision.resolve", revision: before.revision, payload: payload))
+        XCTAssertNil(resolved.error)
+        let accepted = await rig.supervisor.handle(rig.request("operation.execute", revision: before.revision, payload: payload))
+        XCTAssertEqual(accepted.status, "accepted")
+        try await waitUntil(40) { await rig.registry.snapshot().first?.transition?.phase == "switched" }
+        let switched = try await current(rig)
+        let replacement = try XCTUnwrap(switched.transition?.newTargets)
+        XCTAssertFalse(replacement.isEmpty)
+        for target in replacement { _ = ManagedProcess.signal(target) }
+        // The drain would otherwise wait 60 s for the held connection; rollback must come well before that.
+        try await waitUntil(20) { await rig.registry.operation(id: id)?.phase == "needs_review" }
+        let outcome = await rig.registry.operation(id: id)?.outcome
+        XCTAssertEqual(outcome, "rolled_back_replacement_retained_for_review")
+        let after = try await current(rig)
+        XCTAssertEqual(after.backendPort, old, "the stable port must point back at the old backend")
+        let served = await fetch(stable)
+        XCTAssertEqual(served, "ready-\(old)")
     }
 }

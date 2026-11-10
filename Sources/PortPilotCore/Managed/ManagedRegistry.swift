@@ -50,6 +50,27 @@ public actor ManagedRegistry {
             for i in state.services.indices where state.services[i].lifecycle != "stopped" {
                 state.services[i].lifecycle = "needs_review"
                 state.services[i].treeComplete = false
+                // The task that held the fence died with the old helper and can never release it.
+                // Record the interrupted operation for review and keep every process it may have
+                // started, so restart still requires each one proven exited.
+                if let fence = state.services[i].fence {
+                    if let o = state.operations.firstIndex(where: { $0.id == fence }) {
+                        state.operations[o].phase = "needs_review"
+                        state.operations[o].outcome = "helper_restarted_outcome_unverified"
+                    }
+                    state.services[i].fence = nil
+                }
+                if let transition = state.services[i].transition {
+                    for target in transition.newTargets where !state.services[i].incarnations.contains(target) {
+                        state.services[i].incarnations.append(target)
+                    }
+                    state.services[i].transition?.phase = "needs_review"
+                    if let o = state.operations.firstIndex(where: { $0.id == transition.operationId }),
+                       !["completed", "needs_review", "denied"].contains(state.operations[o].phase) {
+                        state.operations[o].phase = "needs_review"
+                        state.operations[o].outcome = "helper_restarted_outcome_unverified"
+                    }
+                }
             }
         } catch { state = ManagedState(); recoveryRequired = true }
         (exportBook, exportFault, exportRevocationPending) = ManagedExportStore.load(persistence)
