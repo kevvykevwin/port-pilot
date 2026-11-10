@@ -273,6 +273,44 @@ assert_contains "v7 tar: UTF-16 sentinel found" "$OUT" "sentinel"
 new_case; printf 'just some text, not an archive at all\n' > "$ART/notes.txt"; prepare --artifact "$ART/notes.txt"
 run_audit; assert_eq "control: plain text is not taken for tar" "$RC" 0
 
+start "a tar header in front of a zip does not hide the zip, and a tar-looking .strings.gz is still UTF-16 scanned"
+for magic in v7 ustar; do
+new_case
+python3 -I - "$ART/release.zip" "$SENT" "$magic" <<'PY'
+import io, sys, tarfile, zipfile
+hdr = tarfile.TarInfo("readme.txt"); hdr.size = 0
+block = bytearray(hdr.tobuf(format=tarfile.USTAR_FORMAT)[:512])
+if sys.argv[3] == "v7":
+    block[257:500] = bytes(243); block[148:156] = b"        "
+    block[148:156] = ("%06o\0 " % sum(block)).encode()
+z = io.BytesIO()
+with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("cfg/.env", "API_KEY=" + sys.argv[2])
+open(sys.argv[1], "wb").write(bytes(block) + z.getvalue())
+PY
+prepare --artifact "$ART/release.zip"
+run_audit
+assert_eq "$magic header + zip: exit 1" "$RC" 1
+assert_contains "$magic header + zip: forbidden_file" "$OUT" "forbidden_file"
+done
+new_case
+python3 -I - "$ART/Localizable.strings.gz" "$SENT" <<'PY'
+import gzip, sys, tarfile
+hdr = tarfile.TarInfo("a"); hdr.size = 0
+block = bytearray(hdr.tobuf(format=tarfile.USTAR_FORMAT)[:512])
+block[257:500] = bytes(243); block[148:156] = b"        "
+block[148:156] = ("%06o\0 " % sum(block)).encode()
+body = bytes(block) + ('"k" = "' + sys.argv[2] + '";').encode("utf-16-le")
+open(sys.argv[1], "wb").write(gzip.compress(body))
+PY
+prepare --artifact "$ART/Localizable.strings.gz"
+expect_fail "tar-looking .strings.gz" "sentinel"
+new_case; cp /bin/ls "$ART/tool"; plutil -convert binary1 -o "$ART/Info.plist" - <<'PL' >/dev/null 2>&1 || printf 'bplist00' > "$ART/Info.plist"
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>k</key><string>v</string></dict></plist>
+PL
+prepare --artifact "$ART/tool" --artifact "$ART/Info.plist"
+run_audit; assert_eq "control: Mach-O and binary plist are not taken for tar" "$RC" 0
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare

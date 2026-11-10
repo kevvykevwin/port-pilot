@@ -327,6 +327,9 @@ class Scanner:
                 self.f.add("archive_depth", loc)
             else:
                 self.scan_archive(data, kind, loc, depth, name)
+                # A tar header does not stop unzip from finding a zip at the tail.
+                if kind == "tar" and zip_at_tail(data):
+                    self.scan_archive(data, "zip", loc, depth, name)
 
     def scan_utf16(self, data, name, loc):
         """Scan UTF-16 decodings: BOM present, or a .strings file."""
@@ -370,16 +373,22 @@ class Scanner:
         out = decompress_bounded(data, kind)
         if not self._take_budget(len(out), loc):
             return
-        if looks_like_tar(out):
-            # Raw bytes too: tar readers can skip data a push still carries.
-            self.scan_bytes(out, loc + "#decompressed")
-            self._scan_tar(out, loc, depth)
-            return
         inner = landed_basename(name) or name
         for ext in (".gz", ".bz2", ".xz", ".tgz"):
             if inner.lower().endswith(ext):
                 inner = inner[: -len(ext)]
                 break
+        if looks_like_tar(out):
+            # Raw bytes too: tar readers can skip data a push still carries. gunzip
+            # writes the same bytes as a plain file, so its UTF-16 and tail-zip
+            # readings are scanned as well.
+            dloc = loc + "#decompressed"
+            self.scan_bytes(out, dloc)
+            self.scan_utf16(out, inner, dloc)
+            self._scan_tar(out, loc, depth)
+            if zip_at_tail(out):
+                self.scan_archive(out, "zip", dloc, depth + 1, inner)
+            return
         self.scan_blob(out, inner, loc + "#decompressed", depth + 1)
 
     def _member_ok(self, name, mloc):
@@ -790,13 +799,17 @@ def archive_kind(data):
         return "xz"
     if looks_like_tar(data):
         return "tar"
-    # A zip behind a prefix (self-extracting script, PNG polyglot): extractors
-    # find it through the end record at the tail.
-    if (
-        b"PK\x05\x06" in data[-65557:] or b"PK\x06\x07" in data[-65557:]
-    ) and zipfile.is_zipfile(io.BytesIO(data)):
+    if zip_at_tail(data):
         return "zip"
     return None
+
+
+def zip_at_tail(data):
+    """A zip behind a prefix (self-extracting script, PNG polyglot, or a tar
+    header): unzip finds it through the end record at the tail."""
+    return (
+        b"PK\x05\x06" in data[-65557:] or b"PK\x06\x07" in data[-65557:]
+    ) and zipfile.is_zipfile(io.BytesIO(data))
 
 
 def png_inflated_metadata(data):
