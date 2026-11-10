@@ -158,6 +158,39 @@ assert_contains "reports forbidden_file" "$OUT" "forbidden_file"
 assert_contains "location names the file" "$OUT" "private-config.json"
 assert_absent "no receipt" "$RECEIPT"
 
+start "forbidden names match regardless of case (the macOS volume is case-insensitive)"
+new_case; mkdir -p "$ART/Case.app/Contents/Resources"
+printf 'x\n' > "$ART/Case.app/Contents/Resources/.ENV"
+prepare --artifact "$ART/Case.app"
+run_audit; assert_eq "upper-case .ENV: exit 1" "$RC" 1; assert_contains "upper-case .ENV: forbidden_file" "$OUT" "forbidden_file"
+new_case
+python3 -I - "$ART/case.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("cfg/Private-Config.JSON", "{}")
+PY
+prepare --artifact "$ART/case.zip"
+run_audit; assert_eq "mixed-case zip member: exit 1" "$RC" 1; assert_contains "mixed-case zip member: forbidden_file" "$OUT" "forbidden_file"
+new_case; printf 'ok\n' > "$REPO/notes.txt"; commit_all "clean"; prepare
+run_audit; assert_eq "control: ordinary names stay clean" "$RC" 0
+
+start "a tar link named like a forbidden file is reported (links skipped the name check)"
+for kind in hard sym; do
+new_case
+python3 -I - "$ART/links.tar" "$kind" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w") as t:
+    data = b"API=abc\n"
+    i = tarfile.TarInfo("notes.txt"); i.size = len(data); t.addfile(i, io.BytesIO(data))
+    link = tarfile.TarInfo("cfg/.env")
+    link.type = tarfile.LNKTYPE if sys.argv[2] == "hard" else tarfile.SYMTYPE
+    link.linkname = "notes.txt" if sys.argv[2] == "hard" else "../notes.txt"
+    t.addfile(link)
+PY
+prepare --artifact "$ART/links.tar"
+run_audit; assert_eq "$kind link: exit 1" "$RC" 1; assert_contains "$kind link: forbidden_file" "$OUT" "forbidden_file"
+done
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare

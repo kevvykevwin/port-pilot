@@ -205,8 +205,17 @@ class CatFile:
             self.proc.kill()
 
 
-def forbidden_name(basename):
-    return any(fnmatch.fnmatch(basename, pat) for pat in FORBIDDEN_NAMES)
+def forbidden_name(name):
+    """True when a path or member name lands on disk as a forbidden file.
+
+    Extractors (unzip, bsdtar) treat "\\" as a path separator, and the default
+    macOS volume is case-insensitive, so the basename is taken after both
+    separators and trailing separators are stripped, and matching ignores case.
+    """
+    normal = name.replace("\\", "/").rstrip("/")
+    candidates = {os.path.basename(name), normal.rsplit("/", 1)[-1]}
+    return any(fnmatch.fnmatchcase(c.casefold(), pat.casefold())
+               for c in candidates if c for pat in FORBIDDEN_NAMES)
 
 
 # --------------------------------------------------------------------- findings
@@ -284,9 +293,7 @@ class Scanner:
 
     def scan_blob(self, data, name, loc, depth=0):
         """Scan one file's bytes: name policy, raw content, archive members."""
-        # unzip and bsdtar turn "\\" in a member name into a path separator;
-        # os.path.basename on POSIX does not.
-        if forbidden_name(os.path.basename(name)) or forbidden_name(name.replace("\\", "/").rsplit("/", 1)[-1]):
+        if forbidden_name(name):
             self.f.add("forbidden_file", loc)
         self.scan_bytes(data, loc)
         self.scan_utf16(data, name, loc)
@@ -426,6 +433,9 @@ class Scanner:
                 if not self._member_ok(member.name, mloc):
                     continue
                 if member.issym() or member.islnk():
+                    # The link is written under its own name; that name is policy-checked too.
+                    if forbidden_name(member.name):
+                        self.f.add("forbidden_file", mloc)
                     target = member.linkname.replace("\\", "/")
                     if target.startswith("/") or ".." in target.split("/"):
                         self.f.add("archive_traversal", mloc)
@@ -1173,7 +1183,7 @@ def scan_git_object(reader, sha, path, loc, scanner):
     if sha in scanner.published:
         # Already public: content is not re-audited, but name policy still applies.
         scanner.skipped_public.add(sha)
-        if path and forbidden_name(os.path.basename(path)):
+        if path and forbidden_name(path):
             scanner.f.add("forbidden_file", loc)
         return
     try:
@@ -1229,12 +1239,12 @@ def audit_ref(repo, ref, reader, scanned, scanner):
         return
     for raw in set(touched.split(b"\0")):
         path = raw.decode("utf-8", "replace").strip("\n")
-        if path and forbidden_name(os.path.basename(path)):
+        if path and forbidden_name(path):
             f.add("forbidden_file", f"{name}:history:{path}")
     for line in listing.splitlines():
         sha, _, path = line.partition(" ")
         loc = f"{name}@{sha[:10]}" + (f":{path}" if path else "")
-        if path and forbidden_name(os.path.basename(path)):
+        if path and forbidden_name(path):
             f.add("forbidden_file", loc)
         if sha in scanned:
             # Same object under another path: the object was audited, the path
