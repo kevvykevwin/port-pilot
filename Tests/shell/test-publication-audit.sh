@@ -225,6 +225,21 @@ ln -s notes.txt "$ART/Link.app/Contents/.env"
 prepare --artifact "$ART/Link.app"
 run_audit; assert_eq "symlink .env: exit 1" "$RC" 1; assert_contains "symlink .env: forbidden_file" "$OUT" "forbidden_file"
 
+start "tar members of an unknown type are scanned (bsdtar writes them as regular files)"
+new_case
+python3 -I - "$ART/typez.tar" "$SENT" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.USTAR_FORMAT) as t:
+    for name, data in (("cfg/.env", b"API=abc\n"),
+                       ("en.lproj/Localizable.strings", ('"k" = "' + sys.argv[2] + '";').encode("utf-16-le"))):
+        i = tarfile.TarInfo(name); i.size = len(data); i.type = b"Z"; t.addfile(i, io.BytesIO(data))
+PY
+prepare --artifact "$ART/typez.tar"
+run_audit
+assert_eq "type Z: exit 1" "$RC" 1
+assert_contains "type Z: forbidden_file" "$OUT" "forbidden_file"
+assert_contains "type Z: UTF-16 sentinel found" "$OUT" "sentinel"
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare

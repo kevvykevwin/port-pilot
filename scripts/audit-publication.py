@@ -439,16 +439,18 @@ class Scanner:
                 mloc = f"{loc}!{member.name}"
                 if not self._member_ok(member.name, mloc):
                     continue
+                # Every member lands under its own name (links, FIFOs and unknown types included).
+                if forbidden_name(member.name):
+                    self.f.add("forbidden_file", mloc)
                 if member.issym() or member.islnk():
-                    # The link is written under its own name; that name is policy-checked too.
-                    if forbidden_name(member.name):
-                        self.f.add("forbidden_file", mloc)
                     target = member.linkname.replace("\\", "/")
                     if target.startswith("/") or ".." in target.split("/"):
                         self.f.add("archive_traversal", mloc)
                     continue
-                if not member.isfile():
+                if member.isdir() or member.ischr() or member.isblk() or member.isfifo():
                     continue
+                # bsdtar writes unknown member types (e.g. "Z", "8", "9", "M") as regular
+                # files, so anything not known to be content-free is scanned as a file.
                 if member.size > MAX_FILE_BYTES:
                     self.f.add("too_large", mloc)
                     continue
