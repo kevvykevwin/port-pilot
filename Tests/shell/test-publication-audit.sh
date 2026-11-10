@@ -84,6 +84,13 @@ expect_fail() { # label, finding code
     assert_absent "$1: no receipt written" "$RECEIPT"
 }
 
+commit_all() { git -C "$REPO" add -A && git -C "$REPO" commit -q -m "$1"; }
+ctl_zip() { # label, file: audit a standard-tool zip as the only artifact
+    rm -f "$RECEIPT"; make_manifest --artifact "$2"; make_review; run_audit
+    assert_eq "$1: exit 0 (no false positive)" "$RC" 0
+    assert_not_contains "$1: no archive_unreadable" "$OUT" "archive_unreadable"
+}
+
 start "clean candidate passes and writes a 0600 receipt (false-positive on clean tree)"
 new_case; prepare
 run_audit
@@ -339,13 +346,15 @@ prepare --artifact "$ART/server.pem.gz"
 run_audit; assert_eq "tar inside server.pem.gz: exit 1" "$RC" 1; assert_contains "tar inside server.pem.gz: forbidden_file" "$OUT" "forbidden_file"
 
 start "names are checked as the macOS decompressors write them (.z, -z, _z, -gz, .Z, .bz)"
-for art in "credential-abc.json.z gz" "actors.json-gz gz" "export-1.json_z gz" "private-config.json-z gz" "e.pem.Z gz" "credential-abc.json.bz bz2"; do
+# Apple gunzip picks the suffix by name and decodes gzip, bzip2 and xz bodies alike.
+for art in "credential-abc.json.z gz" "actors.json-gz gz" "export-1.json_z gz" "private-config.json-z gz" "e.pem.Z gz" \
+           "credential-abc.json.bz bz2" "e.pem.lz gz" "credential-abc.json.bz2 gz" "e.pem.gz bz2" "actors.json.z xz" "export-1.json.bz2 xz"; do
 set -- $art
 new_case
 python3 -I - "$ART/$1" "$2" <<'PY'
-import bz2, gzip, sys
+import bz2, gzip, lzma, sys
 body = b"{}\n"
-open(sys.argv[1], "wb").write(gzip.compress(body) if sys.argv[2] == "gz" else bz2.compress(body))
+open(sys.argv[1], "wb").write({"gz": gzip.compress, "bz2": bz2.compress, "xz": lzma.compress}[sys.argv[2]](body))
 PY
 prepare --artifact "$ART/$1"
 run_audit; assert_eq "$1: exit 1" "$RC" 1; assert_contains "$1: forbidden_file" "$OUT" "forbidden_file"
@@ -595,7 +604,6 @@ assert_not_contains "other name not printed" "$OUT" "$N_OTHER"
 # pub_case: REPO's initial commit is made "public" by an origin/main ref; the
 # base file and a forbidden-name file are added before that ref is cut.
 mk_pub_ref() { git -C "$REPO" update-ref refs/remotes/origin/main HEAD; PUBSHA=$(git -C "$REPO" rev-parse HEAD); }
-commit_all() { git -C "$REPO" add -A && git -C "$REPO" commit -q -m "$1"; }
 
 start "secret only in a blob reachable from the published base passes, with a NOTE"
 # Bug caught: published history re-scanned, blocking a release over already-public content.
@@ -1134,8 +1142,10 @@ elif kind in ("upath_local", "upath_cd", "upath_ok", "upath_badcrc", "upath_badv
     tgt = b"notes.txt" if kind in ("upath_ok", "upath_badcrc", "upath_badver") else b".env"  # badcrc/badver: right name, only the CRC/version is wrong
     ex = upath(n, tgt, version=2 if kind == "upath_badver" else 1, crc_of=b"other" if kind == "upath_badcrc" else None)
     plain = kind == "upath_cd"
-    A = local(n, 8, 0, crc(hid), len(hd), len(hid), hd, b"" if plain else ex)
-    data = finish(A, [cdent(n, 8, 0, crc(hid), len(hd), len(hid), 0, ex if kind in ("upath_cd", "upath_ok") else b"")])
+    # The positive control carries a clean body, so only the extra is under test.
+    body, packed = (clean, ad) if kind == "upath_ok" else (hid, hd)
+    A = local(n, 8, 0, crc(body), len(packed), len(body), packed, b"" if plain else ex)
+    data = finish(A, [cdent(n, 8, 0, crc(body), len(packed), len(body), 0, ex if kind in ("upath_cd", "upath_ok") else b"")])
 elif kind == "method_mismatch":
     A = local(b"s.txt", 8, 0, crc(hid), len(hd), len(hid), hd)
     data = finish(A, [cdent(b"s.txt", 0, 0, crc(hd), len(hd), len(hd), 0)])
@@ -1233,8 +1243,9 @@ elif kind == "z64_loc_in_comment":
 elif kind == "dir_data_zero":
     # Bug caught: a deflated directory entry whose stream inflates to bytes while
     # the directory claims file_size 0 (the walk, not the size check, must catch it).
-    D = local(b"d/", 8, 0, crc(hid), len(hd), 0, hd)
-    data = finish(D, [cdent(b"d/", 8, 0, crc(hid), len(hd), 0, 0)])
+    # CRC 0 (correct for an empty body), so zipfile's CRC check cannot catch it first.
+    D = local(b"d/", 8, 0, 0, len(hd), 0, hd)
+    data = finish(D, [cdent(b"d/", 8, 0, 0, len(hd), 0, 0)])
 elif kind == "dir_deflated_empty":
     # Positive control: ZipFile.writestr("d/", b"") with ZIP_DEFLATED stores a
     # 2-byte empty deflate stream with file_size 0.
@@ -1332,11 +1343,6 @@ new_case; python3 -I "$ROOT/mkzip.py" png_clean "$ART/ok.png" "$SENT"; prepare -
 run_audit
 assert_eq "clean png: exit 0" "$RC" 0
 
-ctl_zip() { # label, file: audit a standard-tool zip as the only artifact
-    rm -f "$RECEIPT"; make_manifest --artifact "$2"; make_review; run_audit
-    assert_eq "$1: exit 0 (no false positive)" "$RC" 0
-    assert_not_contains "$1: no archive_unreadable" "$OUT" "archive_unreadable"
-}
 start "positive controls: zip -r -, -0, -fd, -z comment, ditto (+ --sequesterRsrc), zip64 streaming writer"
 new_case; mkdir -p "$CASE/zs/Fake.app/Contents"
 for i in 1 2 3; do python3 -I -c 'import sys;print(("line %s\n" % sys.argv[1]) * 60, end="")' "$i" > "$CASE/zs/Fake.app/Contents/f$i.txt"; done

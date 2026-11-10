@@ -222,20 +222,25 @@ def looks_like_tar(data):
     return True
 
 
-# Suffixes the macOS decompressors strip, with what replaces them. gunzip also
-# takes .z, -z, _z, -gz and .Z for a gzip body; bunzip2 also takes .bz; the
-# tar shorthands (.tgz and friends) become .tar. Compared case-insensitively.
-_DECOMPRESS_SUFFIXES = {
-    "gz": ((".tgz", ".tar"), (".taz", ".tar"), (".gz", ""), ("-gz", ""), (".z", ""), ("-z", ""), ("_z", "")),
-    "bz2": ((".tbz2", ".tar"), (".tbz", ".tar"), (".bz2", ""), (".bz", "")),
-    "xz": ((".txz", ".tar"), (".xz", ""), (".lzma", "")),
-}
+# Suffixes the macOS decompressors strip, with what replaces them. Apple gunzip
+# chooses by file name alone and decodes gzip, bzip2 and xz bodies alike, so
+# every tool's list applies whatever the body is. Compared case-insensitively;
+# tar shorthands come first so they win over the plain suffix they end in.
+_DECOMPRESS_SUFFIXES = (
+    (".tgz", ".tar"), (".taz", ".tar"), (".tbz2", ".tar"), (".tbz", ".tar"), (".txz", ".tar"),
+    (".gz", ""), ("-gz", ""), (".z", ""), ("-z", ""), ("_z", ""), (".lz", ""),
+    (".bz2", ""), (".bz", ""), (".xz", ""), (".lzma", ""),
+)
 
 
-def decompressed_name(name, kind):
-    """The file name gunzip, bunzip2 or xz writes for a compressed `name`."""
+def decompressed_name(name):
+    """The file name gunzip, bunzip2 or xz writes for a compressed `name`.
+
+    The table lists tar shorthands before the plain suffixes they end in, so
+    the first match is the one the tools use.
+    """
     lower = name.lower()
-    for ext, replacement in _DECOMPRESS_SUFFIXES.get(kind, ()):
+    for ext, replacement in _DECOMPRESS_SUFFIXES:
         if lower.endswith(ext):
             return name[: -len(ext)] + replacement
     return name
@@ -392,12 +397,14 @@ class Scanner:
         out = decompress_bounded(data, kind)
         if not self._take_budget(len(out), loc):
             return
-        inner = decompressed_name(landed_basename(name) or name, kind)
+        # Apple gunzip strips by name whatever the body is, so the suffix table
+        # does not depend on `kind`.
+        inner = decompressed_name(landed_basename(name) or name)
+        dloc = loc + "#decompressed"
         if looks_like_tar(out):
             # Raw bytes too: tar readers can skip data a push still carries. gunzip
             # writes the same bytes as a plain file, so its UTF-16 and tail-zip
             # readings are scanned as well.
-            dloc = loc + "#decompressed"
             self.scan_bytes(out, dloc)
             self.scan_utf16(out, inner, dloc)
             if forbidden_name(inner):
@@ -406,7 +413,7 @@ class Scanner:
             if zip_at_tail(out):
                 self.scan_archive(out, "zip", dloc, depth + 1, inner)
             return
-        self.scan_blob(out, inner, loc + "#decompressed", depth + 1)
+        self.scan_blob(out, inner, dloc, depth + 1)
 
     def _member_ok(self, name, mloc):
         # Defense in depth: member names are also present in the raw archive
