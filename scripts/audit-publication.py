@@ -205,6 +205,23 @@ class CatFile:
             self.proc.kill()
 
 
+def looks_like_tar(data):
+    """True when the first block parses as a tar header (ustar, gnu, pax or v7).
+
+    The "ustar" magic alone misses v7 archives, which bsdtar still extracts. An
+    all-zero block raises EOFHeaderError, so empty data is not taken for tar.
+    """
+    if len(data) < 512:
+        return False
+    if data[257:262] == b"ustar":
+        return True
+    try:
+        tarfile.TarInfo.frombuf(data[:512], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return False
+    return True
+
+
 def landed_basename(name):
     """The file name an extractor actually writes for a path or member name.
 
@@ -353,7 +370,7 @@ class Scanner:
         out = decompress_bounded(data, kind)
         if not self._take_budget(len(out), loc):
             return
-        if out[257:262] == b"ustar":
+        if looks_like_tar(out):
             # Raw bytes too: tar readers can skip data a push still carries.
             self.scan_bytes(out, loc + "#decompressed")
             self._scan_tar(out, loc, depth)
@@ -771,7 +788,7 @@ def archive_kind(data):
         return "bz2"
     if data[:6] == b"\xfd7zXZ\x00":
         return "xz"
-    if data[257:262] == b"ustar":
+    if looks_like_tar(data):
         return "tar"
     # A zip behind a prefix (self-extracting script, PNG polyglot): extractors
     # find it through the end record at the tail.

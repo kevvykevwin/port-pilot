@@ -336,10 +336,45 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         try await r.reconcileStops()
         let settled = await r.snapshot()[0]
         XCTAssertNil(settled.fence)
-        XCTAssertNotEqual(settled.transition?.phase, "preparing")
+        // The forked fixture tree is not kernel-verified, so the stop settles as needs_review.
+        XCTAssertEqual(settled.lifecycle, "needs_review")
+        XCTAssertEqual(settled.transition?.phase, "needs_review")
+        // What the interrupted move task does next: it cannot record or abandon, so it finishes for review.
+        do { try await r.recordReplacement(serviceId: s.id, operationId: moveId, targets: [Procs.extra]); XCTFail("record after settle") }
+        catch { XCTAssertNotNil(error as? ManagedError) }
+        try await r.finishReroute(serviceId: s.id, operationId: moveId, outcome: "preparation_failed_replacement_exit_unverified")
+        let finished = await r.snapshot()[0]
+        XCTAssertEqual(finished.lifecycle, "needs_review")
+        do { _ = try await r.restartLaunch(rerun(finished), serviceId: s.id, fingerprint: "private", backend: 30010); XCTFail("replacement alive") }
+        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
         procs.exit(Procs.extra)
         let quiesced = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: s.id))
         XCTAssertNil(quiesced.error, "quiesce must not be blocked forever by a move the stop interrupted")
+        guard case .object(let values) = quiesced.data, case .string(let checkpoint)? = values["checkpoint"] else { return XCTFail("checkpoint") }
+        let resumed = await r.handle(request("lifecycle.resume", actor: "user", revision: nil, service: s.id, payload: ["checkpoint": .string(checkpoint)]))
+        XCTAssertNil(resumed.error)
+        let current = await r.snapshot()[0]
+        let restarted = try await r.restartLaunch(rerun(current), serviceId: s.id, fingerprint: "private", backend: 30010)
+        XCTAssertEqual(restarted.lifecycle, "starting", "a stopped service whose move was interrupted must run again")
+        XCTAssertNil(restarted.transition)
+    }
+    /// Bug caught: a cleanly stopped service that kept a move the stop interrupted (transition "needs_review")
+    /// was refused by restart forever, because a stopped service required no transition at all.
+    func testStoppedServiceWithInterruptedMoveRestartsOnceMoveTargetsExit() async throws {
+        let procs = Procs(); procs.start(Procs.extra)
+        var s = service(); s.lifecycle = "stopped"; s.backendPort = 30001; s.stablePort = 20001
+        s.transition = ManagedRouteTransition(operationId: UUID(), oldBackend: 30001, newBackend: 30003, oldGeneration: 1,
+                                              oldTargets: s.incarnations, newTargets: [Procs.extra], phase: "needs_review")
+        let r = ManagedRegistry(persistence: try seed(s, root: directory()), actors: actors, identity: { procs.lookup($0) }, isGone: { procs.isGone($0) })
+        procs.exit(Procs.root)
+        let loaded = await r.snapshot()[0]
+        XCTAssertEqual(loaded.lifecycle, "stopped")
+        do { _ = try await r.restartLaunch(rerun(loaded), serviceId: s.id, fingerprint: "private", backend: 30010); XCTFail("replacement alive") }
+        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+        procs.exit(Procs.extra)
+        let restarted = try await r.restartLaunch(rerun(loaded), serviceId: s.id, fingerprint: "private", backend: 30010)
+        XCTAssertEqual(restarted.lifecycle, "starting")
+        XCTAssertNil(restarted.transition)
     }
     func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
         let (r, s, procs) = try await tree(root: directory())

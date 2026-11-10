@@ -227,18 +227,51 @@ run_audit; assert_eq "symlink .env: exit 1" "$RC" 1; assert_contains "symlink .e
 
 start "tar members of an unknown type are scanned (bsdtar writes them as regular files)"
 new_case
-python3 -I - "$ART/typez.tar" "$SENT" <<'PY'
+for type in Z M V; do
+new_case
+python3 -I - "$ART/typez.tar" "$SENT" "$type" <<'PY'
 import io, sys, tarfile
 with tarfile.open(sys.argv[1], "w", format=tarfile.USTAR_FORMAT) as t:
     for name, data in (("cfg/.env", b"API=abc\n"),
                        ("en.lproj/Localizable.strings", ('"k" = "' + sys.argv[2] + '";').encode("utf-16-le"))):
-        i = tarfile.TarInfo(name); i.size = len(data); i.type = b"Z"; t.addfile(i, io.BytesIO(data))
+        i = tarfile.TarInfo(name); i.size = len(data); i.type = sys.argv[3].encode(); t.addfile(i, io.BytesIO(data))
 PY
 prepare --artifact "$ART/typez.tar"
 run_audit
-assert_eq "type Z: exit 1" "$RC" 1
-assert_contains "type Z: forbidden_file" "$OUT" "forbidden_file"
-assert_contains "type Z: UTF-16 sentinel found" "$OUT" "sentinel"
+assert_eq "type $type: exit 1" "$RC" 1
+assert_contains "type $type: forbidden_file" "$OUT" "forbidden_file"
+assert_contains "type $type: UTF-16 sentinel found" "$OUT" "sentinel"
+done
+
+start "a v7-format tar (no ustar magic) is opened (bsdtar extracts it)"
+new_case
+python3 -I - "$ART/v7.tar" "$SENT" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.USTAR_FORMAT) as t:
+    for name, data in (("readme.txt", b"hello\n"), ("cfg/.env", b"API=abc\n"),
+                       ("en.lproj/Localizable.strings", ('"k" = "' + sys.argv[2] + '";').encode("utf-16-le"))):
+        i = tarfile.TarInfo(name); i.size = len(data); t.addfile(i, io.BytesIO(data))
+raw = bytearray(open(sys.argv[1], "rb").read())
+# Rewrite every header as v7: clear magic/version/uname/gname/prefix, fix the checksum.
+off = 0
+while off + 512 <= len(raw) and any(raw[off:off + 512]):
+    h = raw[off:off + 512]
+    size = int(bytes(h[124:136]).strip(b"\0 ") or b"0", 8)
+    h[257:500] = bytes(243)
+    h[148:156] = b"        "
+    h[148:156] = ("%06o\0 " % sum(h)).encode()
+    raw[off:off + 512] = h
+    off += 512 + (size + 511) // 512 * 512
+open(sys.argv[1], "wb").write(bytes(raw))
+assert b"ustar" not in bytes(raw[:512])
+PY
+prepare --artifact "$ART/v7.tar"
+run_audit
+assert_eq "v7 tar: exit 1" "$RC" 1
+assert_contains "v7 tar: forbidden_file" "$OUT" "forbidden_file"
+assert_contains "v7 tar: UTF-16 sentinel found" "$OUT" "sentinel"
+new_case; printf 'just some text, not an archive at all\n' > "$ART/notes.txt"; prepare --artifact "$ART/notes.txt"
+run_audit; assert_eq "control: plain text is not taken for tar" "$RC" 0
 
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
