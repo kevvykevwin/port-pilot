@@ -327,8 +327,8 @@ class Scanner:
                 self.f.add("archive_depth", loc)
             else:
                 self.scan_archive(data, kind, loc, depth, name)
-                # A tar header does not stop unzip from finding a zip at the tail.
-                if kind == "tar" and zip_at_tail(data):
+                # A tar header or compressed stream does not stop unzip from finding a zip at the tail.
+                if kind != "zip" and zip_at_tail(data):
                     self.scan_archive(data, "zip", loc, depth, name)
 
     def scan_utf16(self, data, name, loc):
@@ -385,6 +385,8 @@ class Scanner:
             dloc = loc + "#decompressed"
             self.scan_bytes(out, dloc)
             self.scan_utf16(out, inner, dloc)
+            if forbidden_name(inner):
+                self.f.add("forbidden_file", dloc)
             self._scan_tar(out, loc, depth)
             if zip_at_tail(out):
                 self.scan_archive(out, "zip", dloc, depth + 1, inner)
