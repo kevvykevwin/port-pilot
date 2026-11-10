@@ -222,6 +222,25 @@ def looks_like_tar(data):
     return True
 
 
+# Suffixes the macOS decompressors strip, with what replaces them. gunzip also
+# takes .z, -z, _z, -gz and .Z for a gzip body; bunzip2 also takes .bz; the
+# tar shorthands (.tgz and friends) become .tar. Compared case-insensitively.
+_DECOMPRESS_SUFFIXES = {
+    "gz": ((".tgz", ".tar"), (".taz", ".tar"), (".gz", ""), ("-gz", ""), (".z", ""), ("-z", ""), ("_z", "")),
+    "bz2": ((".tbz2", ".tar"), (".tbz", ".tar"), (".bz2", ""), (".bz", "")),
+    "xz": ((".txz", ".tar"), (".xz", ""), (".lzma", "")),
+}
+
+
+def decompressed_name(name, kind):
+    """The file name gunzip, bunzip2 or xz writes for a compressed `name`."""
+    lower = name.lower()
+    for ext, replacement in _DECOMPRESS_SUFFIXES.get(kind, ()):
+        if lower.endswith(ext):
+            return name[: -len(ext)] + replacement
+    return name
+
+
 def landed_basename(name):
     """The file name an extractor actually writes for a path or member name.
 
@@ -373,11 +392,7 @@ class Scanner:
         out = decompress_bounded(data, kind)
         if not self._take_budget(len(out), loc):
             return
-        inner = landed_basename(name) or name
-        for ext in (".gz", ".bz2", ".xz", ".tgz"):
-            if inner.lower().endswith(ext):
-                inner = inner[: -len(ext)]
-                break
+        inner = decompressed_name(landed_basename(name) or name, kind)
         if looks_like_tar(out):
             # Raw bytes too: tar readers can skip data a push still carries. gunzip
             # writes the same bytes as a plain file, so its UTF-16 and tail-zip
