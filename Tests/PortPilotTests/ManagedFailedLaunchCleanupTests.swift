@@ -224,4 +224,23 @@ final class ManagedFailedLaunchCleanupTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(ManagedProcess.exitVerified(target), "old backend pid \(target.pid) must receive the stop signal")
         }
     }
+
+    /// Bug caught: a launch whose spawn failed (missing working directory) recorded no process and left the
+    /// service in needs_review with an empty record, so it could never be run again.
+    func testSpawnFailureLeavesServiceRunnableAgain() async throws {
+        let rig = try rig(timeout: 3)
+        try FileManager.default.createDirectory(at: rig.root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        let script = try write("print('never runs')", in: rig.root)
+        let missing = rig.root.appendingPathComponent("missing-dir").path
+        let launch = ManagedLaunch(service: "spawn-fails", executable: "/usr/bin/python3", arguments: [script.path, "{port}"], cwd: missing, configurationFiles: [script.path])
+        let accepted = await rig.supervisor.handle(rig.request("service.run", revision: 0, payload: ["launch": try .value(launch)]))
+        XCTAssertEqual(accepted.status, "accepted")
+        try await waitUntil { await rig.registry.snapshot().first?.lifecycle != "starting" }
+        let failedFirst = await rig.registry.snapshot().first
+        let failed = try XCTUnwrap(failedFirst)
+        XCTAssertEqual(failed.lifecycle, "needs_review")
+        XCTAssertTrue(failed.incarnations.isEmpty)
+        let again = await rig.supervisor.handle(rig.request("service.run", revision: failed.revision, payload: ["launch": try .value(launch)]))
+        XCTAssertNil(again.error, "a launch that never started a process must be runnable again")
+    }
 }

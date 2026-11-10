@@ -160,6 +160,9 @@ public actor ManagedSupervisor {
     private let recipes: ManagedRecipes?
     private var nextTailnetCheck: TimeInterval = 0
     private var replacements: [UUID: ManagedTrackedChild] = [:]
+    /// Children this helper spawned that no longer belong to a service or move. An exited child stays a
+    /// zombie (no identity, no ESRCH) until reaped, so it could never be proven exited; reconcile reaps them.
+    private var retiredChildren: [ManagedTrackedChild] = []
     private var scheduledReroutes: Set<UUID> = []
     /// Services whose start() or reroute task is running; those tasks own the relay, so the orphan sweep skips them.
     private var activeOperations: Set<UUID> = [] { didSet { operationEpoch &+= 1 } }
@@ -294,8 +297,13 @@ public actor ManagedSupervisor {
             // Recovering a recipe does not prove complete process ancestry.
         }
     }
+    private func retire(_ child: ManagedTrackedChild?) {
+        guard let child, !child.isReaped else { return }
+        retiredChildren.append(child)
+    }
     public func reconcile() async {
-        for child in processes.values { _ = child.treeVerified() }
+        for child in Array(processes.values) + Array(replacements.values) + retiredChildren { _ = child.treeVerified() }
+        retiredChildren.removeAll { $0.isReaped }
         let services = await registry.snapshot()
         let pids = LibProc.listAllPids()
         for service in services where ["running", "release_pending"].contains(service.lifecycle) && service.fence == nil {
@@ -319,10 +327,20 @@ public actor ManagedSupervisor {
     /// True when a live recorded incarnation of the service is LISTENing on its backend port at 127.0.0.1.
     private static func ownsBackend(_ service: ManagedService, entries: [PortEntry]) -> Bool {
         guard let backend = service.backendPort else { return false }
-        return entries.contains { entry in
-            entry.port == backend && entry.state == .listen && entry.localAddress == "127.0.0.1" &&
-            service.incarnations.contains { $0.pid == entry.pid && $0.startTime == entry.processStartTime && ManagedProcess.incarnation(pid: $0.pid) == $0 }
+        return owns(port: backend, targets: service.incarnations, entries: entries)
+    }
+    /// True when one of `targets`, still the same live process, is LISTENing on `port` at 127.0.0.1.
+    private static func owns(port: UInt16, targets: [ManagedIncarnation], entries: [PortEntry]) -> Bool {
+        entries.contains { entry in
+            entry.port == port && entry.state == .listen && entry.localAddress == "127.0.0.1" &&
+            targets.contains { $0.pid == entry.pid && $0.startTime == entry.processStartTime && ManagedProcess.incarnation(pid: $0.pid) == $0 }
         }
+    }
+    /// Scans only `targets`; a failed scan is never ownership.
+    private static func owns(port: UInt16, targets: [ManagedIncarnation]) async -> Bool {
+        let pids = targets.map(\.pid)
+        guard case .success(let entries, _) = await PortScanner(pidProvider: { pids }).scan() else { return false }
+        return owns(port: port, targets: targets, entries: entries)
     }
     /// A relay must never forward to a port nobody owns: once the listener is gone, an unrelated process
     /// could bind it and the stable URL (and any Tailscale Serve route on it) would serve that process.
@@ -408,12 +426,7 @@ public actor ManagedSupervisor {
                 targets += ManagedAncestry.discover(known: targets)
                 replacementTargets = targets
                 try await registry.recordReplacement(serviceId: service.id, operationId: operationId, targets: targets)
-                let pids = targets.map(\.pid)
-                let scan = await PortScanner(pidProvider: { pids }).scan()
-                var owned = false
-                if case .success(let entries, _) = scan {
-                    owned = entries.contains { entry in entry.port == port && entry.state == .listen && entry.localAddress == "127.0.0.1" && targets.contains { $0.pid == entry.pid && $0.startTime == entry.processStartTime } }
-                }
+                let owned = await Self.owns(port: port, targets: targets)
                 let ready = owned ? await healthy(launch, port: port, session: session) : false
                 if ready { successes += 1 } else { successes = 0 }
                 if successes == 3 { break }
@@ -427,15 +440,19 @@ public actor ManagedSupervisor {
             }
             switched = true
             let observationDeadline = ProcessInfo.processInfo.systemUptime + observationWindow
+            // The orphan sweep skips a running move, so this task alone keeps proving the relay's target.
+            // A replacement that dies, or stops owning its port (which an unrelated process could then
+            // bind), rolls back instead of receiving traffic.
             while ProcessInfo.processInfo.systemUptime < observationDeadline {
                 guard targets.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }),
+                      await Self.owns(port: port, targets: targets),
                       await healthy(launch, port: stable, session: session) else { throw ManagedError.readinessFailed }
                 try await Task.sleep(for: .seconds(1))
             }
             let drainDeadline = ProcessInfo.processInfo.systemUptime + 60
             while forwarder.connectionCount(generation: service.routeGeneration) > 0 && ProcessInfo.processInfo.systemUptime < drainDeadline {
-                // A replacement that dies during the drain must roll back, not keep receiving traffic.
-                guard targets.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }) else { throw ManagedError.readinessFailed }
+                guard targets.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }),
+                      await Self.owns(port: port, targets: targets) else { throw ManagedError.readinessFailed }
                 try await Task.sleep(for: .seconds(1))
             }
             if forwarder.connectionCount(generation: service.routeGeneration) == 0,
@@ -450,7 +467,7 @@ public actor ManagedSupervisor {
                     }
                     guard oldChild.treeVerified(), ManagedProcess.exitVerified(oldChild.identity) else { throw ManagedError.needsDecision }
                     treeEvidence.record(process, service: service.id)
-                    processes[service.id] = process
+                    retire(processes.updateValue(process, forKey: service.id))
                     try await registry.completeReroute(serviceId: service.id, operationId: operationId,
                                                        oldTreeVerified: oldChild.treeVerified(), newTreeVerified: process.treeVerified())
                     replacements.removeValue(forKey: operationId)
@@ -474,13 +491,16 @@ public actor ManagedSupervisor {
             } else {
                 replacements[operationId]?.discardUnstarted()
             }
-            // Drop the child (and its kqueue fd) once it has been terminated or discarded.
-            replacements.removeValue(forKey: operationId)
+            // Keep reaping the child until it has exited; dropping it unreaped would leave a zombie.
+            retire(replacements.removeValue(forKey: operationId))
+            // After the switch the relay points at a backend that just failed; close it until proven otherwise.
+            if switched { forwarder.setBackendVerified(false) }
             if switched, let old = service.backendPort, await healthy(launch, port: old, session: session) {
                 do {
                     try await registry.rollbackReroute(serviceId: service.id, operationId: operationId) { port, generation in
                         forwarder.switchBackend(to: port, generation: generation)
                     }
+                    forwarder.setBackendVerified(await Self.owns(port: old, targets: service.incarnations))
                 } catch {
                     try? await registry.finishReroute(serviceId: service.id, operationId: operationId, outcome: "no_healthy_backend")
                 }
@@ -513,7 +533,7 @@ public actor ManagedSupervisor {
             guard let backend = service.backendPort, let stable = service.stablePort else { throw ManagedError.invalidInput }
             guard try launch.fingerprint(key: key, secret: secret) == service.launchFingerprint else { throw ManagedError.incompatibleLaunch }
             let process = try ManagedTrackedChild(launch: launch, port: backend, environment: launch.resolvedEnvironment(port: backend, secret: secret))
-            processes[service.id] = process
+            retire(processes.updateValue(process, forKey: service.id))
             let identity = process.identity
             try await registry.recordChild(serviceId: service.id, incarnation: identity)
             treeEvidence.record(process, service: service.id)

@@ -293,9 +293,10 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
     /// Bug caught: a helper restart during a stop, launch or move kept the dead task's fence, so the service sat
     /// in needs_review forever and restart, quiesce, upgrade and uninstall were all blocked.
     func testHelperRestartReleasesDeadTasksFenceButRestartStillWaitsForEveryProcess() async throws {
-        for interrupted in ["stop", "move"] {
+        for interrupted in ["stop", "run", "move"] {
             let procs = Procs(); procs.start(Procs.root)
-            var fenced = service(); let operation = UUID(); fenced.fence = operation; fenced.lifecycle = "stopping"
+            var fenced = service(); let operation = UUID(); fenced.fence = operation
+            fenced.lifecycle = interrupted == "run" ? "starting" : "stopping"
             fenced.backendPort = 30001; fenced.stablePort = 20001
             if interrupted == "move" {
                 procs.start(Procs.extra)
@@ -305,9 +306,10 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
             }
             let disk = try ManagedPersistence(root: try directory())
             var state = ManagedState(); state.services = [fenced]
-            state.operations = [ManagedOperation(id: operation, serviceId: fenced.id, action: interrupted == "move" ? "reroute" : "stop",
+            let (action, phase) = ["stop": ("stop", "signal_sent"), "run": ("run", "starting"), "move": ("reroute", "observing")][interrupted]!
+            state.operations = [ManagedOperation(id: operation, serviceId: fenced.id, action: action,
                                                  revision: fenced.revision, targets: fenced.incarnations, generation: 1, actor: "user",
-                                                 phase: interrupted == "move" ? "observing" : "signal_sent", expires: Date())]
+                                                 phase: phase, expires: Date())]
             try disk.commit(state)
             let r = ManagedRegistry(persistence: disk, actors: actors, identity: { procs.lookup($0) }, isGone: { procs.isGone($0) })
             let loaded = await r.snapshot()[0]
@@ -342,14 +344,43 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(restarted.lifecycle, "starting", interrupted)
         }
     }
-    func testRestartFromNeedsReviewRejectedWhenNothingWasRecorded() async throws {
-        // Nothing recorded: vacuous "all exited" must not count as proof.
+    /// Bug caught: a launch whose spawn failed (or whose helper died before recording a child) recorded nothing,
+    /// and an empty record was treated as "not proven exited", so the service could never run again.
+    func testLaunchThatRecordedNothingCanBeRunAgain() async throws {
         var empty = service(); empty.incarnations = []
         let emptyRegistry = ManagedRegistry(persistence: try seed(empty, root: directory()), actors: actors, identity: { _ in nil }, isGone: { _ in true })
         let seeded = await emptyRegistry.snapshot()[0]
         XCTAssertEqual(seeded.lifecycle, "needs_review"); XCTAssertTrue(seeded.incarnations.isEmpty)
-        do { _ = try await emptyRegistry.restartLaunch(rerun(seeded), serviceId: seeded.id, fingerprint: "private", backend: 30002); XCTFail("empty") }
-        catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+        let restarted = try await emptyRegistry.restartLaunch(rerun(seeded), serviceId: seeded.id, fingerprint: "private", backend: 30002)
+        XCTAssertEqual(restarted.lifecycle, "starting")
+    }
+    /// Bug caught: after a failed move the record holds a dead replacement root; stop refused with
+    /// identityUnavailable, so the live old backend could no longer be stopped. Uncertain targets still block.
+    func testStopSkipsProvenExitedRootButNotAnUnreadableOne() async throws {
+        for dead in ["exited", "unreadable"] {
+            let procs = Procs(); procs.start(Procs.root); procs.start(Procs.extra)
+            var moved = service(); moved.incarnations = [Procs.root, Procs.extra]; moved.backendPort = 30001; moved.stablePort = 20001
+            moved.transition = ManagedRouteTransition(operationId: UUID(), oldBackend: 30001, newBackend: 30003, oldGeneration: 1,
+                                                      oldTargets: [Procs.root], newTargets: [Procs.extra], phase: "needs_review")
+            let r = ManagedRegistry(persistence: try seed(moved, root: directory()), actors: actors, identity: { procs.lookup($0) },
+                                    sendSignal: { identity, _ in procs.signal(identity) }, isGone: { procs.isGone($0) })
+            if dead == "exited" { procs.exit(Procs.extra) } else { procs.hide(Procs.extra) }
+            let s = await r.snapshot()[0]
+            let payload = try await approvedStop(r, s)
+            let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: payload))
+            if dead == "exited" {
+                XCTAssertNil(executed.error)
+                XCTAssertEqual(procs.signaled, [Procs.root.pid], "only the live old backend is signalled")
+                procs.exit(Procs.root)
+                try await r.reconcileStops()
+                let after = await r.snapshot()[0]
+                XCTAssertNil(after.fence)
+                XCTAssertNotEqual(after.lifecycle, "stopping")
+            } else {
+                XCTAssertEqual(executed.error, .identityUnavailable)
+                XCTAssertTrue(procs.signaled.isEmpty)
+            }
+        }
     }
     func testRerouteRefusedWhileRecordedDescendantIsDead() async throws {
         let (r, s, procs) = try await tree(root: directory())

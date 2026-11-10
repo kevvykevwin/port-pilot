@@ -36,7 +36,13 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         var pid: Int32 = 0
         let result = posix_spawn(&pid, launch.executable, &actions, &attributes, &argv, &env)
         guard result == 0 else { throw ManagedError.dependencyUnavailable }
-        guard let identity = ManagedProcess.incarnation(pid: pid) else { throw ManagedError.identityUnavailable }
+        guard let identity = ManagedProcess.incarnation(pid: pid) else {
+            // Our own unreaped child: its PID cannot be reused until waitpid, so killing by PID is safe.
+            kill(pid, SIGKILL)
+            var status: Int32 = 0
+            _ = waitpid(pid, &status, 0)
+            throw ManagedError.identityUnavailable
+        }
         self.identity = identity
         let fd = kqueue()
         guard fd >= 0 else {
@@ -93,6 +99,8 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         let result = waitpid(identity.pid, &status, WNOHANG)
         if result == identity.pid || (result < 0 && errno == ECHILD) { reaped = true }
     }
+    /// True once the kernel has reaped this child, so its PID reports ESRCH and exit can be proven.
+    public var isReaped: Bool { lock.withLock { reaped } }
     public func discardUnstarted() {
         lock.withLock {
             guard !resumed else { return }
