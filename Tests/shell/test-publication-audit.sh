@@ -191,6 +191,40 @@ prepare --artifact "$ART/links.tar"
 run_audit; assert_eq "$kind link: exit 1" "$RC" 1; assert_contains "$kind link: forbidden_file" "$OUT" "forbidden_file"
 done
 
+start "a trailing \".\" component does not hide a forbidden name or a .strings file (bsdtar drops it)"
+new_case
+python3 -I - "$ART/dot.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("cfg/.env/.", "API=abc\n")
+PY
+prepare --artifact "$ART/dot.zip"
+run_audit; assert_eq "zip cfg/.env/.: exit 1" "$RC" 1; assert_contains "zip cfg/.env/.: forbidden_file" "$OUT" "forbidden_file"
+new_case
+python3 -I - "$ART/dot.tar" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w") as t:
+    data = b"API=abc\n"
+    i = tarfile.TarInfo("notes.txt"); i.size = len(data); t.addfile(i, io.BytesIO(data))
+    link = tarfile.TarInfo("cfg/.env/."); link.type = tarfile.LNKTYPE; link.linkname = "notes.txt"; t.addfile(link)
+PY
+prepare --artifact "$ART/dot.tar"
+run_audit; assert_eq "tar hard link cfg/.env/.: exit 1" "$RC" 1; assert_contains "tar hard link cfg/.env/.: forbidden_file" "$OUT" "forbidden_file"
+new_case
+python3 -I - "$ART/strings.zip" "$SENT" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("en.lproj/Localizable.strings/.", ('"k" = "' + sys.argv[2] + '";').encode("utf-16-le"))
+PY
+prepare --artifact "$ART/strings.zip"
+expect_fail "UTF-16 .strings behind a trailing dot" "sentinel"
+
+start "a symlink in a directory artifact named like a forbidden file is reported"
+new_case; mkdir -p "$ART/Link.app/Contents"; printf 'API=abc\n' > "$ART/Link.app/Contents/notes.txt"
+ln -s notes.txt "$ART/Link.app/Contents/.env"
+prepare --artifact "$ART/Link.app"
+run_audit; assert_eq "symlink .env: exit 1" "$RC" 1; assert_contains "symlink .env: forbidden_file" "$OUT" "forbidden_file"
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare

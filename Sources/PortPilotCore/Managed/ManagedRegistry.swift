@@ -225,7 +225,11 @@ public actor ManagedRegistry {
                     guard state.maintenance == nil, !state.services.contains(where: { $0.fence != nil }) else { throw ManagedError.operationInProgress }
                     // Active-child survival under launchd has not been accepted.
                     // A missing identity with a still-existing PID is uncertain.
-                    guard state.services.flatMap(\.incarnations).allSatisfy(provenExited) else { throw ManagedError.needsDecision }
+                    // A move still preparing can spawn or resume a replacement, and a replacement may be
+                    // recorded only in the transition; both must be settled before the helper is replaced.
+                    guard !state.services.contains(where: { $0.transition?.phase == "preparing" }),
+                          state.services.flatMap({ $0.incarnations + ($0.transition.map { $0.oldTargets + $0.newTargets } ?? []) })
+                            .allSatisfy(provenExited) else { throw ManagedError.needsDecision }
                     candidate.maintenance = request.requestId
                 } else {
                     guard let checkpoint = request.payload["checkpoint"]?.string,
