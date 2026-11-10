@@ -622,7 +622,8 @@ public actor ManagedRegistry {
               let transition = state.services[i].transition, transition.operationId == operationId,
               transition.phase == "preparing" else { throw ManagedError.staleRevision }
         let service = state.services[i], operation = state.operations[o]
-        guard service.fence == nil, service.revision == operation.revision,
+        // A stop that failed mid-move leaves needs_review with no fence; the move must not revive it.
+        guard service.lifecycle == "running", service.fence == nil, service.revision == operation.revision,
               service.incarnations == operation.targets, service.routeGeneration == operation.generation,
               now() >= lastWallTime, operation.expires > now(), (approvalDeadlines[operationId] ?? 0) > uptime() else { throw ManagedError.staleRevision }
         guard operation.approved || (!service.activeClaims.isEmpty && service.activeClaims.allSatisfy({ operation.acknowledgements.contains($0.actor) })) else { throw ManagedError.needsDecision }

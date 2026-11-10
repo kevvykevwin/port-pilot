@@ -123,6 +123,24 @@ final class ManagedForwarderLifecycleTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(viaStable, "stable port must refuse connections while the service is stopped")
     }
 
+    /// Bug caught: after its last claim was released, a healthy service awaiting cleanup refused an identical
+    /// run with incompatible_launch instead of being reused, so the caller could not keep it alive.
+    func testReleasePendingServiceIsReusedByIdenticalRun() async throws {
+        let rig = try rig()
+        try await run(rig, revision: 0)
+        let running = try await current(rig)
+        let release = await rig.supervisor.handle(rig.request("claim.release", revision: running.revision,
+            payload: ["serviceId": .string(running.id.uuidString), "claimId": .string(running.claims[0].id.uuidString)]))
+        XCTAssertNil(release.error)
+        let pending = try await current(rig)
+        XCTAssertEqual(pending.lifecycle, "release_pending")
+        let again = await rig.supervisor.handle(rig.request("service.run", revision: pending.revision, payload: ["launch": try .value(rig.launch)]))
+        XCTAssertNil(again.error, "an identical run must reuse the healthy service")
+        let reused = try await current(rig)
+        XCTAssertEqual(reused.lifecycle, "running")
+        XCTAssertEqual(reused.incarnations, running.incarnations)
+    }
+
     /// Bug caught: dropping the relay on stop must not break restart; the recreated relay must rebind the same stable port.
     func testRestartAfterStopRebindsStablePortToNewBackend() async throws {
         let rig = try rig()

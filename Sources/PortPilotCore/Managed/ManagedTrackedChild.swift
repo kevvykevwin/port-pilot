@@ -37,18 +37,13 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         let result = posix_spawn(&pid, launch.executable, &actions, &attributes, &argv, &env)
         guard result == 0 else { throw ManagedError.dependencyUnavailable }
         guard let identity = ManagedProcess.incarnation(pid: pid) else {
-            // Our own unreaped child: its PID cannot be reused until waitpid, so killing by PID is safe.
-            kill(pid, SIGKILL)
-            var status: Int32 = 0
-            _ = waitpid(pid, &status, 0)
+            Self.killAndReap(pid)
             throw ManagedError.identityUnavailable
         }
         self.identity = identity
         let fd = kqueue()
         guard fd >= 0 else {
-            _ = ProcessKiller.forceKill(pid: pid, expectedStartTime: identity.startTime)
-            var status: Int32 = 0
-            _ = waitpid(pid, &status, 0)
+            Self.killAndReap(pid)
             throw ManagedError.dependencyUnavailable
         }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
@@ -57,14 +52,20 @@ public final class ManagedTrackedChild: @unchecked Sendable {
         watch.fflags = UInt32(NOTE_FORK) | UInt32(NOTE_EXIT)
         guard kevent64(fd, &watch, 1, nil, 0, 0, nil) == 0 else {
             close(fd)
-            _ = ProcessKiller.forceKill(pid: pid, expectedStartTime: identity.startTime)
-            var status: Int32 = 0
-            _ = waitpid(pid, &status, 0)   // our unreaped child: reap it so no zombie blocks exit proof
+            Self.killAndReap(pid)
             throw ManagedError.dependencyUnavailable
         }
         events = fd
     }
     deinit { close(events) }
+    /// Kills and reaps a child this initializer just spawned (still suspended, never resumed). Its PID cannot
+    /// be reused until it is reaped, so a plain SIGKILL by PID is safe; SIGKILL always ends a stopped process,
+    /// so the blocking wait returns. EINTR is retried so no zombie is left behind.
+    private static func killAndReap(_ pid: Int32) {
+        kill(pid, SIGKILL)
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+    }
     public func resume() throws {
         try lock.withLock {
             guard !resumed, ManagedProcess.incarnation(pid: identity.pid) == identity else { throw ManagedError.staleIdentity }
