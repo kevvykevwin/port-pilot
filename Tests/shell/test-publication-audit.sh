@@ -311,6 +311,33 @@ PL
 prepare --artifact "$ART/tool" --artifact "$ART/Info.plist"
 run_audit; assert_eq "control: Mach-O and binary plist are not taken for tar" "$RC" 0
 
+start "a compressed stream in front of a zip does not hide the zip, and a tar inside server.pem.gz is name-checked"
+for comp in gz bz2 xz; do
+new_case
+python3 -I - "$ART/release.zip" "$SENT" "$comp" <<'PY'
+import bz2, gzip, io, lzma, sys, zipfile
+head = {"gz": gzip.compress, "bz2": bz2.compress, "xz": lzma.compress}[sys.argv[3]](b"hello benign\n")
+z = io.BytesIO()
+with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("cfg/.env", "API_KEY=" + sys.argv[2])
+open(sys.argv[1], "wb").write(head + z.getvalue())
+PY
+prepare --artifact "$ART/release.zip"
+run_audit
+assert_eq "$comp + zip: exit 1" "$RC" 1
+assert_contains "$comp + zip: forbidden_file" "$OUT" "forbidden_file"
+done
+new_case
+python3 -I - "$ART/server.pem.gz" <<'PY'
+import gzip, io, sys, tarfile
+b = io.BytesIO()
+with tarfile.open(fileobj=b, mode="w:") as t:
+    data = b"hello\n"; i = tarfile.TarInfo("a.txt"); i.size = len(data); t.addfile(i, io.BytesIO(data))
+open(sys.argv[1], "wb").write(gzip.compress(b.getvalue()))
+PY
+prepare --artifact "$ART/server.pem.gz"
+run_audit; assert_eq "tar inside server.pem.gz: exit 1" "$RC" 1; assert_contains "tar inside server.pem.gz: forbidden_file" "$OUT" "forbidden_file"
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare
