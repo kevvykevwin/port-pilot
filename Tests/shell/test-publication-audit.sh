@@ -851,6 +851,19 @@ elif kind == "local_csize_lie":
     B = Bh + B_data
     data = finish(A + B, [cdent(b"a.txt", 8, 0, crc(clean), len(ad), len(clean), 0),
                           cdent(b"b.bin", 0, 0, crc(B_data), len(B_data), len(B_data), len(A))])
+elif kind in ("dd_inflate_overrun", "dd_wellformed"):
+    # Bug caught: a deflated entry WITH a data descriptor whose directory and
+    # descriptor both claim the clean prefix (64 'A' bytes) while the real stream
+    # inflates further into a token. zipfile reads 64 bytes; ditto/unzip extract
+    # the token. The inflated length/CRC must be compared to the directory.
+    fake = b"sk-ant-" + b"api03-FAKEFAKEFAKEFAKE0000"
+    pre = b"A" * 64
+    full = pre + b"\n" + fake if kind == "dd_inflate_overrun" else pre
+    st = deflate(full)
+    dd = b"PK\x07\x08" + struct.pack("<III", crc(pre), len(st), len(pre))
+    nm = b"Contents/Resources/notes.txt"
+    A = local(nm, 8, 8, 0, 0, 0, st + dd)
+    data = finish(A, [cdent(nm, 8, 8, crc(pre), len(st), len(pre), 0)])
 elif kind == "local_csize_small":
     # Bug caught: a deflated entry (no descriptor) whose LOCAL csize is too SMALL.
     # The real stream is one final stored block holding padding and then a complete
@@ -968,6 +981,17 @@ for K in csize_cover csize_cover_dd stored_cover method_mismatch; do
     new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
     expect_fail "$K" "archive_unreadable"
 done
+
+start "dd_inflate_overrun: descriptor and directory agree on a clean 64-byte prefix but the deflate stream inflates to a token after it (archive_unreadable AND the token is found)"
+new_case; python3 -I "$ROOT/mkzip.py" dd_inflate_overrun "$ART/ddo.zip" "$SENT"; prepare --artifact "$ART/ddo.zip"
+expect_fail "dd overrun unreadable" "archive_unreadable"
+expect_fail "dd overrun token" "secret_anthropic_key"
+
+start "dd_wellformed: a deflated entry whose descriptor, directory and real stream all agree stays clean (no false positive)"
+new_case; python3 -I "$ROOT/mkzip.py" dd_wellformed "$ART/ddw.zip" "$SENT"; prepare --artifact "$ART/ddw.zip"
+run_audit
+assert_eq "dd wellformed: exit 0" "$RC" 0
+assert_not_contains "dd wellformed: no archive_unreadable" "$OUT" "archive_unreadable"
 
 start "method_mismatch and csize_cover: the bytes the walk decodes are scanned (sentinel found, not just unreadable)"
 new_case; python3 -I "$ROOT/mkzip.py" method_mismatch "$ART/mm.zip" "$SENT"; prepare --artifact "$ART/mm.zip"

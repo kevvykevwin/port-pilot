@@ -609,20 +609,25 @@ def _walk_zip(data, infos, start_dir, budget=MAX_ARCHIVE_TOTAL_BYTES):
             budget -= len(body)
             if budget < 0:
                 raise _TooLarge()
+            actual = (zlib.crc32(body) & 0xFFFFFFFF, end - body_start, len(body))
+            if info is not None and method == 8:
+                # What the stream really holds must match what the directory
+                # (and so zipfile) claims, with or without a descriptor: a
+                # descriptor that agrees with the directory proves nothing
+                # about the inflated bytes.
+                if actual != (info.CRC, info.compress_size, info.file_size):
+                    entry_ok = False
+            elif info is not None and (
+                end - body_start != info.compress_size or len(body) != info.file_size
+            ):
+                entry_ok = False
             if has_dd:
-                if info is not None:
-                    want = (info.CRC, info.compress_size, info.file_size)
-                else:
-                    want = (zlib.crc32(body) & 0xFFFFFFFF, end - body_start, len(body))
+                want = actual if info is None else (info.CRC, info.compress_size, info.file_size)
                 dd_end = _data_descriptor_end(data, end, *want, boundaries)
                 if dd_end is None:
                     entry_ok = False
                     raise _WalkStop
                 end = dd_end
-            elif info is not None and (
-                end - body_start != info.compress_size or len(body) != info.file_size
-            ):
-                entry_ok = False
             if not entry_ok:
                 consistent = False
                 bodies.append((lname.decode("utf-8", "replace"), body))
