@@ -231,6 +231,27 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(executed.error, .identityUnavailable)
         XCTAssertTrue(procs.signaled.isEmpty)
     }
+    /// Bug caught: a stop whose signal failed left needs_review with its fence set, and nothing ever
+    /// released it, so no later stop, restart or quiesce was possible.
+    func testFailedStopSignalReleasesFenceAndLaterStopWorks() async throws {
+        let procs = Procs(); procs.start(Procs.root)
+        let refuse = SignalGate(); refuse.allow = false
+        var s = service(); s.backendPort = 30001; s.stablePort = 20001
+        let r = ManagedRegistry(persistence: try seed(s, root: directory()), actors: actors, identity: { procs.lookup($0) },
+                                sendSignal: { identity, _ in refuse.allow && procs.signal(identity) }, isGone: { procs.isGone($0) })
+        let loaded = await r.snapshot()[0]
+        let payload = try await approvedStop(r, loaded)
+        let failed = await r.handle(request("operation.execute", actor: "user", revision: loaded.revision, service: loaded.id, payload: payload))
+        XCTAssertNil(failed.error)
+        let after = await r.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "needs_review")
+        XCTAssertNil(after.fence, "a failed signal must not leave a fence nothing can release")
+        refuse.allow = true
+        let retry = try await approvedStop(r, after)
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: after.revision, service: after.id, payload: retry))
+        XCTAssertNil(executed.error, "the user must be able to stop again")
+        XCTAssertEqual(procs.signaled, [Procs.root.pid])
+    }
     func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
         let (r, s, procs) = try await tree(root: directory())
         let payload = try await approvedStop(r, s)
@@ -636,4 +657,10 @@ final class Procs: @unchecked Sendable {
     func lookup(_ pid: Int32) -> ManagedIncarnation? { lock.withLock { table[pid] } }
     func isGone(_ pid: Int32) -> Bool { lock.withLock { gone.contains(pid) } }
     func signal(_ i: ManagedIncarnation) -> Bool { lock.withLock { sent.append(i.pid); return true } }
+}
+
+private final class SignalGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = true
+    var allow: Bool { get { lock.withLock { value } } set { lock.withLock { value = newValue } } }
 }
