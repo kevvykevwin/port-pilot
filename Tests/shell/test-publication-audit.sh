@@ -1006,6 +1006,44 @@ elif kind == "cd_offset_ff":
     eo = data.rfind(b"PK\x05\x06")
     data[eo + 12 : eo + 16] = struct.pack("<I", struct.unpack("<I", data[eo + 12 : eo + 16])[0] + len(ex))
     data = bytes(data)
+elif kind == "z64_loc_in_comment":
+    # Bug caught: a zip64 locator hidden in the last central-directory entry's
+    # comment, 20 bytes before the 32-bit end record. zipfile and ditto ignore it
+    # (no zip64 end record precedes it); bsdtar follows it into pad.bin's body,
+    # to a second directory that lists a deflated .env.
+    N = local(b"notes.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
+    pad = b"padding "
+    body_start = len(N) + len(local(b"pad.bin", 0, 0, 0, 0, 0, b""))
+    henv = local(b".env", 8, 0, crc(hid), len(hd), len(hid), hd)
+    cd2 = cdent(b".env", 8, 0, crc(hid), len(hd), len(hid), body_start + len(pad))
+    rec_in = body_start + len(pad) + len(henv) + len(cd2)
+    rec = b"PK\x06\x06" + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, 1, 1, len(cd2), body_start + len(pad) + len(henv))
+    inner = pad + henv + cd2 + rec
+    P = local(b"pad.bin", 0, 0, crc(inner), len(inner), len(inner), inner)
+    cd_off = len(N) + len(P)
+    loc = b"PK\x06\x07" + struct.pack("<IQI", 0, rec_in, 1)
+    cd1a = cdent(b"notes.txt", 0, 0, crc(clean), len(clean), len(clean), 0)
+    cd1b = bytearray(cdent(b"pad.bin", 0, 0, crc(inner), len(inner), len(inner), len(N)))
+    cd1b[32:34] = struct.pack("<H", len(loc))
+    cd1 = cd1a + bytes(cd1b) + loc
+    data = N + P + cd1 + eocd(2, len(cd1), cd_off)
+elif kind == "dir_data_zero":
+    # Bug caught: a deflated directory entry whose stream inflates to bytes while
+    # the directory claims file_size 0 (the walk, not the size check, must catch it).
+    D = local(b"d/", 8, 0, crc(hid), len(hd), 0, hd)
+    data = finish(D, [cdent(b"d/", 8, 0, crc(hid), len(hd), 0, 0)])
+elif kind == "dir_deflated_empty":
+    # Positive control: ZipFile.writestr("d/", b"") with ZIP_DEFLATED stores a
+    # 2-byte empty deflate stream with file_size 0.
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("d/", b"")
+        z.writestr("d/c.txt", clean)
+    data = b.getvalue()
+elif kind == "backslash_name":
+    # Bug caught: member names with backslashes; os.path.basename keeps
+    # "cfg\\.env" whole on macOS, but unzip and bsdtar extract cfg/.env.
+    data = plain_zip([("cfg\\.env", b"x=1\n")])
 elif kind in ("comment_zip", "comment_local", "trailing_bytes", "sig_in_cd_name", "plain_comment"):
     inner = plain_zip([("s.txt", hid)])
     if kind == "comment_local":
@@ -1030,12 +1068,14 @@ for K in csize_cover csize_cover_dd stored_cover method_mismatch; do
     expect_fail "$K" "archive_unreadable"
 done
 
-for K in twoeocd z64_loc_off z64_disk z64_count dir_data upath_local upath_cd upath_badcrc upath_badver; do
+for K in twoeocd z64_loc_off z64_disk z64_count dir_data dir_data_zero z64_loc_in_comment upath_local upath_cd upath_badcrc upath_badver; do
     case $K in
         twoeocd) T="zip64 end record and 32-bit end record point at different central directories (the second lists a hidden entry)" ;;
         z64_loc_off) T="zip64 locator record offset does not match where the zip64 end record is" ;;
         z64_disk) T="32-bit end record disk number disagrees with the zip64 record" ;;
         z64_count) T="32-bit end record entry count disagrees with the zip64 record" ;;
+        dir_data_zero) T="deflated directory entry whose stream inflates to bytes while file_size claims 0" ;;
+        z64_loc_in_comment) T="zip64 locator hidden in a central-directory entry comment, pointing at a second directory inside a stored member" ;;
         dir_data) T="directory entry that carries a deflated body (unzip -p prints it, zipfile skips it)" ;;
         upath_local) T="Unicode Path extra in the local header renames notes.txt to .env" ;;
         upath_cd) T="Unicode Path extra in the central directory renames notes.txt to .env" ;;
@@ -1051,6 +1091,10 @@ new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/non
 for K in z64_marker z64_equal upath_ok; do
     python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; ctl_zip "$K" "$ART/$K.zip"
 done
+
+start "backslash in a member name: cfg\\.env is extracted as cfg/.env by unzip and bsdtar (forbidden_file)"
+new_case; python3 -I "$ROOT/mkzip.py" backslash_name "$ART/bs.zip" "$SENT"; prepare --artifact "$ART/bs.zip"
+expect_fail "backslash .env member" "forbidden_file"
 
 start "dd_inflate_overrun: descriptor and directory agree on a clean 64-byte prefix but the deflate stream inflates to a token after it (archive_unreadable AND the token is found)"
 new_case; python3 -I "$ROOT/mkzip.py" dd_inflate_overrun "$ART/ddo.zip" "$SENT"; prepare --artifact "$ART/ddo.zip"
@@ -1176,6 +1220,7 @@ new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/non
 python3 -I "$ROOT/mkzip.py" zip64_real "$ART/real64.zip" "$SENT"; ctl_zip "real zip64" "$ART/real64.zip"
 python3 -I "$ROOT/mkzip.py" plain_comment "$ART/pc.zip" "$SENT"; ctl_zip "plain comment" "$ART/pc.zip"
 python3 -I "$ROOT/mkzip.py" sig_in_cd_name "$ART/sig.zip" "$SENT"; ctl_zip "signature in name" "$ART/sig.zip"
+python3 -I "$ROOT/mkzip.py" dir_deflated_empty "$ART/dde.zip" "$SENT"; ctl_zip "deflated empty directory (zipfile writestr d/)" "$ART/dde.zip"
 
 start "corrupt xz is archive_unreadable, not a LZMAError traceback"
 new_case; printf '\3757zXZ\000garbage' > "$ART/bad.xz"; prepare --artifact "$ART/bad.xz"
