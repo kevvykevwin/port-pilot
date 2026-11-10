@@ -813,10 +813,21 @@ def deflate(b):
     c = zlib.compressobj(9, zlib.DEFLATED, -15)
     return c.compress(b) + c.flush()
 def crc(b): return zlib.crc32(b) & 0xFFFFFFFF
-def local(name, method, flags, c, cs, us, data):
-    return b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, flags, method, 0, 0x21, c, cs, us, len(name), 0) + name + data
-def cdent(name, method, flags, c, cs, us, off):
-    return b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", 20, 20, flags, method, 0, 0x21, c, cs, us, len(name), 0, 0, 0, 0, 0, off) + name
+def local(name, method, flags, c, cs, us, data, extra=b""):
+    return b"PK\x03\x04" + struct.pack("<HHHHHIIIHH", 20, flags, method, 0, 0x21, c, cs, us, len(name), len(extra)) + name + extra + data
+def cdent(name, method, flags, c, cs, us, off, extra=b""):
+    return b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", 20, 20, flags, method, 0, 0x21, c, cs, us, len(name), len(extra), 0, 0, 0, 0, off) + name + extra
+def upath(name, target, version=1, crc_of=None):
+    body = struct.pack("<BI", version, crc(name if crc_of is None else crc_of)) + target
+    return struct.pack("<HH", 0x7075, len(body)) + body
+def z64tail(cd_off, cd_size, n, e32, loc_delta=0):
+    """zip64 end record + locator + 32-bit end record. e32 'marker' puts the
+    see-zip64 markers in every 32-bit field; a tuple (disk, cddisk, nd, nt, size, off) is used verbatim."""
+    rec_pos = cd_off + cd_size
+    rec = b"PK\x06\x06" + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, n, n, cd_size, cd_off)
+    loc = b"PK\x06\x07" + struct.pack("<IQI", 0, rec_pos + loc_delta, 1)
+    f = (0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF) if e32 == "marker" else e32
+    return rec + loc + b"PK\x05\x06" + struct.pack("<HHHHIIH", *f, 0)
 def eocd(n, size, off): return b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, n, n, size, off, 0)
 clean = b"clean text " * 20
 hid = b"note " + sent + b"\n"
@@ -885,6 +896,43 @@ elif kind == "stored_cover":
     A = local(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
     cov = clean + H
     data = finish(A + H, [cdent(b"a.txt", 0, 0, crc(cov), len(cov), len(cov), 0)])
+elif kind == "twoeocd":
+    # Bug caught: the zip64 end record points at the real directory (one stored
+    # entry x.bin) while the 32-bit end record points at a second directory
+    # inside x.bin's data that lists the hidden deflated entry h.txt. zipfile
+    # follows zip64 (sees x.bin only); unzip follows the 32-bit record (h.txt).
+    xh = len(local(b"x.bin", 0, 0, 0, 0, 0, b""))
+    # The inner bytes start with padding so x.bin is not itself sniffed as a zip.
+    pad = b"padding "
+    cd2 = cdent(b"h.txt", 8, 0, crc(hid), len(hd), len(hid), xh + len(pad))
+    inner = pad + H + cd2
+    X = local(b"x.bin", 0, 0, crc(inner), len(inner), len(inner), inner)
+    cd1 = cdent(b"x.bin", 0, 0, crc(inner), len(inner), len(inner), 0)
+    e32 = (0, 0, 1, 1, len(cd2), xh + len(pad) + len(H))
+    data = X + cd1 + z64tail(len(X), len(cd1), 1, e32)
+elif kind in ("z64_marker", "z64_equal", "z64_loc_off", "z64_disk", "z64_count"):
+    # Bug caught: a zip64 end record whose 32-bit twin is all markers or agrees
+    # with it is ordinary; a locator pointing elsewhere, or any 32-bit field that
+    # disagrees with zip64, lets two extractors read different directories.
+    A = local(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), clean)
+    cd1 = cdent(b"a.txt", 0, 0, crc(clean), len(clean), len(clean), 0)
+    e32 = {"z64_equal": (0, 0, 1, 1, len(cd1), len(A)), "z64_disk": (1, 0, 1, 1, len(cd1), len(A)),
+           "z64_count": (0, 0, 1, 2, len(cd1), len(A))}.get(kind, "marker")
+    data = A + cd1 + z64tail(len(A), len(cd1), 1, e32, 1 if kind == "z64_loc_off" else 0)
+elif kind == "dir_data":
+    # Bug caught: a directory entry (name ends in /) that carries a deflated body;
+    # zipfile skips it as a directory but unzip -p prints the bytes.
+    D = local(b"d/", 8, 0, crc(hid), len(hd), len(hid), hd)
+    data = finish(D, [cdent(b"d/", 8, 0, crc(hid), len(hd), len(hid), 0)])
+elif kind in ("upath_local", "upath_cd", "upath_ok", "upath_badcrc", "upath_badver"):
+    # Bug caught: a Unicode Path extra (0x7075) renaming notes.txt to .env;
+    # bsdtar honours it while zipfile and the filename check see notes.txt.
+    n = b"notes.txt"
+    tgt = b"notes.txt" if kind in ("upath_ok", "upath_badcrc", "upath_badver") else b".env"  # badcrc/badver: right name, only the CRC/version is wrong
+    ex = upath(n, tgt, version=2 if kind == "upath_badver" else 1, crc_of=b"other" if kind == "upath_badcrc" else None)
+    plain = kind == "upath_cd"
+    A = local(n, 8, 0, crc(hid), len(hd), len(hid), hd, b"" if plain else ex)
+    data = finish(A, [cdent(n, 8, 0, crc(hid), len(hd), len(hid), 0, ex if kind in ("upath_cd", "upath_ok") else b"")])
 elif kind == "method_mismatch":
     A = local(b"s.txt", 8, 0, crc(hid), len(hd), len(hid), hd)
     data = finish(A, [cdent(b"s.txt", 0, 0, crc(hd), len(hd), len(hd), 0)])
@@ -980,6 +1028,28 @@ for K in csize_cover csize_cover_dd stored_cover method_mismatch; do
     start "zip $K: central directory lies about sizes/method so a hidden local entry is read by bsdtar/unzip but not zipfile (archive_unreadable)"
     new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
     expect_fail "$K" "archive_unreadable"
+done
+
+for K in twoeocd z64_loc_off z64_disk z64_count dir_data upath_local upath_cd upath_badcrc upath_badver; do
+    case $K in
+        twoeocd) T="zip64 end record and 32-bit end record point at different central directories (the second lists a hidden entry)" ;;
+        z64_loc_off) T="zip64 locator record offset does not match where the zip64 end record is" ;;
+        z64_disk) T="32-bit end record disk number disagrees with the zip64 record" ;;
+        z64_count) T="32-bit end record entry count disagrees with the zip64 record" ;;
+        dir_data) T="directory entry that carries a deflated body (unzip -p prints it, zipfile skips it)" ;;
+        upath_local) T="Unicode Path extra in the local header renames notes.txt to .env" ;;
+        upath_cd) T="Unicode Path extra in the central directory renames notes.txt to .env" ;;
+        upath_badcrc) T="Unicode Path extra whose CRC does not match the header filename" ;;
+        upath_badver) T="Unicode Path extra with an unknown version" ;;
+    esac
+    start "$T [$K] (archive_unreadable)"
+    new_case; python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; prepare --artifact "$ART/$K.zip"
+    expect_fail "$K" "archive_unreadable"
+done
+start "positive controls: zip64 end record with all-marker 32-bit fields, with equal fields, and a Unicode Path extra that matches the filename stay clean"
+new_case; prepare --artifact "$ART/none.bin" 2>/dev/null; printf 'x' > "$ART/none.bin"
+for K in z64_marker z64_equal upath_ok; do
+    python3 -I "$ROOT/mkzip.py" "$K" "$ART/$K.zip" "$SENT"; ctl_zip "$K" "$ART/$K.zip"
 done
 
 start "dd_inflate_overrun: descriptor and directory agree on a clean 64-byte prefix but the deflate stream inflates to a token after it (archive_unreadable AND the token is found)"
