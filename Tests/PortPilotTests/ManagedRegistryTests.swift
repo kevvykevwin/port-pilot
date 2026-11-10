@@ -290,15 +290,59 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(ok.lifecycle, "starting")
         }
     }
-    func testRestartFromNeedsReviewRejectedWhileFenceRemainsOrNothingWasRecorded() async throws {
-        // Fence still set (stop never resolved): every process is gone, yet the stop is unresolved.
-        var fencedService = service(); fencedService.fence = UUID(); fencedService.treeComplete = false
-        let fencedRegistry = ManagedRegistry(persistence: try seed(fencedService, root: directory()), actors: actors,
-                                             identity: { _ in nil }, isGone: { _ in true })
-        let fenced = await fencedRegistry.snapshot()[0]
-        XCTAssertEqual(fenced.lifecycle, "needs_review"); XCTAssertNotNil(fenced.fence)
-        do { _ = try await fencedRegistry.restartLaunch(rerun(fenced), serviceId: fenced.id, fingerprint: "private", backend: 30002); XCTFail("fence set") }
-        catch { XCTAssertEqual(error as? ManagedError, .operationInProgress, "checkRevision rejects a fenced service before the restart guard") }
+    /// Bug caught: a helper restart during a stop, launch or move kept the dead task's fence, so the service sat
+    /// in needs_review forever and restart, quiesce, upgrade and uninstall were all blocked.
+    func testHelperRestartReleasesDeadTasksFenceButRestartStillWaitsForEveryProcess() async throws {
+        for interrupted in ["stop", "move"] {
+            let procs = Procs(); procs.start(Procs.root)
+            var fenced = service(); let operation = UUID(); fenced.fence = operation; fenced.lifecycle = "stopping"
+            fenced.backendPort = 30001; fenced.stablePort = 20001
+            if interrupted == "move" {
+                procs.start(Procs.extra)
+                fenced.lifecycle = "running"
+                fenced.transition = ManagedRouteTransition(operationId: operation, oldBackend: 30001, newBackend: 30003, oldGeneration: 1,
+                                                           oldTargets: fenced.incarnations, newTargets: [Procs.extra], phase: "switched")
+            }
+            let disk = try ManagedPersistence(root: try directory())
+            var state = ManagedState(); state.services = [fenced]
+            state.operations = [ManagedOperation(id: operation, serviceId: fenced.id, action: interrupted == "move" ? "reroute" : "stop",
+                                                 revision: fenced.revision, targets: fenced.incarnations, generation: 1, actor: "user",
+                                                 phase: interrupted == "move" ? "observing" : "signal_sent", expires: Date())]
+            try disk.commit(state)
+            let r = ManagedRegistry(persistence: disk, actors: actors, identity: { procs.lookup($0) }, isGone: { procs.isGone($0) })
+            let loaded = await r.snapshot()[0]
+            XCTAssertEqual(loaded.lifecycle, "needs_review", interrupted)
+            XCTAssertNil(loaded.fence, "\(interrupted): the fence of a task that died with the helper must not survive")
+            let record = await r.operation(id: operation)
+            XCTAssertEqual(record?.phase, "needs_review", interrupted)
+            XCTAssertEqual(record?.outcome, "helper_restarted_outcome_unverified", interrupted)
+            if interrupted == "move" {
+                XCTAssertTrue(loaded.incarnations.contains(Procs.extra), "the move's replacement must stay recorded")
+                XCTAssertEqual(loaded.transition?.phase, "needs_review")
+            }
+            // Something recorded is still alive: no restart, no quiesce.
+            do { _ = try await r.restartLaunch(rerun(loaded), serviceId: loaded.id, fingerprint: "private", backend: 30002); XCTFail(interrupted) }
+            catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch, interrupted) }
+            let early = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: loaded.id))
+            XCTAssertEqual(early.error, .needsDecision, interrupted)
+            procs.exit(Procs.root)
+            if interrupted == "move" {
+                do { _ = try await r.restartLaunch(rerun(loaded), serviceId: loaded.id, fingerprint: "private", backend: 30002); XCTFail("replacement alive") }
+                catch { XCTAssertEqual(error as? ManagedError, .incompatibleLaunch) }
+                procs.exit(Procs.extra)
+            }
+            let quiesced = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: loaded.id))
+            XCTAssertNil(quiesced.error, "\(interrupted): quiesce (and so upgrade/uninstall) must work once everything has exited")
+            guard case .object(let values) = quiesced.data, case .string(let checkpoint)? = values["checkpoint"] else { return XCTFail("checkpoint") }
+            let resumed = await r.handle(request("lifecycle.resume", actor: "user", revision: nil, service: loaded.id,
+                                                 payload: ["checkpoint": .string(checkpoint)]))
+            XCTAssertNil(resumed.error)
+            let review = await r.snapshot()[0]
+            let restarted = try await r.restartLaunch(rerun(review), serviceId: review.id, fingerprint: "private", backend: 30002)
+            XCTAssertEqual(restarted.lifecycle, "starting", interrupted)
+        }
+    }
+    func testRestartFromNeedsReviewRejectedWhenNothingWasRecorded() async throws {
         // Nothing recorded: vacuous "all exited" must not count as proof.
         var empty = service(); empty.incarnations = []
         let emptyRegistry = ManagedRegistry(persistence: try seed(empty, root: directory()), actors: actors, identity: { _ in nil }, isGone: { _ in true })

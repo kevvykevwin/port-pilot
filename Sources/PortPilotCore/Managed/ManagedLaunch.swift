@@ -167,8 +167,11 @@ public actor ManagedSupervisor {
     private var operationEpoch = 0
     private let treeEvidence = ManagedTreeEvidence()
     private let readinessTimeout: TimeInterval
-    public init(registry: ManagedRegistry, key: Data, persistence: ManagedPersistence? = nil, readinessTimeout: TimeInterval = 30) {
-        self.registry = registry; self.key = key; self.readinessTimeout = readinessTimeout
+    /// How long a move watches the new backend through the stable port before draining the old one.
+    private let observationWindow: TimeInterval
+    public init(registry: ManagedRegistry, key: Data, persistence: ManagedPersistence? = nil, readinessTimeout: TimeInterval = 30,
+                observationWindow: TimeInterval = 30) {
+        self.registry = registry; self.key = key; self.readinessTimeout = readinessTimeout; self.observationWindow = observationWindow
         recipes = persistence.map { ManagedRecipes(persistence: $0, key: key) }
     }
     private func secret(_ name: String) throws -> String {
@@ -423,7 +426,7 @@ public actor ManagedSupervisor {
                 forwarder.setBackendVerified(true)
             }
             switched = true
-            let observationDeadline = ProcessInfo.processInfo.systemUptime + 30
+            let observationDeadline = ProcessInfo.processInfo.systemUptime + observationWindow
             while ProcessInfo.processInfo.systemUptime < observationDeadline {
                 guard targets.allSatisfy({ ManagedProcess.incarnation(pid: $0.pid) == $0 }),
                       await healthy(launch, port: stable, session: session) else { throw ManagedError.readinessFailed }
