@@ -528,9 +528,13 @@ public actor ManagedRegistry {
         // A needs_review service is restartable only once every process it ever recorded is proven gone.
         // An empty record counts as finished: a launch records its child before resuming it, so a launch
         // that recorded nothing (spawn failed, or the helper died first) never ran any user code.
-        let finished = service.lifecycle == "stopped" ? service.transition == nil
+        // A stopped service may keep a move that a stop interrupted; once no move can still progress and
+        // every move target is proven exited, it is restartable (the transition is cleared below).
+        let transitionTargets = service.transition.map { $0.oldTargets + $0.newTargets } ?? []
+        let finished = service.lifecycle == "stopped"
+            ? service.fence == nil && service.transition?.phase != "preparing" && transitionTargets.allSatisfy(provenExited)
             : service.lifecycle == "needs_review" && service.fence == nil
-                && (service.incarnations + (service.transition.map { $0.oldTargets + $0.newTargets } ?? [])).allSatisfy(provenExited)
+                && (service.incarnations + transitionTargets).allSatisfy(provenExited)
         guard finished, service.launchFingerprint == fingerprint,
               !state.services.contains(where: { $0.lifecycle != "stopped" && ($0.backendPort == backend || $0.transition?.newBackend == backend) }) else { throw ManagedError.incompatibleLaunch }
         var candidate = state
