@@ -235,7 +235,7 @@ public actor ManagedSupervisor {
                     return await registry.handle(request)
                 }
                 guard existing.launchFingerprint == fingerprint, !launch.configurationFiles.isEmpty,
-                      existing.lifecycle == "running", let stable = existing.stablePort,
+                      ["running", "release_pending"].contains(existing.lifecycle), let stable = existing.stablePort,
                       let backend = existing.backendPort else { throw ManagedError.incompatibleLaunch }
                 guard request.expectedRevision == existing.revision else { throw ManagedError.staleRevision }
                 guard existing.fence == nil else { throw ManagedError.operationInProgress }

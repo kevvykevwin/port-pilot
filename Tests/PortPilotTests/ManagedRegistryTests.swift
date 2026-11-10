@@ -252,6 +252,49 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(executed.error, "the user must be able to stop again")
         XCTAssertEqual(procs.signaled, [Procs.root.pid])
     }
+    /// Bug caught: an automatic cleanup whose signal failed left needs_review with its fence set, so the
+    /// service could never be restarted or quiesced even after its process exited.
+    func testFailedCleanupSignalReleasesFence() async throws {
+        let clock = TestClock(); let log = SignalLog()
+        let (r, s) = try await running(root: directory(), clock: clock, signal: log)
+        let released = await r.handle(request("claim.release", revision: s.revision, service: s.id,
+                                              payload: ["claimId": .string(s.claims[0].id.uuidString)]))
+        XCTAssertNil(released.error)
+        clock.advance(60)
+        try await r.cleanup { _ in false }
+        let after = await r.snapshot()[0]
+        XCTAssertEqual(after.lifecycle, "needs_review")
+        XCTAssertNil(after.fence, "a failed cleanup signal must not leave a fence nothing can release")
+    }
+    /// Bug caught: once a failed stop released its fence, a move that was still preparing could switch
+    /// and complete, reporting the service running although the user's stop had failed.
+    func testMoveCannotSwitchAfterPartlyFailedStop() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let move = await r.handle(request("operation.propose", actor: "user", revision: s.revision, service: s.id, payload: ["action": .string("reroute")]))
+        let moveId = try XCTUnwrap(move.operationId)
+        var movePayload: [String: ManagedJSON] = ["operationId": .string(moveId.uuidString), "approved": .bool(true)]
+        let moveApproval = await r.handle(request("decision.resolve", actor: "user", revision: s.revision, service: s.id, payload: movePayload))
+        XCTAssertNil(moveApproval.error)
+        movePayload["serviceId"] = .string(s.id.uuidString)
+        let begun = try await r.beginReroute(ManagedRequest(operation: "operation.execute", actor: "user", credential: "token-user",
+                                                            expectedRevision: s.revision, payload: movePayload), backend: 30009)
+        XCTAssertNil(begun.error)
+        procs.start(Procs.extra)
+        try await r.recordReplacement(serviceId: s.id, operationId: moveId, targets: [Procs.extra])
+        let stop = try await approvedStop(r, s)
+        procs.refuse(Procs.child)   // the root is signalled, the descendant's signal fails
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: stop))
+        XCTAssertNil(executed.error)
+        XCTAssertEqual(procs.signaled, [Procs.root.pid])
+        let mid = await r.snapshot()[0]
+        XCTAssertEqual(mid.lifecycle, "needs_review")
+        XCTAssertNil(mid.fence)
+        do { try await r.switchReroute(serviceId: s.id, operationId: moveId) { _, _ in }; XCTFail("switch after failed stop") }
+        catch { XCTAssertNotNil(error as? ManagedError) }
+        let final = await r.snapshot()[0]
+        XCTAssertEqual(final.lifecycle, "needs_review", "a failed stop must not be turned back into running by the move")
+        XCTAssertEqual(final.backendPort, s.backendPort)
+    }
     func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
         let (r, s, procs) = try await tree(root: directory())
         let payload = try await approvedStop(r, s)
@@ -656,7 +699,15 @@ final class Procs: @unchecked Sendable {
     }
     func lookup(_ pid: Int32) -> ManagedIncarnation? { lock.withLock { table[pid] } }
     func isGone(_ pid: Int32) -> Bool { lock.withLock { gone.contains(pid) } }
-    func signal(_ i: ManagedIncarnation) -> Bool { lock.withLock { sent.append(i.pid); return true } }
+    private var refused: Set<Int32> = []
+    /// Signals to this process fail (e.g. EPERM after it changed user).
+    func refuse(_ i: ManagedIncarnation) { lock.withLock { _ = refused.insert(i.pid) } }
+    func signal(_ i: ManagedIncarnation) -> Bool {
+        lock.withLock {
+            guard !refused.contains(i.pid) else { return false }
+            sent.append(i.pid); return true
+        }
+    }
 }
 
 private final class SignalGate: @unchecked Sendable {
