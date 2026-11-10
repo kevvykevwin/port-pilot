@@ -284,7 +284,9 @@ class Scanner:
 
     def scan_blob(self, data, name, loc, depth=0):
         """Scan one file's bytes: name policy, raw content, archive members."""
-        if forbidden_name(os.path.basename(name)):
+        # unzip and bsdtar turn "\\" in a member name into a path separator;
+        # os.path.basename on POSIX does not.
+        if forbidden_name(os.path.basename(name)) or forbidden_name(name.replace("\\", "/").rsplit("/", 1)[-1]):
             self.f.add("forbidden_file", loc)
         self.scan_bytes(data, loc)
         self.scan_utf16(data, name, loc)
@@ -393,8 +395,11 @@ class Scanner:
                 if not self._member_ok(info.filename, mloc):
                     continue
                 if info.is_dir():
-                    if info.file_size > 0 or info.compress_size > 0:
-                        # unzip -p prints a directory entry's bytes; zipfile skips them.
+                    if info.file_size > 0:
+                        # unzip -p prints a directory entry's bytes; zipfile skips
+                        # them. A deflated empty stream (compress_size 2) is what
+                        # ZipFile.writestr("d/", b"") writes; the local-header walk
+                        # already checks the real inflated length and CRC.
                         self.f.add("archive_unreadable", mloc)
                     continue
                 if info.file_size > MAX_FILE_BYTES:
@@ -569,16 +574,24 @@ def _zip_tail_ok(data, start_dir):
     has_loc = data.startswith(b"PK\x06\x07", pos)
     if has_loc != has_rec:
         return False  # one without the other: extractors disagree about zip64
+    loc_pos = None
     if has_loc:
         if len(data) < pos + 20:
             return False
         _, rec_off, _ = struct.unpack("<IQI", data[pos + 4 : pos + 20])
-        # zipfile shifts the locator's offset by the same prefix it finds for
-        # the directory; the shifted value must be where the record really is.
-        if rec_off + (start_dir - z64[5]) != z64_pos:
+        # Legitimate writers never shift the zip64 offsets: the locator must
+        # name the record exactly and the record must name the real directory.
+        # (zipfile would tolerate a shift; a stricter extractor reads elsewhere.)
+        if rec_off != z64_pos or z64[5] != start_dir:
             return False
+        loc_pos = pos
         pos += 20
     if not data.startswith(b"PK\x05\x06", pos) or len(data) < pos + 22:
+        return False
+    if pos >= 20 and data[pos - 20 : pos - 16] == b"PK\x06\x07" and loc_pos != pos - 20:
+        # A locator-shaped record right before the end record that the walk did
+        # not reach as the locator (e.g. inside a directory entry comment):
+        # bsdtar follows it, zipfile ignores it.
         return False
     if z64 is not None:
         # Every 32-bit field must defer to zip64 (marker) or agree with it, or
