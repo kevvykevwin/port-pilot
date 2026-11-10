@@ -338,6 +338,29 @@ PY
 prepare --artifact "$ART/server.pem.gz"
 run_audit; assert_eq "tar inside server.pem.gz: exit 1" "$RC" 1; assert_contains "tar inside server.pem.gz: forbidden_file" "$OUT" "forbidden_file"
 
+start "names are checked as the macOS decompressors write them (.z, -z, _z, -gz, .Z, .bz)"
+for art in "credential-abc.json.z gz" "actors.json-gz gz" "export-1.json_z gz" "private-config.json-z gz" "e.pem.Z gz" "credential-abc.json.bz bz2"; do
+set -- $art
+new_case
+python3 -I - "$ART/$1" "$2" <<'PY'
+import bz2, gzip, sys
+body = b"{}\n"
+open(sys.argv[1], "wb").write(gzip.compress(body) if sys.argv[2] == "gz" else bz2.compress(body))
+PY
+prepare --artifact "$ART/$1"
+run_audit; assert_eq "$1: exit 1" "$RC" 1; assert_contains "$1: forbidden_file" "$OUT" "forbidden_file"
+done
+new_case
+python3 -I - "$ART/backup.pem.tgz" <<'PY'
+import gzip, io, sys, tarfile
+b = io.BytesIO()
+with tarfile.open(fileobj=b, mode="w:") as t:
+    data = b"hello\n"; i = tarfile.TarInfo("a.txt"); i.size = len(data); t.addfile(i, io.BytesIO(data))
+open(sys.argv[1], "wb").write(gzip.compress(b.getvalue()))
+PY
+prepare --artifact "$ART/backup.pem.tgz"
+run_audit; assert_eq "control: .tgz unpacks as .tar, not as a forbidden .pem" "$RC" 0
+
 start "forbidden file committed to a published ref fails (credential-*.json)"
 new_case; printf '{}' > "$REPO/credential-abc.json"
 git -C "$REPO" add -A && git -C "$REPO" commit -q -m "cred"; prepare
