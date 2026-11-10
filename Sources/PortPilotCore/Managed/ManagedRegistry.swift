@@ -72,6 +72,11 @@ public actor ManagedRegistry {
                     }
                 }
             }
+            // No move task survives a restart, including on a stopped service, so a "preparing" move can
+            // never progress; quiesce still needs every one of its targets proven exited.
+            for i in state.services.indices where state.services[i].transition?.phase == "preparing" {
+                state.services[i].transition?.phase = "needs_review"
+            }
         } catch { state = ManagedState(); recoveryRequired = true }
         (exportBook, exportFault, exportRevocationPending) = ManagedExportStore.load(persistence)
     }
@@ -829,6 +834,9 @@ public actor ManagedRegistry {
             var candidate = state
             candidate.services[i].treeComplete = candidate.services[i].treeComplete && treeVerified(candidate.services[i].id)
             candidate.services[i].fence = nil
+            // A move still preparing could not abandon while this stop held the fence; settle it for review.
+            // Its task then fails recordReplacement/switch and stops the replacement.
+            if candidate.services[i].transition?.phase == "preparing" { candidate.services[i].transition?.phase = "needs_review" }
             candidate.services[i].lifecycle = candidate.services[i].treeComplete ? "stopped" : "needs_review"
             candidate.services[i].revision += 1
             candidate.operations[o].phase = candidate.services[i].treeComplete ? "completed" : "needs_review"

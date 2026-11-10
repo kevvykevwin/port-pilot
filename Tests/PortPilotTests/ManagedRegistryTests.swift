@@ -295,9 +295,10 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(final.lifecycle, "needs_review", "a failed stop must not be turned back into running by the move")
         XCTAssertEqual(final.backendPort, s.backendPort)
     }
-    /// Bug caught: quiesce checked only `incarnations`, so with a move preparing (or its live replacement recorded
-    /// only in the transition) the helper could be unloaded or replaced under a running child.
-    func testQuiesceWaitsForMoveReplacements() async throws {
+    /// Bug caught: quiesce checked only `incarnations`, so a live replacement recorded only in a move's
+    /// transition did not stop the helper from being unloaded or replaced. After a restart no move task
+    /// survives, so a leftover "preparing" move must not block quiesce forever once its targets have exited.
+    func testQuiesceWaitsForMoveReplacementsButNotForeverAfterRestart() async throws {
         for phase in ["preparing", "needs_review"] {
             let procs = Procs(); procs.start(Procs.extra)
             var s = service(); s.lifecycle = "stopped"; s.backendPort = 30001; s.stablePort = 20001
@@ -309,9 +310,36 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(blocked.error, .needsDecision, "\(phase): a live replacement must block quiesce")
             procs.exit(Procs.extra)
             let again = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: s.id))
-            if phase == "preparing" { XCTAssertEqual(again.error, .needsDecision, "a preparing move can still spawn one") }
-            else { XCTAssertNil(again.error) }
+            XCTAssertNil(again.error, "\(phase): quiesce must succeed once every move target has exited")
         }
+    }
+    /// Bug caught: a stop that settled while a move was preparing left the move "preparing" on a stopped
+    /// service (its abandon was refused while the stop held the fence), blocking quiesce permanently.
+    func testStopDuringPreparingMoveStillAllowsQuiesce() async throws {
+        let (r, s, procs) = try await tree(root: directory())
+        let move = await r.handle(request("operation.propose", actor: "user", revision: s.revision, service: s.id, payload: ["action": .string("reroute")]))
+        let moveId = try XCTUnwrap(move.operationId)
+        var movePayload: [String: ManagedJSON] = ["operationId": .string(moveId.uuidString), "approved": .bool(true)]
+        let moveApproval = await r.handle(request("decision.resolve", actor: "user", revision: s.revision, service: s.id, payload: movePayload))
+        XCTAssertNil(moveApproval.error)
+        movePayload["serviceId"] = .string(s.id.uuidString)
+        _ = try await r.beginReroute(ManagedRequest(operation: "operation.execute", actor: "user", credential: "token-user",
+                                                    expectedRevision: s.revision, payload: movePayload), backend: 30009)
+        procs.start(Procs.extra)
+        try await r.recordReplacement(serviceId: s.id, operationId: moveId, targets: [Procs.extra])
+        let stop = try await approvedStop(r, s)
+        let executed = await r.handle(request("operation.execute", actor: "user", revision: s.revision, service: s.id, payload: stop))
+        XCTAssertNil(executed.error)
+        do { try await r.abandonReplacement(serviceId: s.id, operationId: moveId, outcome: "x"); XCTFail("stop holds the fence") }
+        catch { XCTAssertEqual(error as? ManagedError, .operationInProgress) }
+        procs.exit(Procs.root); procs.exit(Procs.child)
+        try await r.reconcileStops()
+        let settled = await r.snapshot()[0]
+        XCTAssertNil(settled.fence)
+        XCTAssertNotEqual(settled.transition?.phase, "preparing")
+        procs.exit(Procs.extra)
+        let quiesced = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: s.id))
+        XCTAssertNil(quiesced.error, "quiesce must not be blocked forever by a move the stop interrupted")
     }
     func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
         let (r, s, procs) = try await tree(root: directory())
