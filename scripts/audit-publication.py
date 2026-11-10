@@ -390,7 +390,12 @@ class Scanner:
             bodies = None
             for info in infos:
                 mloc = f"{loc}!{info.filename}"
-                if not self._member_ok(info.filename, mloc) or info.is_dir():
+                if not self._member_ok(info.filename, mloc):
+                    continue
+                if info.is_dir():
+                    if info.file_size > 0 or info.compress_size > 0:
+                        # unzip -p prints a directory entry's bytes; zipfile skips them.
+                        self.f.add("archive_unreadable", mloc)
                     continue
                 if info.file_size > MAX_FILE_BYTES:
                     self.f.add("too_large", mloc)
@@ -484,6 +489,32 @@ def _data_descriptor_end(data, pos, crc, csize, usize, boundaries):
 _ZIP64_UNSET = 0xFFFFFFFF
 
 
+def _unicode_path_ok(extra, header_name, filename):
+    """Every Unicode Path extra (0x7075) must be well formed, carry the CRC32 of
+    the raw header name, and name info.filename. Anything else lets bsdtar
+    extract the entry under a name the audit never saw. Malformed extras that
+    cannot be parsed are treated as inconsistent."""
+    pos = 0
+    while pos + 4 <= len(extra):
+        hid, hlen = struct.unpack("<HH", extra[pos : pos + 4])
+        field = extra[pos + 4 : pos + 4 + hlen]
+        pos += 4 + hlen
+        if len(field) != hlen:
+            return False
+        if hid != 0x7075:
+            continue
+        if hlen < 5 or field[0] != 1:
+            return False
+        if struct.unpack("<I", field[1:5])[0] != zlib.crc32(header_name) & 0xFFFFFFFF:
+            return False
+        try:
+            if field[5:].decode("utf-8") != filename:
+                return False
+        except UnicodeDecodeError:
+            return False
+    return True
+
+
 def _local_zip64_sizes(extra, need_usize, need_csize):
     """Read (usize, csize) from the zip64 extra (id 0x0001) of a local header.
     A local header carries both sizes in it. Returns None if missing/malformed."""
@@ -527,14 +558,39 @@ def _zip_tail_ok(data, start_dir):
             return False
         n, m, k = struct.unpack("<HHH", data[pos + 28 : pos + 34])
         pos += 46 + n + m + k
-    if data.startswith(b"PK\x06\x06", pos):
-        if len(data) < pos + 12:
+    z64 = None
+    has_rec = data.startswith(b"PK\x06\x06", pos)
+    if has_rec:
+        if len(data) < pos + 56:
             return False
+        z64_pos = pos
+        z64 = struct.unpack("<IIQQQQ", data[pos + 16 : pos + 56])  # disk, cd disk, n here, n total, size, offset
         pos += 12 + struct.unpack("<Q", data[pos + 4 : pos + 12])[0]
-    if data.startswith(b"PK\x06\x07", pos):
+    has_loc = data.startswith(b"PK\x06\x07", pos)
+    if has_loc != has_rec:
+        return False  # one without the other: extractors disagree about zip64
+    if has_loc:
+        if len(data) < pos + 20:
+            return False
+        _, rec_off, _ = struct.unpack("<IQI", data[pos + 4 : pos + 20])
+        # zipfile shifts the locator's offset by the same prefix it finds for
+        # the directory; the shifted value must be where the record really is.
+        if rec_off + (start_dir - z64[5]) != z64_pos:
+            return False
         pos += 20
     if not data.startswith(b"PK\x05\x06", pos) or len(data) < pos + 22:
         return False
+    if z64 is not None:
+        # Every 32-bit field must defer to zip64 (marker) or agree with it, or
+        # zipfile (zip64) and unzip (32-bit) read different central directories.
+        e_disk, e_cd_disk, e_here, e_total, e_size, e_off = struct.unpack("<HHHHII", data[pos + 4 : pos + 20])
+        for got, marker, want in (
+            (e_disk, 0xFFFF, z64[0]), (e_cd_disk, 0xFFFF, z64[1]),
+            (e_here, 0xFFFF, z64[2]), (e_total, 0xFFFF, z64[3]),
+            (e_size, 0xFFFFFFFF, z64[4]), (e_off, 0xFFFFFFFF, z64[5]),
+        ):
+            if got != marker and got != want:
+                return False
     clen = struct.unpack("<H", data[pos + 20 : pos + 22])[0]
     # bsdtar zero-pads a zip written to a non-seekable output to a block size;
     # extractors accept that, so only non-zero bytes after the comment are bad.
@@ -575,6 +631,13 @@ def _walk_zip(data, infos, start_dir, budget=MAX_ARCHIVE_TOTAL_BYTES):
                     and method == info.compress_type
                     and (flags & 0x9) == (info.flag_bits & 0x9)
                 )
+            if info is not None and not (
+                # zipfile already swaps a valid directory extra into info.filename,
+                # so compare against the header name as stored.
+                _unicode_path_ok(extra, lname, info.orig_filename)
+                and _unicode_path_ok(info.extra, lname, info.orig_filename)
+            ):
+                entry_ok = False
             if flags & 0x1 or method not in (0, 8):
                 consistent = False
                 raise _WalkStop  # encrypted / unsupported: cannot find the end
