@@ -295,6 +295,24 @@ final class ManagedRegistryTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(final.lifecycle, "needs_review", "a failed stop must not be turned back into running by the move")
         XCTAssertEqual(final.backendPort, s.backendPort)
     }
+    /// Bug caught: quiesce checked only `incarnations`, so with a move preparing (or its live replacement recorded
+    /// only in the transition) the helper could be unloaded or replaced under a running child.
+    func testQuiesceWaitsForMoveReplacements() async throws {
+        for phase in ["preparing", "needs_review"] {
+            let procs = Procs(); procs.start(Procs.extra)
+            var s = service(); s.lifecycle = "stopped"; s.backendPort = 30001; s.stablePort = 20001
+            s.transition = ManagedRouteTransition(operationId: UUID(), oldBackend: 30001, newBackend: 30003, oldGeneration: 1,
+                                                  oldTargets: s.incarnations, newTargets: [Procs.extra], phase: phase)
+            let r = ManagedRegistry(persistence: try seed(s, root: directory()), actors: actors, identity: { procs.lookup($0) }, isGone: { procs.isGone($0) })
+            procs.exit(Procs.root)
+            let blocked = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: s.id))
+            XCTAssertEqual(blocked.error, .needsDecision, "\(phase): a live replacement must block quiesce")
+            procs.exit(Procs.extra)
+            let again = await r.handle(request("lifecycle.quiesce", actor: "user", revision: nil, service: s.id))
+            if phase == "preparing" { XCTAssertEqual(again.error, .needsDecision, "a preparing move can still spawn one") }
+            else { XCTAssertNil(again.error) }
+        }
+    }
     func testReconcilePrunesExitedDescendantAndKeepsServiceRunning() async throws {
         let (r, s, procs) = try await tree(root: directory())
         let payload = try await approvedStop(r, s)

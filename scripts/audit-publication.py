@@ -205,15 +205,22 @@ class CatFile:
             self.proc.kill()
 
 
+def landed_basename(name):
+    """The file name an extractor actually writes for a path or member name.
+
+    unzip and bsdtar treat "\\" as a path separator, and bsdtar drops empty and
+    "." components, so "cfg/.env/." and "cfg\\.env\\" both land as ".env".
+    """
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    return parts[-1] if parts else ""
+
+
 def forbidden_name(name):
     """True when a path or member name lands on disk as a forbidden file.
 
-    Extractors (unzip, bsdtar) treat "\\" as a path separator, and the default
-    macOS volume is case-insensitive, so the basename is taken after both
-    separators and trailing separators are stripped, and matching ignores case.
+    The default macOS volume is case-insensitive, so matching ignores case.
     """
-    normal = name.replace("\\", "/").rstrip("/")
-    candidates = {os.path.basename(name), normal.rsplit("/", 1)[-1]}
+    candidates = {os.path.basename(name), landed_basename(name)}
     return any(fnmatch.fnmatchcase(c.casefold(), pat.casefold())
                for c in candidates if c for pat in FORBIDDEN_NAMES)
 
@@ -308,7 +315,7 @@ class Scanner:
         """Scan UTF-16 decodings: BOM present, or a .strings file."""
         if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
             codecs = ["utf-16"]
-        elif name.lower().endswith(".strings"):
+        elif landed_basename(name).lower().endswith(".strings") or name.lower().endswith(".strings"):
             codecs = ["utf-16-le", "utf-16-be"]
         else:
             return
@@ -351,7 +358,7 @@ class Scanner:
             self.scan_bytes(out, loc + "#decompressed")
             self._scan_tar(out, loc, depth)
             return
-        inner = name
+        inner = landed_basename(name) or name
         for ext in (".gz", ".bz2", ".xz", ".tgz"):
             if inner.lower().endswith(ext):
                 inner = inner[: -len(ext)]
@@ -918,6 +925,8 @@ def hash_and_scan_path(path, loc, scanner, root_for_links=None):
                 f.add("unreadable", f"{loc}/{rel}")
                 continue
             if stat.S_ISLNK(fmode):
+                if forbidden_name(rel):
+                    f.add("forbidden_file", f"{loc}/{rel}")
                 try:
                     target = os.readlink(full)
                 except OSError:
