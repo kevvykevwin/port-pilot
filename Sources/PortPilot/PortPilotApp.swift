@@ -11,11 +11,9 @@ struct PortPilotApp: App {
         MenuBarExtra {
             MenuBarView(store: store)
         } label: {
-            Image(nsImage: store.hasConflicts
-                ? LighthouseIcon.menuBarImageConflict
-                : store.hasMultiPortProjects
-                    ? LighthouseIcon.menuBarImageActive
-                    : LighthouseIcon.menuBarImage)
+            MenuBarIconLabel(state: store.hasConflicts
+                ? .conflict
+                : store.hasMultiPortProjects ? .active : .idle)
         }
         .menuBarExtraStyle(.window)
     }
@@ -33,13 +31,55 @@ struct PortPilotApp: App {
     }
 }
 
-/// Generates an NSImage template for the menu bar lighthouse icon
+/// Picks the lighthouse image for the menu bar's current light/dark appearance.
+///
+/// SwiftUI rasterizes an `Image(nsImage:)` once and keeps the bitmap, even when
+/// the image has a drawing handler, so one image cannot follow appearance
+/// changes by itself. `colorScheme` in a `MenuBarExtra` label follows the main
+/// menu bar's appearance, so the label swaps images instead. With several
+/// displays tinted differently, the beam icons follow the main one; only the
+/// template idle icon is tinted per screen.
+struct MenuBarIconLabel: View {
+    let state: LighthouseIcon.State
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Image(nsImage: LighthouseIcon.image(for: state, darkMenuBar: colorScheme == .dark))
+    }
+}
+
+/// Menu bar lighthouse icons, drawn with `NSBezierPath` (Canvas and SF Symbols
+/// don't render in `MenuBarExtra` labels).
 enum LighthouseIcon {
-    static let menuBarImage: NSImage = makeImage(active: false)
-    /// Lighthouse with glowing amber beacon — used when multi-port projects detected
-    static let menuBarImageActive: NSImage = makeImage(active: true)
-    /// Lighthouse with red beacon — used when true port conflicts detected
-    static let menuBarImageConflict: NSImage = makeImage(active: true, beamColor: .red)
+    enum State: CaseIterable, Sendable {
+        /// No beam. Template image: AppKit tints it for light and dark menu bars.
+        case idle
+        /// Amber beam — multi-port projects detected.
+        case active
+        /// Red beam — true port conflicts detected.
+        case conflict
+    }
+
+    /// The image to show for `state` on a light or dark menu bar.
+    ///
+    /// The beam variants can't be templates (AppKit would tint the beam too),
+    /// so their tower color is baked in per appearance: black on a light menu
+    /// bar, white on a dark one.
+    static func image(for state: State, darkMenuBar: Bool) -> NSImage {
+        switch (state, darkMenuBar) {
+        case (.idle, _): idleImage
+        case (.active, false): activeLight
+        case (.active, true): activeDark
+        case (.conflict, false): conflictLight
+        case (.conflict, true): conflictDark
+        }
+    }
+
+    private static let idleImage = makeImage(tower: .black, beam: nil)
+    private static let activeLight = makeImage(tower: .black, beam: .orange)
+    private static let activeDark = makeImage(tower: .white, beam: .orange)
+    private static let conflictLight = makeImage(tower: .black, beam: .red)
+    private static let conflictDark = makeImage(tower: .white, beam: .red)
 
     /// Builds the lighthouse path into `path` using the scaled coordinate space.
     private static func buildLighthousePath(sx: CGFloat, sy: CGFloat) -> NSBezierPath {
@@ -77,15 +117,17 @@ enum LighthouseIcon {
         return path
     }
 
-    private static func makeImage(active: Bool, beamColor: NSColor = .orange) -> NSImage {
+    /// Draws the lighthouse with a fixed tower color and an optional colored beam.
+    /// Beam-less images are templates; images with a beam are not.
+    private static func makeImage(tower: NSColor, beam beamColor: NSColor?) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: true) { rect in
             let sx = rect.width / 22
             let sy = rect.height / 22
             let path = buildLighthousePath(sx: sx, sy: sy)
-            NSColor.black.setFill()
+            tower.setFill()
             path.fill()
-            if active {
+            if let beamColor {
                 // Glow beam — same triangle as the light beam, painted on top
                 let beam = NSBezierPath()
                 beam.move(to: NSPoint(x: 14.0 * sx, y: 5.4 * sy))
@@ -97,9 +139,7 @@ enum LighthouseIcon {
             }
             return true
         }
-        // Template images are auto-tinted for light/dark mode.
-        // Active variant must NOT be a template — the colored beam must keep its color.
-        image.isTemplate = !active
+        image.isTemplate = beamColor == nil
         return image
     }
 }
