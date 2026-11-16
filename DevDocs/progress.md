@@ -11,6 +11,7 @@
   - a revocation whose tombstone and sidecar writes both fail stays revoked across a helper restart;
   - the updater no longer stops updating once the bundle contains the helper. It checks upstream first, defers only while the helper's launch agent is installed or loaded, and then notifies once per pending version with the supported `managed-helper.py upgrade` path.
 - **P4**: the owner signed the manual privacy review; the final audit of the release candidate passes and its receipt verifies.
+- **Released v0.5.0 (2026-11-11)**: PR #20 merged to main (`e90a48c`); publication audit passed on the merged commit with the signed manual review (published base `5d90674`); tag `v0.5.0` pushed and the GitHub release published. _(branch `release/v0.5.0` deleted locally 2026-11-11; code is on main)_
 - **Release-branch review (2026-11-08)** found and fixed three blockers:
   - the zip audit trusted the inflated stream instead of the local header size, so a deflate entry whose header size ran into the next entry could hide a file from the audit while `bsdtar` extracted it;
   - a stopped service with a forked or restarted process tree ended in `needs_review` with no way out; it can now be run again once every recorded process is proven exited;
@@ -248,6 +249,19 @@ Run the complete XCTest suite with `swift test`. Coverage includes:
 - Automatic backend rerouting remains in scope; automatic Tailscale configuration writes are deferred beyond v1. Bot/T3 authentication, helper child survival and remote acceptance remain explicit implementation gates. Documentation only; no runtime changes or app tests.
 
 ## Deploy Log
+
+### 2026-11-17 00:43 — fix/dark-menu-bar-icon (validate)
+<!-- deploy:03dcebf-1794843827-SEkURL -->
+- Files: 6 changed (`(root) (4), Sources/ (1), Tests/ (1)`)
+  - `AGENTS.md`
+  - `CLAUDE.md`
+  - `Package.swift`
+  - `Sources/PortPilot/PortPilotApp.swift`
+  - `Tests/PortPilotAppTests/LighthouseIconTests.swift`
+  - `VERSION`
+- Commits ahead of origin/main (2):
+  - chore: bump version to 0.5.1 (build 5)
+  - fix: draw the beacon icon's tower white on a dark menu bar
 
 ### 2026-11-08 01:23 — feat/serve-routes (full)
 <!-- deploy:bfed8cc-1794066829-ViSIMm -->
