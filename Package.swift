@@ -23,6 +23,13 @@ let package = Package(
             name: "PortPilotTests",
             dependencies: ["PortPilotCore"],
             path: "Tests/PortPilotTests"
+        ),
+        // App-target tests (menu bar icon drawing). Kept apart so the core
+        // tests never link the SwiftUI app.
+        .testTarget(
+            name: "PortPilotAppTests",
+            dependencies: ["PortPilot"],
+            path: "Tests/PortPilotAppTests"
         )
     ]
 )

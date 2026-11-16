@@ -29,7 +29,8 @@ Sources/
     ├── Services/           # ConflictNotifier
     └── Views/              # MenuBarView, PortListView, PortRowView, EmptyStateView
 Tests/
-└── PortPilotTests/      # XCTest suite
+├── PortPilotTests/      # XCTest suite (PortPilotCore)
+└── PortPilotAppTests/   # app-target tests (menu bar icon pixels, light/dark)
 ```
 
 ## Key Patterns
@@ -44,7 +45,7 @@ Tests/
 - **Process termination**: Verify `(PID, processStartTime)` before every signal. SIGTERM gets a grace period; SIGKILL requires a separate confirmation and another identity check.
 - **Polling cadence**: 2s while the menu is open, 30s in the background, and 60s in background Low Power Mode.
 - **macOS app detection**: `PortCategory.isMacApp()` — single source of truth. Checks executable path (`/Applications/`, `.app/`, `/System/`) and known process names.
-- **Menu bar icon**: `NSImage` drawn via `NSBezierPath` (not Canvas/SF Symbol — those don't render in `MenuBarExtra` labels). `isTemplate=true` for light/dark auto-tinting, `isTemplate=false` for amber beacon.
+- **Menu bar icon**: `NSImage` drawn via `NSBezierPath` (not Canvas/SF Symbol — those don't render in `MenuBarExtra` labels). Idle is `isTemplate=true` (AppKit tints it). Beam variants are `isTemplate=false` and come in separate light/dark images (black or white tower); `MenuBarIconLabel` picks one from `colorScheme`. Don't pick the color inside the drawing handler: SwiftUI rasterizes `Image(nsImage:)` once and keeps the first bitmap.
 
 ## Testing
 
@@ -52,6 +53,7 @@ Tests/
 - Scanner tests spawn real TCP listeners and processes — they test against the live system
 - PortStore tests use `MockScanner` for deterministic results
 - `@MainActor` tests for PortStore (it's `@Observable @MainActor`)
+- `PortPilotAppTests` depends on the `PortPilot` app target and renders the menu bar icon (including the SwiftUI label in an offscreen window), so it needs a logged-in GUI session; `swift test --filter PortPilotTests` runs the core tests alone. Keep `PortPilotTests` depending only on `PortPilotCore`.
 
 ## Conventions
 
